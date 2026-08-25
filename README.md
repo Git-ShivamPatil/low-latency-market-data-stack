@@ -31,11 +31,11 @@ Consume an exchange feed and place orders against it without the decode path or 
 
 ```mermaid
 flowchart LR
-    N0["FIX 4.4 gateway<br/>session · resend · gap-fill"]
-    N1["Risk service<br/>pre-trade limits"]
-    N2["Matching engine<br/>price-time priority"]
-    N3["Snapshot + replay<br/>2s cycle · TCP recovery"]
-    N4["Rust feed handler<br/>A/B arbitration · MBP/MBO"]
+    N0["FIX 4.4 gateway"]
+    N1["Risk service"]
+    N2["Matching engine"]
+    N3["Snapshot + replay"]
+    N4["Rust feed handler"]
 
     N0 --> N1
     N1 --> N2
@@ -52,7 +52,15 @@ flowchart LR
     class N4 output
 ```
 
-<sub>Conceptual architecture. Colour is meaning, and it is the same across all seven projects in this series: **grey** is what comes in, **teal** is where the work happens, **amber** is state that outlives a request, **violet** is what comes out.</sub>
+| Stage | | What it does |
+|---|---|---|
+| **FIX 4.4 gateway** | `in` | session · resend · gap-fill |
+| **Risk service** | `work` | pre-trade limits |
+| **Matching engine** | `work` | price-time priority |
+| **Snapshot + replay** | `state` | 2s cycle · TCP recovery |
+| **Rust feed handler** | `out` | A/B arbitration · MBP/MBO |
+
+<sub>Conceptual architecture. Colour carries meaning, and it means the same thing across all seven projects in this series: **grey** is what comes in, **teal** is where the work happens, **amber** is state that outlives a request, **violet** is what comes out.</sub>
 
 ## What is being built
 
