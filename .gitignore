@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# C++
+build/
+*.o
+*.a
+
+# env
+.env
+.env.local
+
+# editors
+.vscode/
+.idea/
+
+# bench output
+/results/*.json
+!/results/.gitkeep
