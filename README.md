@@ -31,11 +31,11 @@ Consume an exchange feed and place orders against it without the decode path or 
 
 ```mermaid
 flowchart LR
-    N0["<b>FIX 4.4 gateway</b><br/><small>session · resend · gap-fill</small>"]
-    N1["<b>Risk service</b><br/><small>pre-trade limits</small>"]
-    N2["<b>Matching engine</b><br/><small>price-time priority</small>"]
-    N3["<b>Snapshot + replay</b><br/><small>2s cycle · TCP recovery</small>"]
-    N4["<b>Rust feed handler</b><br/><small>A/B arbitration · MBP/MBO</small>"]
+    N0["FIX 4.4 gateway<br/>session · resend · gap-fill"]
+    N1["Risk service<br/>pre-trade limits"]
+    N2["Matching engine<br/>price-time priority"]
+    N3["Snapshot + replay<br/>2s cycle · TCP recovery"]
+    N4["Rust feed handler<br/>A/B arbitration · MBP/MBO"]
 
     N0 --> N1
     N1 --> N2
