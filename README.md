@@ -241,3 +241,15 @@ All seven are published on [shivamsfolio.com](https://www.shivamsfolio.com/proje
 ## Licence
 
 [MIT](LICENSE) © Shivam Patil
+
+---
+
+<div align="center">
+
+### [shivamsfolio.com](https://www.shivamsfolio.com)
+
+**[This project's case study](https://www.shivamsfolio.com/projects/low-latency-market-data-order-entry)** · **[All 7 projects](https://www.shivamsfolio.com/projects)** · **[Get in touch](https://www.shivamsfolio.com/contact)**
+
+<sub>Built by Shivam Patil — systems engineering, trading infrastructure, and applied AI.</sub>
+
+</div>
