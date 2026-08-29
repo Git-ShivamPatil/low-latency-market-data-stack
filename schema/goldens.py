@@ -64,7 +64,7 @@ FMT_MODIFY_ORDER = "<QqIHBB"     # orderId newPrice newQuantity symbolId side re
 FMT_DELETE_ORDER = "<QHBB"       # orderId symbolId side reserved
 FMT_TRADE = "<QQQqIHBB"          # tradeId aggressorOrderId restingOrderId price qty symbolId side reserved
 FMT_SNAPSHOT = "<QHBB"           # lastSequence symbolId flags reserved
-FMT_SNAPSHOT_LEVEL = "<qIHBB"    # price quantity orderCount side reserved
+FMT_SNAPSHOT_ORDER = "<QqIBBH"   # orderId price quantity side reserved reserved2
 FMT_HEARTBEAT = "<Q"             # lastSequence
 FMT_SEQUENCE_RESET = "<Q"        # newSequence
 
@@ -88,7 +88,7 @@ BLOCK_LENGTH = {
     "SequenceReset": 8,
 }
 
-LEVEL_BLOCK_LENGTH = 16
+ORDER_BLOCK_LENGTH = 24
 
 BID, ASK = 0, 1
 REDUCE, REPLACE = 0, 1
@@ -111,7 +111,7 @@ class Msg:
 
     kind: str
     fields: dict[str, object]
-    levels: list[dict[str, object]] = dc_field(default_factory=list)
+    orders: list[dict[str, object]] = dc_field(default_factory=list)
 
     def pack(self) -> bytes:
         f = self.fields
@@ -145,11 +145,11 @@ class Msg:
             body = struct.pack(
                 FMT_SNAPSHOT, f["last_sequence"], f["symbol_id"], f["flags"], 0
             )
-            group = struct.pack(FMT_GROUP_HEADER, LEVEL_BLOCK_LENGTH, len(self.levels))
-            for lv in self.levels:
+            group = struct.pack(FMT_GROUP_HEADER, ORDER_BLOCK_LENGTH, len(self.orders))
+            for o in self.orders:
                 group += struct.pack(
-                    FMT_SNAPSHOT_LEVEL,
-                    lv["price"], lv["quantity"], lv["order_count"], lv["side"], 0,
+                    FMT_SNAPSHOT_ORDER,
+                    o["order_id"], o["price"], o["quantity"], o["side"], 0, 0,
                 )
             return h + body + group
         raise AssertionError(f"unhandled message kind {self.kind}")
@@ -231,19 +231,22 @@ HAND_TYPED: dict[str, str] = {
         "0800 0700 0100 0100"
         "0000200000000000",
 
-    # Snapshot with two levels. packetHeader.flags=1 marks the snapshot cycle.
+    # Snapshot with two ORDERS. packetHeader.flags=1 marks the snapshot cycle,
+    # and Snapshot.flags=1 marks this as the last fragment for the symbol.
     #   root: blockLength=12 templateId=5
     #         lastSequence=0x0000000000100000 symbolId=7 flags=1 reserved=0
-    #   group header: blockLength=16(0x10) numInGroup=2
-    #   level 0: price=1012500 quantity=250(0xFA) orderCount=3 side=Bid(0)
-    #   level 1: price=1012600 quantity=100(0x64) orderCount=1 side=Ask(1)
-    "snapshot_two_levels":
+    #   group header: blockLength=24(0x18) numInGroup=2
+    #   order 0: orderId=0x0000000100000002 price=1012500 quantity=250(0xFA)
+    #            side=Bid(0)
+    #   order 1: orderId=0x0000000100000003 price=1012600 quantity=100(0x64)
+    #            side=Ask(1)
+    "snapshot_two_orders":
         "0100 0100 0100 00 01 0600100000000000 060504030201a017"
         "0c00 0500 0100 0100"
         "0000100000000000 0700 01 00"
-        "1000 0200"
-        "14730f0000000000 fa000000 0300 00 00"
-        "78730f0000000000 64000000 0100 01 00",
+        "1800 0200"
+        "0200000001000000 14730f0000000000 fa000000 00 00 0000"
+        "0300000001000000 78730f0000000000 64000000 01 00 0000",
 }
 
 
@@ -310,14 +313,19 @@ def vectors() -> list[Vector]:
             messages=[Msg("SequenceReset", {"new_sequence": 0x0000000000200000})],
         ),
         Vector(
-            name="snapshot_two_levels",
-            why="The repeating group, and the snapshot flag on the packet header.",
+            name="snapshot_two_orders",
+            why=(
+                "The repeating group, the snapshot flag on the packet header, and the "
+                "last-fragment flag on the message. Orders are listed in queue order: a "
+                "consumer that re-adds them in this order reproduces price-time priority "
+                "exactly, which an aggregated snapshot could never do."
+            ),
             channel=0, flags=1, first_sequence=BASE + 6, send_timestamp_ns=TS,
             messages=[Msg("Snapshot", {
                 "last_sequence": BASE, "symbol_id": 7, "flags": 1,
-            }, levels=[
-                {"price": 1_012_500, "quantity": 250, "order_count": 3, "side": BID},
-                {"price": 1_012_600, "quantity": 100, "order_count": 1, "side": ASK},
+            }, orders=[
+                {"order_id": 0x0000000100000002, "price": 1_012_500, "quantity": 250, "side": BID},
+                {"order_id": 0x0000000100000003, "price": 1_012_600, "quantity": 100, "side": ASK},
             ])],
         ),
         Vector(
@@ -329,7 +337,7 @@ def vectors() -> list[Vector]:
             channel=0, flags=1, first_sequence=BASE + 7, send_timestamp_ns=TS,
             messages=[Msg("Snapshot", {
                 "last_sequence": BASE + 7, "symbol_id": 9, "flags": 1,
-            }, levels=[])],
+            }, orders=[])],
         ),
         Vector(
             name="batch_mixed",
@@ -351,10 +359,10 @@ def vectors() -> list[Vector]:
                 }),
                 Msg("Snapshot", {
                     "last_sequence": 0x00000000FFFFFFFF, "symbol_id": 3, "flags": 0,
-                }, levels=[
-                    {"price": 990_000, "quantity": 1000, "order_count": 1, "side": BID},
-                    {"price": 990_100, "quantity": 400, "order_count": 2, "side": ASK},
-                    {"price": 990_200, "quantity": 700, "order_count": 5, "side": ASK},
+                }, orders=[
+                    {"order_id": 0x0000000200000001, "price": 990_000, "quantity": 1000, "side": BID},
+                    {"order_id": 0x0000000200000004, "price": 990_100, "quantity": 400, "side": ASK},
+                    {"order_id": 0x0000000200000005, "price": 990_200, "quantity": 700, "side": ASK},
                 ]),
                 Msg("Trade", {
                     "trade_id": 0x2A, "aggressor_order_id": 0x0000000200000003,
@@ -444,13 +452,14 @@ def annotate(v: Vector) -> str:
             row(width, f"{fname} = {fval}{signed_note(fval)}")
         if m.kind == "Snapshot":
             row(1, "reserved = 0")
-            row(2, f"levels.blockLength = {LEVEL_BLOCK_LENGTH}")
-            row(2, f"levels.numInGroup = {len(m.levels)}")
-            for j, lv in enumerate(m.levels):
+            row(2, f"orders.blockLength = {ORDER_BLOCK_LENGTH}")
+            row(2, f"orders.numInGroup = {len(m.orders)}")
+            for j, lv in enumerate(m.orders):
                 for fname, fval in lv.items():
-                    width = LEVEL_FIELD_WIDTH[fname]
-                    row(width, f"levels[{j}].{fname} = {fval}")
-                row(1, f"levels[{j}].reserved = 0")
+                    width = ORDER_FIELD_WIDTH[fname]
+                    row(width, f"orders[{j}].{fname} = {fval}")
+                row(1, f"orders[{j}].reserved = 0")
+                row(2, f"orders[{j}].reserved2 = 0")
         elif m.kind in ("AddOrder", "DeleteOrder", "Trade"):
             row(1, "reserved = 0")
 
@@ -485,7 +494,7 @@ FIELD_WIDTH = {
     "SequenceReset": {"new_sequence": 8},
 }
 
-LEVEL_FIELD_WIDTH = {"price": 8, "quantity": 4, "order_count": 2, "side": 1}
+ORDER_FIELD_WIDTH = {"order_id": 8, "price": 8, "quantity": 4, "side": 1}
 
 # Snapshot's reserved byte sits between the root fields and the group header, so
 # annotate() emits it there rather than at the end of the message.
@@ -508,7 +517,7 @@ RUST_SUFFIX = {
     "order_id": "u64", "price": "i64", "quantity": "u32", "symbol_id": "u16",
     "new_price": "i64", "new_quantity": "u32", "trade_id": "u64",
     "aggressor_order_id": "u64", "resting_order_id": "u64",
-    "last_sequence": "u64", "new_sequence": "u64", "flags": "u8", "order_count": "u16",
+    "last_sequence": "u64", "new_sequence": "u64", "flags": "u8",
 }
 
 
@@ -614,19 +623,19 @@ def emit_rust_check(o: list[str], v: Vector) -> None:
             emit_rust_field_check(o, f"message {i}.{fname}", "d", fname, fval, m.kind)
         if m.kind == "Snapshot":
             o.append(
-                f'    eq_u16("message {i}.levels.numInGroup", d.levels_count(), {len(m.levels)})?;'
+                f'    eq_u16("message {i}.orders.numInGroup", d.orders_count(), {len(m.orders)})?;'
             )
             o.append(
-                f'    eq_u16("message {i}.levels.blockLength", d.levels_block_length(), {LEVEL_BLOCK_LENGTH})?;'
+                f'    eq_u16("message {i}.orders.blockLength", d.orders_block_length(), {ORDER_BLOCK_LENGTH})?;'
             )
-            o.append("    let mut lv = d.levels();")
-            for j, lvl in enumerate(m.levels):
+            o.append("    let mut lv = d.orders();")
+            for j, lvl in enumerate(m.orders):
                 o.append(
                     f'    let l = lv.next().ok_or_else(|| "message {i}: level {j} missing".to_string())?;'
                 )
                 for fname, fval in lvl.items():
                     emit_rust_field_check(
-                        o, f"message {i}.levels[{j}].{fname}", "l", fname, fval, "level"
+                        o, f"message {i}.orders[{j}].{fname}", "l", fname, fval, "level"
                     )
             o.append(
                 f'    if lv.next().is_some() {{ return Err("message {i}: extra levels".to_string()); }}'
@@ -658,7 +667,7 @@ def emit_rust_field_check(
         8: "eq_u64", 4: "eq_u32", 2: "eq_u16", 1: "eq_u8",
     }
     if kind == "level":
-        w = LEVEL_FIELD_WIDTH[fname]
+        w = ORDER_FIELD_WIDTH[fname]
     else:
         w = FIELD_WIDTH[kind][fname]
     if fname in ("price", "new_price"):
@@ -683,18 +692,18 @@ def emit_rust_build(o: list[str], v: Vector) -> None:
             o.append("    let n = {")
             # A group with no entries never mutates the encoder, and clippy
             # rejects an unnecessary `mut` under -D warnings.
-            binding = "let mut e" if m.levels else "let e"
+            binding = "let mut e" if m.orders else "let e"
             o.append(f"        {binding} = SnapshotEncoder::start(")
             o.append("            w.tail(),")
             o.append(f"            {f['last_sequence']},")
             o.append(f"            {f['symbol_id']},")
             o.append(f"            {f['flags']},")
             o.append("        )?;")
-            for lv in m.levels:
-                o.append("        e.push_level(")
+            for lv in m.orders:
+                o.append("        e.push_order(")
+                o.append(f"            {lv['order_id']},")
                 o.append(f"            {lv['price']},")
                 o.append(f"            {lv['quantity']},")
-                o.append(f"            {lv['order_count']},")
                 o.append(f"            {RUST_SIDE[lv['side']]},")
                 o.append("        )?;")
             o.append("        e.finish()")
@@ -809,17 +818,17 @@ def emit_cpp_check(o: list[str], v: Vector) -> None:
             emit_cpp_field_check(o, f"message {i}.{fname}", "d->", fname, fval)
         if m.kind == "Snapshot":
             o.append(
-                f'        CHECK_EQ("message {i}.levels.numInGroup", d->levels_count(), {len(m.levels)});'
+                f'        CHECK_EQ("message {i}.orders.numInGroup", d->orders_count(), {len(m.orders)});'
             )
             o.append(
-                f'        CHECK_EQ("message {i}.levels.blockLength", d->levels_block_length(), {LEVEL_BLOCK_LENGTH});'
+                f'        CHECK_EQ("message {i}.orders.blockLength", d->orders_block_length(), {ORDER_BLOCK_LENGTH});'
             )
-            for j, lvl in enumerate(m.levels):
+            for j, lvl in enumerate(m.orders):
                 o.append(f"        {{")
-                o.append(f"            auto l = d->level({j});")
+                o.append(f"            auto l = d->order({j});")
                 for fname, fval in lvl.items():
                     emit_cpp_field_check(
-                        o, f"message {i}.levels[{j}].{fname}", "l.", fname, fval,
+                        o, f"message {i}.orders[{j}].{fname}", "l.", fname, fval,
                         indent="            ",
                     )
                 o.append("        }")
@@ -883,16 +892,14 @@ def emit_cpp_build(o: list[str], v: Vector) -> None:
             o.append(f"            , static_cast<std::uint8_t>({f['flags']})")
             o.append("        );")
             o.append(f'        if (!e) {{ err = "message {idx} did not fit"; return 0; }}')
-            for j, lv in enumerate(m.levels):
-                o.append("        if (!e->push_level(")
-                o.append(f"                static_cast<std::int64_t>({lv['price']})")
+            for j, lv in enumerate(m.orders):
+                o.append("        if (!e->push_order(")
+                o.append(f"                static_cast<std::uint64_t>({lv['order_id']}ULL)")
+                o.append(f"                , static_cast<std::int64_t>({lv['price']})")
                 o.append(f"                , static_cast<std::uint32_t>({lv['quantity']})")
-                o.append(
-                    f"                , static_cast<std::uint16_t>({lv['order_count']})"
-                )
                 o.append(f"                , {CPP_SIDE[lv['side']]}")
                 o.append(
-                    f'        )) {{ err = "message {idx} level {j} did not fit"; return 0; }}'
+                    f'        )) {{ err = "message {idx} order {j} did not fit"; return 0; }}'
                 )
             o.append("        pos += e->finish();")
             o.append("    }")

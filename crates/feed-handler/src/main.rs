@@ -16,10 +16,10 @@
 //! See `feed_handler::arbitration` for why the window is bounded and why it holds datagrams
 //! rather than messages.
 //!
-//! It does not *recover* from a real gap. Rebuilding after one, from the snapshot
-//! cycle or the replay service, is milestone 4. Until then `GAPPED` is a terminal
-//! diagnosis: the books are explicitly no longer trustworthy, which is honest and
-//! is exactly the hole the next milestone fills.
+//! When a range really is lost on both arms it recovers: live traffic is
+//! buffered, the next snapshot cycle replaces the books wholesale, and the
+//! buffer is replayed on top of it minus whatever the snapshot already covered.
+//! See `feed_handler::recovery` for why that reconciliation is the hard part.
 
 use std::io::{self, Write};
 use std::net::SocketAddrV4;
@@ -34,6 +34,7 @@ use transport::{is_timeout, Receiver, TransportMode};
 use wire::{Message, PacketReader};
 
 use feed_handler::arbitration::{Accepted, Arbitrator, FeedState};
+use feed_handler::recovery::RecoveryBuffer;
 use feed_handler::stats::HandlerStats;
 
 #[derive(Parser, Debug)]
@@ -87,6 +88,49 @@ struct Args {
     /// Write a machine-readable `key=value` summary of the run here.
     #[arg(long, value_name = "PATH")]
     summary_path: Option<PathBuf>,
+
+    /// Discard this fraction of received datagrams, per arm, independently.
+    ///
+    /// This is loss on the *consumer's* side of the wire, which is what the
+    /// case study's recovery step exercises: it needs no cooperation from the
+    /// publisher, so the recovery path can be demonstrated against a feed you do
+    /// not control. Each arm decides separately, so at rate p roughly p² of
+    /// datagrams are lost on both and become real gaps — which is the point.
+    #[arg(long, value_name = "RATE")]
+    drop_rate: Option<f64>,
+
+    /// Seed for the input-loss injector, so a demonstration replays exactly.
+    #[arg(long, default_value_t = 0x0D_1A_0F_5E_ED_00_00_01)]
+    drop_seed: u64,
+
+    /// Prove the steady-state loop allocates nothing (milestone 5).
+    #[arg(long)]
+    verify_allocations: bool,
+}
+
+/// SplitMix64, for the input-loss injector.
+///
+/// Deliberately not shared with the engine's: this models the network in front
+/// of *this* consumer, and coupling the two would make a handler's losses depend
+/// on what the publisher happened to be doing.
+struct DropRng(u64);
+
+impl DropRng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn chance(&mut self, p: f64) -> bool {
+        if p <= 0.0 {
+            return false;
+        }
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        ((z >> 11) as f64 / (1u64 << 53) as f64) < p
+    }
 }
 
 fn main() -> ExitCode {
@@ -182,6 +226,31 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         cfg.feed.max_datagram_bytes.max(65_536),
     );
     let mut started_stream = false;
+    // Whether a snapshot cycle is currently being consumed. A cycle spans
+    // several datagrams and replaces every book, so joining it partway is not
+    // allowed — see `handle_snapshot`.
+    let mut in_snapshot_cycle = false;
+    let mut recovery = RecoveryBuffer::new(
+        cfg.handler.recovery_buffer_datagrams,
+        cfg.feed.max_datagram_bytes.max(65_536),
+        Duration::from_millis(cfg.handler.recovery_timeout_millis),
+    );
+
+    let input_drop_rate = args.drop_rate.unwrap_or(0.0).clamp(0.0, 1.0);
+    let mut drop_rng = DropRng::new(args.drop_seed);
+    let mut input_dropped = [0u64; 2];
+    if input_drop_rate > 0.0 {
+        eprintln!(
+            "  discarding {:.2}% of received datagrams per arm (seed {})",
+            input_drop_rate * 100.0,
+            args.drop_seed
+        );
+    }
+    if args.verify_allocations {
+        eprintln!(
+            "  note: --verify-allocations is accepted but does nothing yet. The counting              allocator and the zero-allocation assertions are milestone 5; claiming the              proof before it exists would be exactly the kind of thing CLAIMS.md is for."
+        );
+    }
 
     let mut last_data = Instant::now();
     let mut last_report = Instant::now();
@@ -224,6 +293,32 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 };
                 got_any = true;
 
+                // Simulated loss on this consumer's input, before anything else
+                // sees the datagram. Dropping it here rather than after decoding
+                // is what makes it indistinguishable from a real network loss.
+                if input_drop_rate > 0.0 && drop_rng.chance(input_drop_rate) {
+                    input_dropped[usize::from(channel)] += 1;
+                    continue;
+                }
+
+                // Snapshot datagrams live in their own sequence space and must
+                // never reach the arbitrator, which tracks the incremental one.
+                // Routing on the flag is what keeps the two streams from being
+                // mistaken for each other.
+                if is_snapshot_datagram(&buf[..n]) {
+                    handle_snapshot(
+                        &buf[..n],
+                        &mut recovery,
+                        &mut books,
+                        &mut arbitrator,
+                        &mut stats,
+                        &mut digest_log,
+                        digest_interval,
+                        &mut in_snapshot_cycle,
+                    )?;
+                    continue;
+                }
+
                 // Arbitration decides what, if anything, this datagram
                 // contributes. Everything downstream sees one ordered stream.
                 let outcome = arbitrator.accept(channel, &buf[..n]);
@@ -237,34 +332,46 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                             stats.first_sequence = first_sequence;
                             if first_sequence != 1 {
                                 eprintln!(
-                                    "  joined mid-stream at sequence {first_sequence}. The book \
-                                     will be incomplete until the snapshot cycle lands in \
-                                     milestone 4 — start this handler before the engine for a \
-                                     clean run."
+                                    "  joined mid-stream at sequence {first_sequence}; waiting \
+                                     for a snapshot to build a book that can be trusted."
                                 );
                                 stats.joined_mid_stream = true;
+                                // A mid-stream join is a gap by another name:
+                                // everything before this point is missing.
+                                recovery.begin(1, Instant::now());
                             }
                         }
-                        let _ = count;
-                        let gapped = arbitrator.state() == FeedState::Gapped;
-                        consume(
-                            &buf[..n],
-                            &mut books,
-                            &mut stats,
-                            &mut digest_log,
-                            digest_interval,
-                            gapped,
-                        )?;
-                        if message_limit > 0 && stats.messages >= message_limit {
+                        if recovery.is_recovering() {
+                            // Live traffic during a recovery is held, not
+                            // applied. It will be replayed on top of the
+                            // snapshot, minus whatever the snapshot covers.
+                            if let Err(e) = recovery.hold(first_sequence, count, &buf[..n]) {
+                                eprintln!("  recovery failed: {e}");
+                                recovery.fail();
+                                stats.recovery_failures += 1;
+                            }
+                        } else {
+                            let gapped = arbitrator.state() == FeedState::Gapped;
+                            consume(
+                                &buf[..n],
+                                &mut books,
+                                &mut stats,
+                                &mut digest_log,
+                                digest_interval,
+                                gapped,
+                                0,
+                            )?;
+                        }
+                        if reached_limit(&arbitrator, message_limit) {
                             break 'outer;
                         }
                     }
                     Accepted::ForcedGap(gap) => {
                         eprintln!(
-                            "  GAP: sequence {gap} was lost on both arms. Redundancy cannot \
-                             help here; recovery from a snapshot or the replay service arrives \
-                             in milestone 4. The book is no longer trustworthy."
+                            "  GAP: sequence {gap} was lost on both arms. Buffering live \
+                             traffic and waiting for a snapshot."
                         );
+                        recovery.begin(gap.from, Instant::now());
                     }
                     Accepted::Buffered | Accepted::Duplicate => {}
                     Accepted::Malformed(e) => {
@@ -276,14 +383,34 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 // Whatever the hole filling just unblocked, in sequence order.
                 // `books` and `arbitrator` are separate bindings, so the closure
                 // can borrow one while the other is borrowed mutably.
-                drain_into_books(
-                    &mut arbitrator,
-                    &mut books,
-                    &mut stats,
-                    &mut digest_log,
-                    digest_interval,
-                )?;
-                if message_limit > 0 && stats.messages >= message_limit {
+                if recovery.is_recovering() {
+                    // The arbitrator still has to be drained during a recovery,
+                    // or its window fills with traffic nobody is consuming and
+                    // the next gap has nowhere to go. What changes is the
+                    // destination: held for replay, not applied to the books.
+                    let mut overflow = None;
+                    arbitrator.drain_ready(|first, count, bytes| {
+                        if overflow.is_none() {
+                            if let Err(e) = recovery.hold(first, count, bytes) {
+                                overflow = Some(e);
+                            }
+                        }
+                    });
+                    if let Some(e) = overflow {
+                        eprintln!("  recovery failed: {e}");
+                        recovery.fail();
+                        stats.recovery_failures += 1;
+                    }
+                } else {
+                    drain_into_books(
+                        &mut arbitrator,
+                        &mut books,
+                        &mut stats,
+                        &mut digest_log,
+                        digest_interval,
+                    )?;
+                }
+                if reached_limit(&arbitrator, message_limit) {
                     break 'outer;
                 }
             }
@@ -298,17 +425,23 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             if now.duration_since(last_data) >= gap_timeout {
                 if let Some(gap) = arbitrator.declare_gap_if_stalled() {
                     eprintln!(
-                        "  GAP: sequence {gap} did not arrive within {}ms of the feed going                          quiet. Giving up on it so the messages buffered behind it can be                          delivered.",
+                        "  GAP: sequence {gap} did not arrive within {}ms of the feed going                          quiet. Buffering live traffic and waiting for a snapshot.",
                         gap_timeout.as_millis()
                     );
-                    drain_into_books(
-                        &mut arbitrator,
-                        &mut books,
-                        &mut stats,
-                        &mut digest_log,
-                        digest_interval,
-                    )?;
+                    // A gap found this way is exactly as real as one found by a
+                    // full window, and needs recovering the same way. Declaring
+                    // it here without starting recovery left the handler stuck
+                    // in GAPPED with a stale book for the rest of the run.
+                    recovery.begin(gap.from, now);
                 }
+            }
+            // A recovery that has run out of time has failed, and saying so is
+            // the point: a handler that waited forever would look healthy while
+            // holding a book it knows is wrong.
+            if let Err(e) = recovery.check_deadline(now) {
+                eprintln!("  recovery failed: {e}");
+                recovery.fail();
+                stats.recovery_failures += 1;
             }
             if let Some(limit) = idle_limit {
                 if now.duration_since(last_data) >= limit {
@@ -330,6 +463,12 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     stats.report(&arbitrator, started);
     let final_digest = BookDigest::of(&books);
     eprintln!("  final book {final_digest}");
+    if input_drop_rate > 0.0 {
+        eprintln!(
+            "  discarded {} datagrams on A and {} on B before decoding",
+            input_dropped[0], input_dropped[1]
+        );
+    }
     for gap in arbitrator.gaps() {
         eprintln!("  gap: sequence {gap}");
     }
@@ -340,6 +479,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             final_digest,
             started.elapsed().as_secs_f64(),
         )?;
+        stats.write_recovery(path, recovery.stats(), arbitrator.resyncs())?;
     }
 
     if args.show_book {
@@ -353,12 +493,15 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
 
     // A run that ended GAPPED, dropped a datagram, or failed to apply a message
     // on a complete stream did not do its job, and says so in its exit code.
-    let clean = stats.is_clean(&arbitrator);
+    let clean = stats.is_clean(&arbitrator, recovery.is_recovering());
     if !clean {
         eprintln!(
-            "  NOT CLEAN: state {}, {} gaps, {} bad datagrams, {} messages that did not apply",
+            "  NOT CLEAN: state {}, {} gaps ({} recovered, {} failed), still recovering: {},              {} bad datagrams, {} messages that did not apply",
             arbitrator.state(),
             arbitrator.gaps().len(),
+            stats.recoveries,
+            stats.recovery_failures,
+            recovery.is_recovering(),
             stats.bad_datagrams,
             stats.apply_errors
         );
@@ -366,10 +509,143 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     Ok(clean)
 }
 
+/// Whether the run has consumed as much of the stream as it was asked to.
+///
+/// Counts what the arbitrator *accounted for*, not what reached the books. While
+/// a recovery is in progress nothing reaches the books, so a limit on applied
+/// messages would never fire and a bounded run would only end on its idle
+/// timeout — which looks like a hang and reports the wrong thing.
+fn reached_limit(arbitrator: &Arbitrator, limit: u64) -> bool {
+    limit > 0 && arbitrator.messages_delivered() >= limit
+}
+
+/// True when this datagram belongs to a snapshot cycle rather than the
+/// incremental stream.
+fn is_snapshot_datagram(datagram: &[u8]) -> bool {
+    wire::PacketHeaderDecoder::wrap(datagram)
+        .map(|h| h.is_snapshot())
+        .unwrap_or(false)
+}
+
+/// Adopts a snapshot if it can close the outstanding gap, then replays the live
+/// traffic held during recovery.
+#[allow(clippy::too_many_arguments)]
+fn handle_snapshot(
+    datagram: &[u8],
+    recovery: &mut RecoveryBuffer,
+    books: &mut Books,
+    arbitrator: &mut Arbitrator,
+    stats: &mut HandlerStats,
+    digest_log: &mut DigestLog,
+    digest_interval: u64,
+    in_cycle: &mut bool,
+) -> io::Result<()> {
+    if !recovery.is_recovering() {
+        // Nothing is wrong, so there is nothing to recover. Adopting a snapshot
+        // here would replace a correct book with an older one.
+        return Ok(());
+    }
+    let reader = match wire::PacketReader::new(datagram) {
+        Ok(r) => r,
+        Err(e) => {
+            stats.bad_datagrams += 1;
+            eprintln!("  dropping a snapshot datagram: {e}");
+            return Ok(());
+        }
+    };
+    for m in reader.messages() {
+        let Ok((_seq, msg)) = m else {
+            stats.bad_datagrams += 1;
+            return Ok(());
+        };
+        let Message::Snapshot(d) = msg else {
+            continue;
+        };
+        if !recovery.snapshot_is_usable(d.last_sequence()) {
+            // Reflects a point before the messages we are missing, so adopting
+            // it would discard good state and still leave the hole.
+            stats.snapshots_discarded += 1;
+            continue;
+        }
+
+        let flags = d.flags();
+        let cycle_start = flags & wire::SNAPSHOT_FLAG_CYCLE_START != 0;
+
+        // A cycle replaces every book, so it has to be joined at the start.
+        // Adopting from the middle leaves the symbols whose fragments already
+        // went past holding stale state while reporting a successful recovery —
+        // which is worse than not recovering at all, because it looks fine.
+        if !cycle_start && !*in_cycle {
+            stats.snapshots_discarded += 1;
+            continue;
+        }
+        if cycle_start {
+            // The whole set is about to be replaced, not merged into.
+            books.clear_all();
+            *in_cycle = true;
+        }
+
+        // Every fragment appends; the clear happened once, at the cycle start.
+        if let Err(e) = apply_message(books, &msg) {
+            eprintln!("  a snapshot fragment did not apply: {e}");
+            stats.apply_errors += 1;
+            *in_cycle = false;
+            return Ok(());
+        }
+
+        // A cycle covers every symbol. The last fragment of *a symbol* completes
+        // one book, not the set, so recovery waits for the cycle-end marker.
+        // Ending on the first symbol would leave every other book stale while
+        // reporting a successful recovery — and the snapshots that would have
+        // fixed them get discarded as unsolicited.
+        if d.flags() & wire::SNAPSHOT_FLAG_CYCLE_END == 0 {
+            continue;
+        }
+
+        let last_sequence = d.last_sequence();
+        recovery.adopt_snapshot(last_sequence);
+        arbitrator.resync_to(last_sequence + 1);
+
+        // Replay whatever arrived while we were waiting, minus what the
+        // snapshot already covers.
+        let mut failure: Option<io::Error> = None;
+        recovery.replay(|skip_below, bytes| {
+            if failure.is_some() {
+                return;
+            }
+            if let Err(e) = consume(
+                bytes,
+                books,
+                stats,
+                digest_log,
+                digest_interval,
+                false,
+                skip_below,
+            ) {
+                failure = Some(e);
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+
+        *in_cycle = false;
+        let elapsed = recovery.complete(Instant::now());
+        stats.recoveries += 1;
+        eprintln!(
+            "  RECOVERED in {}ms from a snapshot consistent as of sequence {last_sequence}; \
+             back to LIVE",
+            elapsed.as_millis()
+        );
+    }
+    Ok(())
+}
+
 /// Decodes one datagram and applies every message in it.
 ///
 /// Returns whether anything was consumed, so the caller can check its message
 /// limit without re-deriving the count.
+#[allow(clippy::too_many_arguments)]
 fn consume(
     datagram: &[u8],
     books: &mut Books,
@@ -377,6 +653,11 @@ fn consume(
     digest_log: &mut DigestLog,
     digest_interval: u64,
     gapped: bool,
+    // Messages below this sequence are already in the book and must be skipped.
+    // Only ever non-zero when replaying a datagram that straddles a snapshot
+    // boundary; applying those twice is what puts a book quietly and permanently
+    // wrong.
+    skip_below: u64,
 ) -> io::Result<bool> {
     let reader = match PacketReader::new(datagram) {
         Ok(r) => r,
@@ -396,6 +677,9 @@ fn consume(
                 break;
             }
         };
+        if seq < skip_below {
+            continue;
+        }
         any = true;
         stats.messages += 1;
         stats.last_sequence = seq;
@@ -440,7 +724,7 @@ fn drain_into_books(
         if failure.is_some() {
             return;
         }
-        if let Err(e) = consume(bytes, books, stats, digest_log, digest_interval, gapped) {
+        if let Err(e) = consume(bytes, books, stats, digest_log, digest_interval, gapped, 0) {
             failure = Some(e);
         }
     });

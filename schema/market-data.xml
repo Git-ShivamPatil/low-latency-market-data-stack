@@ -114,18 +114,30 @@
     <field name="reserved"         id="8" type="uint8"  offset="39"/>
   </message>
 
+  <!-- Carries individual ORDERS, not aggregated price levels.
+       An aggregate says "three orders total 250 at this price" but not which
+       orders, in what queue order, or with what ids - and queue position is the
+       whole point of price-time priority, so an aggregated snapshot cannot
+       rebuild an order-level book. Per-order entries rebuild both views: the
+       aggregated one is derivable by summing, the reverse is not.
+       Real exchanges publish both, because at their scale the aggregated feed is
+       dramatically smaller. This one does not have that problem.
+       ORDERS APPEAR IN QUEUE ORDER. A consumer that re-adds them in the order
+       received reproduces price-time priority exactly; that ordering is the
+       load-bearing part of this message and is asserted by the recovery tests. -->
   <message name="Snapshot" id="5" blockLength="12"
            description="Full book state for one symbol, consistent as of lastSequence">
     <field name="lastSequence" id="1" type="uint64" offset="0" description="The snapshot reflects every message up to and including this sequence"/>
     <field name="symbolId"     id="2" type="uint16" offset="8"/>
     <field name="flags"        id="3" type="uint8"  offset="10" description="bit0 = last fragment for this symbol in this cycle"/>
     <field name="reserved"     id="4" type="uint8"  offset="11"/>
-    <group name="levels" id="10" blockLength="16" description="Aggregated price levels, best first within each side">
-      <field name="price"      id="1" type="int64"  offset="0" semanticType="Price"/>
-      <field name="quantity"   id="2" type="uint32" offset="8"/>
-      <field name="orderCount" id="3" type="uint16" offset="12"/>
-      <field name="side"       id="4" type="Side"   offset="14"/>
-      <field name="reserved"   id="5" type="uint8"  offset="15"/>
+    <group name="orders" id="10" blockLength="24" description="Resting orders in queue order, best price first within each side">
+      <field name="orderId"    id="1" type="uint64" offset="0"/>
+      <field name="price"      id="2" type="int64"  offset="8" semanticType="Price"/>
+      <field name="quantity"   id="3" type="uint32" offset="16"/>
+      <field name="side"       id="4" type="Side"   offset="20"/>
+      <field name="reserved"   id="5" type="uint8"  offset="21"/>
+      <field name="reserved2"  id="6" type="uint16" offset="22"/>
     </group>
   </message>
 

@@ -364,8 +364,8 @@ inline std::size_t build_sequence_reset(std::byte* out, std::size_t cap, std::st
     return pos;
 }
 
-// The repeating group, and the snapshot flag on the packet header.
-inline std::string check_snapshot_two_levels(const std::byte* buf, std::size_t len) {
+// The repeating group, the snapshot flag on the packet header, and the last-fragment flag on the message. Orders are listed in queue order: a consumer that re-adds them in this order reproduces price-time priority exactly, which an aggregated snapshot could never do.
+inline std::string check_snapshot_two_orders(const std::byte* buf, std::size_t len) {
     auto h = PacketHeaderDecoder::wrap(buf, len);
     if (!h) return "packet header: wrap failed";
     CHECK_EQ("packet.schemaId", h->schema_id(), 1);
@@ -386,28 +386,28 @@ inline std::string check_snapshot_two_levels(const std::byte* buf, std::size_t l
         CHECK_EQ("message 0.last_sequence", d->last_sequence(), 1048576);
         CHECK_EQ("message 0.symbol_id", d->symbol_id(), 7);
         CHECK_EQ("message 0.flags", d->flags(), 1);
-        CHECK_EQ("message 0.levels.numInGroup", d->levels_count(), 2);
-        CHECK_EQ("message 0.levels.blockLength", d->levels_block_length(), 16);
+        CHECK_EQ("message 0.orders.numInGroup", d->orders_count(), 2);
+        CHECK_EQ("message 0.orders.blockLength", d->orders_block_length(), 24);
         {
-            auto l = d->level(0);
-            CHECK_EQ("message 0.levels[0].price", l.price(), 1012500);
-            CHECK_EQ("message 0.levels[0].quantity", l.quantity(), 250);
-            CHECK_EQ("message 0.levels[0].order_count", l.order_count(), 3);
+            auto l = d->order(0);
+            CHECK_EQ("message 0.orders[0].order_id", l.order_id(), 4294967298ULL);
+            CHECK_EQ("message 0.orders[0].price", l.price(), 1012500);
+            CHECK_EQ("message 0.orders[0].quantity", l.quantity(), 250);
             {
                 auto e = l.side();
-                if (!e) return "message 0.levels[0].side: undefined enum value";
-                CHECK_EQ("message 0.levels[0].side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+                if (!e) return "message 0.orders[0].side: undefined enum value";
+                CHECK_EQ("message 0.orders[0].side", static_cast<int>(*e), static_cast<int>(Side::kBid));
             }
         }
         {
-            auto l = d->level(1);
-            CHECK_EQ("message 0.levels[1].price", l.price(), 1012600);
-            CHECK_EQ("message 0.levels[1].quantity", l.quantity(), 100);
-            CHECK_EQ("message 0.levels[1].order_count", l.order_count(), 1);
+            auto l = d->order(1);
+            CHECK_EQ("message 0.orders[1].order_id", l.order_id(), 4294967299ULL);
+            CHECK_EQ("message 0.orders[1].price", l.price(), 1012600);
+            CHECK_EQ("message 0.orders[1].quantity", l.quantity(), 100);
             {
                 auto e = l.side();
-                if (!e) return "message 0.levels[1].side: undefined enum value";
-                CHECK_EQ("message 0.levels[1].side", static_cast<int>(*e), static_cast<int>(Side::kAsk));
+                if (!e) return "message 0.orders[1].side: undefined enum value";
+                CHECK_EQ("message 0.orders[1].side", static_cast<int>(*e), static_cast<int>(Side::kAsk));
             }
         }
         pos += d->total_len();
@@ -416,8 +416,8 @@ inline std::string check_snapshot_two_levels(const std::byte* buf, std::size_t l
     return "";
 }
 
-// Re-encodes `snapshot_two_levels` from the same values check_snapshot_two_levels asserts.
-inline std::size_t build_snapshot_two_levels(std::byte* out, std::size_t cap, std::string& err) {
+// Re-encodes `snapshot_two_orders` from the same values check_snapshot_two_orders asserts.
+inline std::size_t build_snapshot_two_orders(std::byte* out, std::size_t cap, std::string& err) {
     auto ph = encode_packet_header(out, cap
         , static_cast<std::uint8_t>(0)
         , static_cast<std::uint8_t>(1)
@@ -434,18 +434,18 @@ inline std::size_t build_snapshot_two_levels(std::byte* out, std::size_t cap, st
             , static_cast<std::uint8_t>(1)
         );
         if (!e) { err = "message 0 did not fit"; return 0; }
-        if (!e->push_level(
-                static_cast<std::int64_t>(1012500)
+        if (!e->push_order(
+                static_cast<std::uint64_t>(4294967298ULL)
+                , static_cast<std::int64_t>(1012500)
                 , static_cast<std::uint32_t>(250)
-                , static_cast<std::uint16_t>(3)
                 , Side::kBid
-        )) { err = "message 0 level 0 did not fit"; return 0; }
-        if (!e->push_level(
-                static_cast<std::int64_t>(1012600)
+        )) { err = "message 0 order 0 did not fit"; return 0; }
+        if (!e->push_order(
+                static_cast<std::uint64_t>(4294967299ULL)
+                , static_cast<std::int64_t>(1012600)
                 , static_cast<std::uint32_t>(100)
-                , static_cast<std::uint16_t>(1)
                 , Side::kAsk
-        )) { err = "message 0 level 1 did not fit"; return 0; }
+        )) { err = "message 0 order 1 did not fit"; return 0; }
         pos += e->finish();
     }
     if (!patch_message_count(out, cap, static_cast<std::uint16_t>(1)))
@@ -475,8 +475,8 @@ inline std::string check_snapshot_empty_group(const std::byte* buf, std::size_t 
         CHECK_EQ("message 0.last_sequence", d->last_sequence(), 1048583);
         CHECK_EQ("message 0.symbol_id", d->symbol_id(), 9);
         CHECK_EQ("message 0.flags", d->flags(), 1);
-        CHECK_EQ("message 0.levels.numInGroup", d->levels_count(), 0);
-        CHECK_EQ("message 0.levels.blockLength", d->levels_block_length(), 16);
+        CHECK_EQ("message 0.orders.numInGroup", d->orders_count(), 0);
+        CHECK_EQ("message 0.orders.blockLength", d->orders_block_length(), 24);
         pos += d->total_len();
     }
     if (pos != len) return "trailing bytes past the last message";
@@ -560,39 +560,39 @@ inline std::string check_batch_mixed(const std::byte* buf, std::size_t len) {
         CHECK_EQ("message 2.last_sequence", d->last_sequence(), 4294967295);
         CHECK_EQ("message 2.symbol_id", d->symbol_id(), 3);
         CHECK_EQ("message 2.flags", d->flags(), 0);
-        CHECK_EQ("message 2.levels.numInGroup", d->levels_count(), 3);
-        CHECK_EQ("message 2.levels.blockLength", d->levels_block_length(), 16);
+        CHECK_EQ("message 2.orders.numInGroup", d->orders_count(), 3);
+        CHECK_EQ("message 2.orders.blockLength", d->orders_block_length(), 24);
         {
-            auto l = d->level(0);
-            CHECK_EQ("message 2.levels[0].price", l.price(), 990000);
-            CHECK_EQ("message 2.levels[0].quantity", l.quantity(), 1000);
-            CHECK_EQ("message 2.levels[0].order_count", l.order_count(), 1);
+            auto l = d->order(0);
+            CHECK_EQ("message 2.orders[0].order_id", l.order_id(), 8589934593ULL);
+            CHECK_EQ("message 2.orders[0].price", l.price(), 990000);
+            CHECK_EQ("message 2.orders[0].quantity", l.quantity(), 1000);
             {
                 auto e = l.side();
-                if (!e) return "message 2.levels[0].side: undefined enum value";
-                CHECK_EQ("message 2.levels[0].side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+                if (!e) return "message 2.orders[0].side: undefined enum value";
+                CHECK_EQ("message 2.orders[0].side", static_cast<int>(*e), static_cast<int>(Side::kBid));
             }
         }
         {
-            auto l = d->level(1);
-            CHECK_EQ("message 2.levels[1].price", l.price(), 990100);
-            CHECK_EQ("message 2.levels[1].quantity", l.quantity(), 400);
-            CHECK_EQ("message 2.levels[1].order_count", l.order_count(), 2);
+            auto l = d->order(1);
+            CHECK_EQ("message 2.orders[1].order_id", l.order_id(), 8589934596ULL);
+            CHECK_EQ("message 2.orders[1].price", l.price(), 990100);
+            CHECK_EQ("message 2.orders[1].quantity", l.quantity(), 400);
             {
                 auto e = l.side();
-                if (!e) return "message 2.levels[1].side: undefined enum value";
-                CHECK_EQ("message 2.levels[1].side", static_cast<int>(*e), static_cast<int>(Side::kAsk));
+                if (!e) return "message 2.orders[1].side: undefined enum value";
+                CHECK_EQ("message 2.orders[1].side", static_cast<int>(*e), static_cast<int>(Side::kAsk));
             }
         }
         {
-            auto l = d->level(2);
-            CHECK_EQ("message 2.levels[2].price", l.price(), 990200);
-            CHECK_EQ("message 2.levels[2].quantity", l.quantity(), 700);
-            CHECK_EQ("message 2.levels[2].order_count", l.order_count(), 5);
+            auto l = d->order(2);
+            CHECK_EQ("message 2.orders[2].order_id", l.order_id(), 8589934597ULL);
+            CHECK_EQ("message 2.orders[2].price", l.price(), 990200);
+            CHECK_EQ("message 2.orders[2].quantity", l.quantity(), 700);
             {
                 auto e = l.side();
-                if (!e) return "message 2.levels[2].side: undefined enum value";
-                CHECK_EQ("message 2.levels[2].side", static_cast<int>(*e), static_cast<int>(Side::kAsk));
+                if (!e) return "message 2.orders[2].side: undefined enum value";
+                CHECK_EQ("message 2.orders[2].side", static_cast<int>(*e), static_cast<int>(Side::kAsk));
             }
         }
         pos += d->total_len();
@@ -688,24 +688,24 @@ inline std::size_t build_batch_mixed(std::byte* out, std::size_t cap, std::strin
             , static_cast<std::uint8_t>(0)
         );
         if (!e) { err = "message 2 did not fit"; return 0; }
-        if (!e->push_level(
-                static_cast<std::int64_t>(990000)
+        if (!e->push_order(
+                static_cast<std::uint64_t>(8589934593ULL)
+                , static_cast<std::int64_t>(990000)
                 , static_cast<std::uint32_t>(1000)
-                , static_cast<std::uint16_t>(1)
                 , Side::kBid
-        )) { err = "message 2 level 0 did not fit"; return 0; }
-        if (!e->push_level(
-                static_cast<std::int64_t>(990100)
+        )) { err = "message 2 order 0 did not fit"; return 0; }
+        if (!e->push_order(
+                static_cast<std::uint64_t>(8589934596ULL)
+                , static_cast<std::int64_t>(990100)
                 , static_cast<std::uint32_t>(400)
-                , static_cast<std::uint16_t>(2)
                 , Side::kAsk
-        )) { err = "message 2 level 1 did not fit"; return 0; }
-        if (!e->push_level(
-                static_cast<std::int64_t>(990200)
+        )) { err = "message 2 order 1 did not fit"; return 0; }
+        if (!e->push_order(
+                static_cast<std::uint64_t>(8589934597ULL)
+                , static_cast<std::int64_t>(990200)
                 , static_cast<std::uint32_t>(700)
-                , static_cast<std::uint16_t>(5)
                 , Side::kAsk
-        )) { err = "message 2 level 2 did not fit"; return 0; }
+        )) { err = "message 2 order 2 did not fit"; return 0; }
         pos += e->finish();
     }
     // message 3
@@ -889,7 +889,7 @@ inline constexpr Vector kVectors[] = {
     {"trade", "trade.bin", "The longest fixed block, and the only message naming two orders.", check_trade, build_trade},
     {"heartbeat", "heartbeat.bin", "Idle-channel keepalive; the handler uses it to tell quiet from dead.", check_heartbeat, build_heartbeat},
     {"sequence_reset", "sequence_reset.bin", "The publisher restarts its numbering.", check_sequence_reset, build_sequence_reset},
-    {"snapshot_two_levels", "snapshot_two_levels.bin", "The repeating group, and the snapshot flag on the packet header.", check_snapshot_two_levels, build_snapshot_two_levels},
+    {"snapshot_two_orders", "snapshot_two_orders.bin", "The repeating group, the snapshot flag on the packet header, and the last-fragment flag on the message. Orders are listed in queue order: a consumer that re-adds them in this order reproduces price-time priority exactly, which an aggregated snapshot could never do.", check_snapshot_two_orders, build_snapshot_two_orders},
     {"snapshot_empty_group", "snapshot_empty_group.bin", "A snapshot of an empty book. numInGroup=0 must still carry the group header, or total_len walks the reader into the next message.", check_snapshot_empty_group, build_snapshot_empty_group},
     {"batch_mixed", "batch_mixed.bin", "Six messages of five types behind one header, including a variable-length snapshot in the middle. This is the vector that proves a decoder can walk a batch: get any total_len wrong and every message after it is garbage. Batching is not an optimisation here, it is the framing the throughput target depends on.", check_batch_mixed, build_batch_mixed},
     {"negative_price", "negative_price.bin", "Prices are signed on the wire. Spreads, settlement marks and a few real contracts go below zero, and a decoder that reads the field as unsigned looks correct until the day one does.", check_negative_price, build_negative_price},

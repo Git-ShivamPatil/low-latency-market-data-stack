@@ -24,6 +24,9 @@ inline constexpr std::size_t kPacketHeaderLen = 24;
 inline constexpr std::size_t kMessageHeaderLen = 8;
 inline constexpr std::size_t kGroupSizeEncodingLen = 4;
 inline constexpr std::uint8_t kPacketFlagSnapshot = 0x01;
+inline constexpr std::uint8_t kSnapshotFlagLastFragment = 0x01;
+inline constexpr std::uint8_t kSnapshotFlagCycleEnd = 0x02;
+inline constexpr std::uint8_t kSnapshotFlagCycleStart = 0x04;
 
 namespace detail {
 
@@ -461,16 +464,16 @@ class SnapshotDecoder {
     /// bit0 = last fragment for this symbol in this cycle
     [[nodiscard]] std::uint8_t flags() const noexcept { return detail::load_le<std::uint8_t>(p_ + kMessageHeaderLen + 10); }
 
-    /// One entry of the `levels` group.
-    class Level {
+    /// One entry of the `orders` group.
+    class Order {
       public:
-        static constexpr std::uint16_t kBlockLength = 16;
-        explicit Level(const std::byte* p) noexcept : p_(p) {}
+        static constexpr std::uint16_t kBlockLength = 24;
+        explicit Order(const std::byte* p) noexcept : p_(p) {}
+        [[nodiscard]] std::uint64_t order_id() const noexcept { return detail::load_le<std::uint64_t>(p_ + 0); }
         /// Fixed point, scaled by 10^-4.
-        [[nodiscard]] std::int64_t price() const noexcept { return detail::load_le<std::int64_t>(p_ + 0); }
-        [[nodiscard]] std::uint32_t quantity() const noexcept { return detail::load_le<std::uint32_t>(p_ + 8); }
-        [[nodiscard]] std::uint16_t order_count() const noexcept { return detail::load_le<std::uint16_t>(p_ + 12); }
-        [[nodiscard]] std::uint8_t side_raw() const noexcept { return detail::load_le<std::uint8_t>(p_ + 14); }
+        [[nodiscard]] std::int64_t price() const noexcept { return detail::load_le<std::int64_t>(p_ + 8); }
+        [[nodiscard]] std::uint32_t quantity() const noexcept { return detail::load_le<std::uint32_t>(p_ + 16); }
+        [[nodiscard]] std::uint8_t side_raw() const noexcept { return detail::load_le<std::uint8_t>(p_ + 20); }
         /// Validating accessor; returns nullopt on an undefined value.
         [[nodiscard]] std::optional<Side> side() const noexcept { return Side_from_raw(side_raw()); }
 
@@ -478,24 +481,24 @@ class SnapshotDecoder {
         const std::byte* p_;
     };
 
-    [[nodiscard]] std::uint16_t levels_block_length() const noexcept {
+    [[nodiscard]] std::uint16_t orders_block_length() const noexcept {
         return detail::load_le<std::uint16_t>(p_ + kMessageHeaderLen + root_len_);
     }
 
-    [[nodiscard]] std::uint16_t levels_count() const noexcept {
+    [[nodiscard]] std::uint16_t orders_count() const noexcept {
         return detail::load_le<std::uint16_t>(p_ + kMessageHeaderLen + root_len_ + 2);
     }
 
-    /// Entry `i` of the `levels` group. Caller checks `i` against the count.
-    [[nodiscard]] Level level(std::uint16_t i) const noexcept {
+    /// Entry `i` of the `orders` group. Caller checks `i` against the count.
+    [[nodiscard]] Order order(std::uint16_t i) const noexcept {
         const std::size_t base = kMessageHeaderLen + root_len_ +
-                                 kGroupSizeEncodingLen + static_cast<std::size_t>(i) * levels_block_length();
-        return Level(p_ + base);
+                                 kGroupSizeEncodingLen + static_cast<std::size_t>(i) * orders_block_length();
+        return Order(p_ + base);
     }
 
     [[nodiscard]] std::size_t total_len() const noexcept {
         return kMessageHeaderLen + root_len_ + kGroupSizeEncodingLen +
-               static_cast<std::size_t>(levels_count()) * levels_block_length();
+               static_cast<std::size_t>(orders_count()) * orders_block_length();
     }
 
   private:
@@ -519,26 +522,26 @@ class SnapshotEncoder {
         detail::store_le<std::uint64_t>(buf + kMessageHeaderLen, last_sequence);
         detail::store_le<std::uint16_t>(buf + kMessageHeaderLen + 8, symbol_id);
         detail::store_le<std::uint8_t>(buf + kMessageHeaderLen + 10, flags);
-        detail::store_le<std::uint16_t>(buf + kMessageHeaderLen + 12, 16);
+        detail::store_le<std::uint16_t>(buf + kMessageHeaderLen + 12, 24);
         return SnapshotEncoder(buf, cap, kHead);
     }
 
-    /// Appends one `levels` entry.
-    [[nodiscard]] bool push_level(
-        std::int64_t price
+    /// Appends one `orders` entry.
+    [[nodiscard]] bool push_order(
+        std::uint64_t order_id
+        , std::int64_t price
         , std::uint32_t quantity
-        , std::uint16_t order_count
         , Side side
     ) noexcept {
-        constexpr std::size_t kEntry = 16;
+        constexpr std::size_t kEntry = 24;
         if (pos_ + kEntry > cap_) return false;
         if (count_ == std::numeric_limits<std::uint16_t>::max()) return false;
         std::byte* e = buf_ + pos_;
         std::memset(e, 0, kEntry);
-        detail::store_le<std::int64_t>(e + 0, price);
-        detail::store_le<std::uint32_t>(e + 8, quantity);
-        detail::store_le<std::uint16_t>(e + 12, order_count);
-        detail::store_le<std::uint8_t>(e + 14, static_cast<std::uint8_t>(side));
+        detail::store_le<std::uint64_t>(e + 0, order_id);
+        detail::store_le<std::int64_t>(e + 8, price);
+        detail::store_le<std::uint32_t>(e + 16, quantity);
+        detail::store_le<std::uint8_t>(e + 20, static_cast<std::uint8_t>(side));
         pos_ += kEntry;
         ++count_;
         return true;

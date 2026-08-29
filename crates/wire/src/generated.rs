@@ -24,6 +24,28 @@ pub const GROUP_SIZE_ENCODING_LEN: usize = 4;
 
 /// `packetHeader.flags` bit 0: this datagram belongs to a snapshot cycle.
 pub const PACKET_FLAG_SNAPSHOT: u8 = 0x01;
+/// `Snapshot.flags` bit 0: the last fragment for this symbol in this cycle.
+///
+/// A book with more resting orders than fit in one datagram is split
+/// across several `Snapshot` messages. A consumer must not treat a
+/// partial book as complete, so it accumulates fragments until it sees
+/// this bit.
+pub const SNAPSHOT_FLAG_LAST_FRAGMENT: u8 = 0x01;
+/// `Snapshot.flags` bit 1: the last fragment of the whole cycle.
+///
+/// A cycle covers every symbol, so the last fragment *of a symbol*
+/// completes one book and not the set. A consumer recovering from a
+/// gap has to wait for this bit, or it adopts the first symbol it
+/// sees, declares itself recovered, and discards the snapshots for
+/// every other symbol as unsolicited.
+pub const SNAPSHOT_FLAG_CYCLE_END: u8 = 0x02;
+/// `Snapshot.flags` bit 2: the first fragment of the whole cycle.
+///
+/// A cycle replaces every book, so a consumer must join it at the
+/// start. Adopting from the middle leaves the symbols whose fragments
+/// already went past holding stale state, while reporting a
+/// successful recovery.
+pub const SNAPSHOT_FLAG_CYCLE_START: u8 = 0x04;
 
 // Unaligned-safe little-endian access. Messages are packed back to back
 // inside a datagram, so a block can start at any byte offset; every read
@@ -264,6 +286,44 @@ pub fn encode_packet_header(
     put_u64(buf, 8, first_sequence);
     put_u64(buf, 16, send_timestamp_ns);
     Ok(PACKET_HEADER_LEN)
+}
+
+/// Sets `packetHeader.channel` on an already-written header.
+///
+/// The two arms send identical bytes apart from this one field, so the
+/// header is written once and only the channel is patched per arm. That
+/// also means the buffer is always a valid datagram, even when a
+/// simulated drop means it is never actually sent.
+#[inline]
+pub fn patch_packet_channel(buf: &mut [u8], channel: u8) -> Result<(), WireError> {
+    if buf.len() < PACKET_HEADER_LEN {
+        return Err(WireError::ShortBuffer {
+            needed: PACKET_HEADER_LEN,
+            got: buf.len(),
+        });
+    }
+    put_u8(buf, 6, channel);
+    Ok(())
+}
+
+/// Sets `Snapshot.flags` on a message already written by
+/// [`SnapshotEncoder`].
+///
+/// Whether a fragment is the last one for its symbol is only known
+/// once the encoder has run out of room, which is after the root
+/// block was written. Patching afterwards is simpler and less
+/// error-prone than predicting it.
+#[inline]
+pub fn patch_snapshot_flags(buf: &mut [u8], flags: u8) -> Result<(), WireError> {
+    const OFFSET: usize = MESSAGE_HEADER_LEN + 10;
+    if buf.len() <= OFFSET {
+        return Err(WireError::ShortBuffer {
+            needed: OFFSET + 1,
+            got: buf.len(),
+        });
+    }
+    put_u8(buf, OFFSET, flags);
+    Ok(())
 }
 
 /// Patches `messageCount` in a header written by [`encode_packet_header`].
@@ -891,26 +951,26 @@ impl<'a> SnapshotDecoder<'a> {
         le_u8(self.buf, MESSAGE_HEADER_LEN + 10)
     }
 
-    /// Bytes per entry of the `levels` group, read from the wire.
+    /// Bytes per entry of the `orders` group, read from the wire.
     #[inline(always)]
-    pub fn levels_block_length(&self) -> u16 {
+    pub fn orders_block_length(&self) -> u16 {
         le_u16(self.buf, MESSAGE_HEADER_LEN + self.root_len)
     }
 
-    /// Number of `levels` entries.
+    /// Number of `orders` entries.
     #[inline(always)]
-    pub fn levels_count(&self) -> u16 {
+    pub fn orders_count(&self) -> u16 {
         le_u16(self.buf, MESSAGE_HEADER_LEN + self.root_len + 2)
     }
 
-    /// Iterates the `levels` group. Aggregated price levels, best first within each side
+    /// Iterates the `orders` group. Resting orders in queue order, best price first within each side
     #[inline]
-    pub fn levels(&self) -> SnapshotLevelsIter<'a> {
-        SnapshotLevelsIter {
+    pub fn orders(&self) -> SnapshotOrdersIter<'a> {
+        SnapshotOrdersIter {
             buf: self.buf,
             pos: MESSAGE_HEADER_LEN + self.root_len + GROUP_SIZE_ENCODING_LEN,
-            block_len: self.levels_block_length() as usize,
-            remaining: self.levels_count(),
+            block_len: self.orders_block_length() as usize,
+            remaining: self.orders_count(),
         }
     }
 
@@ -920,38 +980,38 @@ impl<'a> SnapshotDecoder<'a> {
         MESSAGE_HEADER_LEN
             + self.root_len
             + GROUP_SIZE_ENCODING_LEN
-            + self.levels_count() as usize * self.levels_block_length() as usize
+            + self.orders_count() as usize * self.orders_block_length() as usize
     }
 }
 
-/// One entry of the `Snapshot.levels` group.
+/// One entry of the `Snapshot.orders` group.
 #[derive(Debug, Clone, Copy)]
-pub struct SnapshotLevelDecoder<'a> {
+pub struct SnapshotOrderDecoder<'a> {
     buf: &'a [u8],
 }
 
-impl<'a> SnapshotLevelDecoder<'a> {
-    pub const BLOCK_LENGTH: u16 = 16;
+impl<'a> SnapshotOrderDecoder<'a> {
+    pub const BLOCK_LENGTH: u16 = 24;
+
+    #[inline(always)]
+    pub fn order_id(&self) -> u64 {
+        le_u64(self.buf, 0)
+    }
 
     /// Fixed point, scaled by 10^-4.
     #[inline(always)]
     pub fn price(&self) -> i64 {
-        le_i64(self.buf, 0)
+        le_i64(self.buf, 8)
     }
 
     #[inline(always)]
     pub fn quantity(&self) -> u32 {
-        le_u32(self.buf, 8)
-    }
-
-    #[inline(always)]
-    pub fn order_count(&self) -> u16 {
-        le_u16(self.buf, 12)
+        le_u32(self.buf, 16)
     }
 
     #[inline(always)]
     pub fn side_raw(&self) -> u8 {
-        le_u8(self.buf, 14)
+        le_u8(self.buf, 20)
     }
 
     /// Validating accessor. Use `side_raw()` on the hot path.
@@ -961,17 +1021,17 @@ impl<'a> SnapshotLevelDecoder<'a> {
     }
 }
 
-/// Iterator over `Snapshot.levels`.
+/// Iterator over `Snapshot.orders`.
 #[derive(Debug, Clone, Copy)]
-pub struct SnapshotLevelsIter<'a> {
+pub struct SnapshotOrdersIter<'a> {
     buf: &'a [u8],
     pos: usize,
     block_len: usize,
     remaining: u16,
 }
 
-impl<'a> Iterator for SnapshotLevelsIter<'a> {
-    type Item = SnapshotLevelDecoder<'a>;
+impl<'a> Iterator for SnapshotOrdersIter<'a> {
+    type Item = SnapshotOrderDecoder<'a>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -981,7 +1041,7 @@ impl<'a> Iterator for SnapshotLevelsIter<'a> {
         self.remaining -= 1;
         let start = self.pos;
         self.pos += self.block_len;
-        Some(SnapshotLevelDecoder {
+        Some(SnapshotOrderDecoder {
             buf: &self.buf[start..self.pos],
         })
     }
@@ -992,12 +1052,12 @@ impl<'a> Iterator for SnapshotLevelsIter<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for SnapshotLevelsIter<'a> {}
+impl<'a> ExactSizeIterator for SnapshotOrdersIter<'a> {}
 
 /// Two-phase encoder for `Snapshot`, which carries a repeating group.
 ///
 /// Writes straight into a caller-owned buffer: `start`, then one
-/// `push_level` per entry, then `finish`. No allocation anywhere.
+/// `push_order` per entry, then `finish`. No allocation anywhere.
 #[derive(Debug)]
 pub struct SnapshotEncoder<'a> {
     buf: &'a mut [u8],
@@ -1025,7 +1085,7 @@ impl<'a> SnapshotEncoder<'a> {
         put_u64(buf, MESSAGE_HEADER_LEN, last_sequence);
         put_u16(buf, MESSAGE_HEADER_LEN + 8, symbol_id);
         put_u8(buf, MESSAGE_HEADER_LEN + 10, flags);
-        put_u16(buf, MESSAGE_HEADER_LEN + 12, 16);
+        put_u16(buf, MESSAGE_HEADER_LEN + 12, 24);
         Ok(Self {
             buf,
             pos: HEAD,
@@ -1033,16 +1093,16 @@ impl<'a> SnapshotEncoder<'a> {
         })
     }
 
-    /// Appends one `levels` entry.
+    /// Appends one `orders` entry.
     #[inline]
-    pub fn push_level(
+    pub fn push_order(
         &mut self,
+        order_id: u64,
         price: i64,
         quantity: u32,
-        order_count: u16,
         side: Side,
     ) -> Result<(), WireError> {
-        const ENTRY: usize = 16;
+        const ENTRY: usize = 24;
         if self.buf.len() < self.pos + ENTRY {
             return Err(WireError::ShortBuffer {
                 needed: self.pos + ENTRY,
@@ -1050,14 +1110,14 @@ impl<'a> SnapshotEncoder<'a> {
             });
         }
         if self.count == u16::MAX {
-            return Err(WireError::GroupOverflow { group: "levels" });
+            return Err(WireError::GroupOverflow { group: "orders" });
         }
         let base = self.pos;
         self.buf[base..base + ENTRY].fill(0);
-        put_i64(self.buf, base, price);
-        put_u32(self.buf, base + 8, quantity);
-        put_u16(self.buf, base + 12, order_count);
-        put_u8(self.buf, base + 14, side as u8);
+        put_u64(self.buf, base, order_id);
+        put_i64(self.buf, base + 8, price);
+        put_u32(self.buf, base + 16, quantity);
+        put_u8(self.buf, base + 20, side as u8);
         self.pos += ENTRY;
         self.count += 1;
         Ok(())

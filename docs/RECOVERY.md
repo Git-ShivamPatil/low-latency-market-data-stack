@@ -65,9 +65,9 @@ times as much stream for the same memory.
 | `LIVE` | Every sequence up to the frontier has been delivered, in order, exactly once. |
 | `GAPPED` | A range is confirmed lost and named. The book downstream of it is not trustworthy. |
 
-`GAPPED` is currently terminal, and it makes the handler exit non-zero. Recovering
-from it — rebuilding via the snapshot cycle or the replay service — is milestone
-4. Until then, the honest thing is to stop claiming the book is right.
+`GAPPED` is cleared only by an actual resync from a snapshot. A run that *ends*
+in it exits non-zero: the whole point of naming the range is that the book
+downstream of it cannot be trusted.
 
 ---
 
@@ -192,3 +192,107 @@ Measured on a 2-core host at 2% loss:
 The uncapped run passed — but it was one bad moment away from inventing gaps that
 never happened, which is the worst possible failure for a component whose entire
 job is telling real loss from apparent loss.
+
+---
+
+## Recovering: the snapshot cycle
+
+Every `snapshot_interval_millis` the engine publishes the whole book, tagged with
+the incremental sequence it reflects. Recovery is: throw the book away, adopt the
+snapshot, resume the live stream from where the snapshot claims to end.
+
+Snapshots ride the same two channels marked with `PACKET_FLAG_SNAPSHOT`, and
+carry **their own sequence space**. A consumer routes on the flag, so a snapshot
+can never look like a gap or a duplicate in the incremental stream. Sharing one
+sequence space would be worse than it sounds: a `LIVE` handler would see snapshot
+messages as increments and apply a whole book on top of the one it has.
+
+### Why the snapshot carries orders, not price levels
+
+This changed during milestone 4, and the reason is worth stating because the
+original design could not work.
+
+An aggregated level says *three orders totalling 250 rest at this price*. It does
+not say which orders, in what queue order, or with what ids — and queue position
+is the whole of price-time priority. An aggregated snapshot therefore cannot
+rebuild an order-level book, only a price-aggregated one.
+
+Per-order entries rebuild both: the aggregate is derivable by summing, the
+reverse is not. **Orders appear in queue order**, so a consumer that re-adds them
+in the order received reproduces priority exactly. That ordering is load-bearing
+and `recovery_restores_queue_position_not_just_quantity` pins it down.
+
+Real exchanges publish both feeds, because at their scale the aggregated one is
+dramatically smaller. This project does not have that problem.
+
+### Three things a cycle has to say
+
+A cycle spans many datagrams — one or more fragments per symbol, every symbol —
+and each boundary needed a marker before recovery was correct:
+
+| Flag | Without it |
+|---|---|
+| `LAST_FRAGMENT` | A partial book for a symbol is treated as complete. |
+| `CYCLE_END` | Recovery finishes on the *first* symbol and discards the snapshots for every other one as unsolicited — reporting success while three books stay stale. |
+| `CYCLE_START` | A consumer joining mid-cycle never clears the symbols whose fragments already went past, and keeps their stale orders forever. |
+
+All three were found by running it, not by reading it. The first version cleared
+the book on every fragment, so only the last fragment's orders survived.
+
+### Reconciling live traffic
+
+The part that is easy to get wrong is what happens to live traffic *during*
+recovery. A snapshot consistent as of sequence `S` arrives when the live stream
+is already at `S + k`. Those `k` messages are not in the snapshot and are not
+coming again. Dropping them puts the book quietly wrong in a new way; applying
+them all would apply some twice.
+
+So live traffic is buffered from the moment recovery starts, and once the
+snapshot is adopted the buffer is replayed from `S + 1`.
+
+**A datagram can straddle that boundary** — starting at a sequence the snapshot
+already reflects and ending past it. Replaying it whole double-applies its first
+few messages, and a double-applied `AddOrder` leaves the book permanently wrong.
+With 32 messages per datagram the boundary lands mid-datagram unless it lands
+exactly on a seam, so this is the normal case, not a corner. The replay tells the
+consumer where to *resume within* each datagram.
+
+### Bounded, or it is a stall
+
+The recovery buffer has a fixed size and the attempt has a deadline. If the
+buffer fills or the deadline passes, recovery has **failed** and the handler says
+so. A recovery path with no failure mode is a hang waiting to happen — and one
+that waits forever looks healthy while holding a book it knows is wrong.
+
+`handler.recovery_timeout_millis` must exceed two snapshot intervals, and the
+config refuses to load otherwise: the cycle already in flight when the gap opened
+may be too old to help, so the *second* one is the first that can close it.
+
+### What is measured
+
+`scripts/smoke.sh` runs a recovery scenario: correlated loss on both arms, a
+200ms snapshot cycle, and then it requires the run to end `LIVE` with every
+shared digest checkpoint matching the engine's, and the worst recovery under a
+2-second budget. A typical run:
+
+```
+  4 gaps, 2 recoveries, worst 48ms, ended LIVE
+  11 shared checkpoints after recovery, every one identical
+```
+
+The checkpoint comparison is the assertion that matters. A handler that recovered
+*quickly* to the *wrong* book would pass a timing check and fail this one.
+
+---
+
+## What is still missing
+
+The `replay-service` binary in the milestone plan is **not built**. Recovery here
+is snapshot-based only.
+
+That is a real gap against the plan, and worth being precise about what it costs:
+a snapshot recovers the book but loses the messages between the gap and the
+snapshot — a consumer that needs the actual trades in that window (for its own
+audit trail, or to drive something downstream) cannot get them. Replay over TCP
+would serve exactly that range. Snapshot recovery is sufficient for rebuilding
+*state*, which is what a book is, and that is why it was built first.

@@ -25,7 +25,7 @@ pub mod digest;
 pub mod digestlog;
 pub mod reference;
 
-pub use apply::{apply_message, ApplyError};
+pub use apply::{apply_message, apply_snapshot, ApplyError};
 pub use digest::{BookDigest, DIGEST_DEPTH};
 pub use digestlog::DigestLog;
 pub use reference::{BookError, Books, Level, ReferenceBook, RestingOrder};

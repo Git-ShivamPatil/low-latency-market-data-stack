@@ -25,9 +25,12 @@ pub enum ApplyError {
     Book { symbol_id: u16, error: BookError },
     /// A field held a value the schema does not define.
     Wire(WireError),
-    /// Rebuilding an order-level book from an aggregated snapshot is not
-    /// possible and is not attempted. See the note in `docs/WIRE.md`.
-    SnapshotNeedsReplay,
+    /// A `Snapshot` fragment named an order the book already holds.
+    ///
+    /// Within one snapshot cycle every order appears once, so this means the
+    /// cycle was not started cleanly — the caller applied a continuation
+    /// fragment without first clearing the symbol via [`apply_snapshot`].
+    SnapshotOverlap { symbol_id: u16, order_id: u64 },
 }
 
 impl std::fmt::Display for ApplyError {
@@ -35,9 +38,13 @@ impl std::fmt::Display for ApplyError {
         match self {
             Self::Book { symbol_id, error } => write!(f, "symbol {symbol_id}: {error}"),
             Self::Wire(e) => write!(f, "{e}"),
-            Self::SnapshotNeedsReplay => f.write_str(
-                "a Snapshot carries aggregated levels, which cannot rebuild an \
-                 order-level book; recovery needs the replay service (milestone 4)",
+            Self::SnapshotOverlap {
+                symbol_id,
+                order_id,
+            } => write!(
+                f,
+                "symbol {symbol_id}: snapshot order {order_id} is already on the book; \
+                 the cycle was not started with apply_snapshot"
             ),
         }
     }
@@ -90,7 +97,45 @@ pub fn apply_message(books: &mut Books, msg: &Message<'_>) -> Result<(), ApplyEr
         Message::Trade(_) => {}
         // Liveness and stream control; neither touches the book.
         Message::Heartbeat(_) | Message::SequenceReset(_) => {}
-        Message::Snapshot(_) => return Err(ApplyError::SnapshotNeedsReplay),
+        // A continuation fragment of a snapshot cycle. The first fragment goes
+        // through `apply_snapshot`, which clears the symbol; the rest append.
+        Message::Snapshot(d) => apply_snapshot_orders(books, d)?,
+    }
+    Ok(())
+}
+
+/// Applies a `Snapshot` as the **start** of a fresh book for its symbol.
+///
+/// A snapshot is the whole book as of `lastSequence`, not an increment, so the
+/// symbol is cleared first. Continuation fragments of the same cycle go through
+/// [`apply_message`], which appends.
+///
+/// Orders are added in the order they appear on the wire, and the publisher
+/// writes them in queue order. That is what lets an order-level snapshot restore
+/// price-time priority exactly — the thing an aggregated snapshot fundamentally
+/// cannot do, because "three orders totalling 250" does not say which of them is
+/// at the front of the queue.
+pub fn apply_snapshot(books: &mut Books, d: &wire::SnapshotDecoder<'_>) -> Result<(), ApplyError> {
+    books.clear_symbol(d.symbol_id());
+    apply_snapshot_orders(books, d)
+}
+
+fn apply_snapshot_orders(
+    books: &mut Books,
+    d: &wire::SnapshotDecoder<'_>,
+) -> Result<(), ApplyError> {
+    let symbol_id = d.symbol_id();
+    let book = books.get_or_create(symbol_id);
+    for order in d.orders() {
+        let side = order.side()?;
+        book.add(order.order_id(), side, order.price(), order.quantity())
+            .map_err(|error| match error {
+                BookError::DuplicateOrderId(order_id) => ApplyError::SnapshotOverlap {
+                    symbol_id,
+                    order_id,
+                },
+                error => ApplyError::Book { symbol_id, error },
+            })?;
     }
     Ok(())
 }
@@ -230,25 +275,118 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_snapshot_says_plainly_that_it_cannot_rebuild_an_order_book() {
+    /// Builds a one-message snapshot datagram for symbol 7.
+    fn snapshot(orders: &[(u64, i64, u32, Side)]) -> Vec<u8> {
         use wire::SnapshotEncoder;
-        let mut buf = vec![0u8; 4096];
-        let mut w = PacketWriter::new(&mut buf, 0, 0, 1, 0).unwrap();
+        let mut buf = vec![0u8; 8192];
+        let mut w = PacketWriter::new(&mut buf, 0, wire::PACKET_FLAG_SNAPSHOT, 1, 0).unwrap();
         let n = {
-            let mut e = SnapshotEncoder::start(w.tail(), 10, 7, 1).unwrap();
-            e.push_level(1_000_000, 10, 1, Side::Bid).unwrap();
+            let mut e = SnapshotEncoder::start(w.tail(), 500, 7, wire::SNAPSHOT_FLAG_LAST_FRAGMENT)
+                .unwrap();
+            for (id, price, qty, side) in orders {
+                e.push_order(*id, *price, *qty, *side).unwrap();
+            }
             e.finish()
         };
         w.commit(n).unwrap();
         let len = w.finish();
+        buf.truncate(len);
+        buf
+    }
 
+    fn decode_snapshot(bytes: &[u8]) -> wire::SnapshotDecoder<'_> {
+        let reader = PacketReader::new(bytes).unwrap();
+        let (_seq, msg) = reader.messages().next().unwrap().unwrap();
+        match msg {
+            Message::Snapshot(d) => d,
+            other => panic!("expected a Snapshot, got template {}", other.template_id()),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_rebuilds_the_book_it_describes() {
+        let bytes = snapshot(&[
+            (1, 1_000_000, 10, Side::Bid),
+            (2, 1_000_000, 5, Side::Bid),
+            (3, 1_000_100, 7, Side::Ask),
+        ]);
         let mut books = Books::new();
-        let reader = PacketReader::new(&buf[..len]).unwrap();
+        apply_snapshot(&mut books, &decode_snapshot(&bytes)).unwrap();
+
+        let book = books.get(7).unwrap();
+        assert_eq!(book.len(), 3);
+        assert_eq!(book.best_bid().unwrap().price, 1_000_000);
+        assert_eq!(book.best_ask().unwrap().price, 1_000_100);
+        books.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_restores_queue_order_not_just_quantity() {
+        // This is the property that justifies carrying orders rather than
+        // aggregated levels. An aggregate could reproduce "15 resting at
+        // 1_000_000" but never which order is at the front of the queue — and
+        // queue position is the whole of price-time priority.
+        let bytes = snapshot(&[
+            (11, 1_000_000, 5, Side::Bid),
+            (22, 1_000_000, 5, Side::Bid),
+            (33, 1_000_000, 5, Side::Bid),
+        ]);
+        let mut books = Books::new();
+        apply_snapshot(&mut books, &decode_snapshot(&bytes)).unwrap();
+
+        assert_eq!(
+            books.get(7).unwrap().front(Side::Bid),
+            Some((1_000_000, 11)),
+            "the first order on the wire must be the front of the queue"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_replaces_the_book_rather_than_merging_into_it() {
+        let mut books = Books::new();
+        books.get_or_create(7).add(99, Side::Ask, 5_000, 1).unwrap();
+
+        let bytes = snapshot(&[(1, 1_000_000, 10, Side::Bid)]);
+        apply_snapshot(&mut books, &decode_snapshot(&bytes)).unwrap();
+
+        let book = books.get(7).unwrap();
+        assert_eq!(book.len(), 1, "the stale order must be gone");
+        assert!(book.get(99).is_none());
+        assert!(book.get(1).is_some());
+    }
+
+    #[test]
+    fn continuation_fragments_append_to_the_cycle() {
+        // apply_snapshot starts a cycle; apply_message continues it.
+        let mut books = Books::new();
+        apply_snapshot(
+            &mut books,
+            &decode_snapshot(&snapshot(&[(1, 1_000_000, 10, Side::Bid)])),
+        )
+        .unwrap();
+
+        let second = snapshot(&[(2, 999_900, 4, Side::Bid)]);
+        let reader = PacketReader::new(&second).unwrap();
+        let (_seq, msg) = reader.messages().next().unwrap().unwrap();
+        apply_message(&mut books, &msg).unwrap();
+
+        assert_eq!(books.get(7).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_fragment_that_repeats_an_order_is_reported_as_a_broken_cycle() {
+        let mut books = Books::new();
+        let bytes = snapshot(&[(1, 1_000_000, 10, Side::Bid)]);
+        apply_snapshot(&mut books, &decode_snapshot(&bytes)).unwrap();
+
+        let reader = PacketReader::new(&bytes).unwrap();
         let (_seq, msg) = reader.messages().next().unwrap().unwrap();
         assert_eq!(
             apply_message(&mut books, &msg),
-            Err(ApplyError::SnapshotNeedsReplay)
+            Err(ApplyError::SnapshotOverlap {
+                symbol_id: 7,
+                order_id: 1
+            })
         );
     }
 }

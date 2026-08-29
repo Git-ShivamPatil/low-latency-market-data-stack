@@ -201,6 +201,13 @@ impl ReferenceBook {
         self.orders.is_empty()
     }
 
+    /// Removes every order, keeping allocated capacity.
+    pub fn clear(&mut self) {
+        self.orders.clear();
+        self.bids.clear();
+        self.asks.clear();
+    }
+
     /// The best price on a side, and the id at the front of its queue — the
     /// order an aggressor would match against first.
     pub fn front(&self, side: Side) -> Option<(i64, u64)> {
@@ -234,6 +241,31 @@ impl ReferenceBook {
                 quantity,
                 order_count: u32::try_from(queue.len()).unwrap_or(u32::MAX),
             });
+        }
+        out
+    }
+
+    /// Every resting order on one side, in the order an aggressor would match
+    /// them: best price first, and within a price, oldest first.
+    ///
+    /// This is the order a snapshot must be written in. A consumer that re-adds
+    /// them in this order reproduces price-time priority exactly, which is the
+    /// whole reason `Snapshot` carries orders rather than aggregated levels —
+    /// an aggregate says how much rests at a price but not which order is at the
+    /// front of the queue.
+    pub fn orders_in_queue_order(&self, side: Side) -> Vec<RestingOrder> {
+        let levels = self.side(side);
+        let iter: Box<dyn Iterator<Item = (&i64, &VecDeque<u64>)>> = match side {
+            Side::Bid => Box::new(levels.iter().rev()),
+            Side::Ask => Box::new(levels.iter()),
+        };
+        let mut out = Vec::with_capacity(self.orders.len());
+        for (_price, queue) in iter {
+            for id in queue {
+                if let Some(order) = self.orders.get(id) {
+                    out.push(*order);
+                }
+            }
         }
         out
     }
@@ -309,6 +341,30 @@ impl Books {
 
     pub fn get(&self, symbol_id: u16) -> Option<&ReferenceBook> {
         self.books.get(&symbol_id)
+    }
+
+    /// Empties one symbol, keeping its allocated capacity.
+    ///
+    /// A snapshot is the whole book as of a sequence, not an increment, so
+    /// applying one starts by discarding whatever was there. Keeping the
+    /// capacity matters because recovery happens while the feed is still
+    /// arriving: this is not the moment to hand memory back and ask for it
+    /// again.
+    /// Empties every book, keeping allocated capacity.
+    ///
+    /// A snapshot *cycle* replaces the whole set, not one symbol: a symbol that
+    /// has gone away since the last cycle simply stops appearing, and clearing
+    /// only the symbols the cycle mentions would leave it resting forever.
+    pub fn clear_all(&mut self) {
+        for book in self.books.values_mut() {
+            book.clear();
+        }
+    }
+
+    pub fn clear_symbol(&mut self, symbol_id: u16) {
+        if let Some(book) = self.books.get_mut(&symbol_id) {
+            book.clear();
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&u16, &ReferenceBook)> {

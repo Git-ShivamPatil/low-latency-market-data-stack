@@ -105,6 +105,17 @@ impl Config {
                 self.feed.max_datagram_bytes
             )));
         }
+        // A recovery has to outlive at least two cycles: the one that may already
+        // have been in flight when the gap opened and is therefore too old, and
+        // the next one, which is the first that can actually close it.
+        if self.feed.snapshot_interval_millis > 0
+            && self.handler.recovery_timeout_millis <= self.feed.snapshot_interval_millis * 2
+        {
+            return Err(ConfigError::Invalid(format!(
+                "handler.recovery_timeout_millis is {} but the snapshot cycle is every {}ms;                  recovery must outlive two cycles or it can time out before the first                  snapshot that could close the gap was ever due",
+                self.handler.recovery_timeout_millis, self.feed.snapshot_interval_millis
+            )));
+        }
         Ok(())
     }
 
@@ -179,6 +190,22 @@ pub struct Feed {
     pub flush_interval_micros: u64,
     /// How often an idle channel emits a `Heartbeat`.
     pub heartbeat_millis: u64,
+    /// How often a full snapshot of every book is published. 0 disables it.
+    ///
+    /// Snapshots ride the same two channels marked with `PACKET_FLAG_SNAPSHOT`
+    /// and carry their own sequence space, so a consumer routes on the flag and
+    /// they never look like a gap in the incremental stream.
+    ///
+    /// The interval is a recovery-time budget, not a tuning knob: a handler that
+    /// cannot replay waits at most this long for a book it can trust.
+    pub snapshot_interval_millis: u64,
+    /// How long to keep publishing snapshots after the last message.
+    ///
+    /// A gap in the final moments of a run is only detectable once the feed goes
+    /// quiet, which is after the engine has stopped. Without a linger, a single
+    /// parting cycle races that detection and usually loses, leaving a consumer
+    /// stuck holding a book it knows is wrong.
+    pub snapshot_linger_millis: u64,
 }
 
 impl Default for Feed {
@@ -198,6 +225,8 @@ impl Default for Feed {
             max_datagram_bytes: 1400,
             flush_interval_micros: 500,
             heartbeat_millis: 1000,
+            snapshot_interval_millis: 2000,
+            snapshot_linger_millis: 3000,
         }
     }
 }
@@ -355,6 +384,18 @@ pub struct Handler {
     /// Declare an outstanding hole lost after this long with nothing arriving.
     /// Without it a stalled feed would hold buffered messages forever.
     pub gap_timeout_millis: u64,
+    /// How many live datagrams may be held while waiting for a snapshot to
+    /// recover from a gap.
+    ///
+    /// At a 2-second snapshot cycle and a batched feed, this is the recovery
+    /// path's memory bound. It has to cover a full cycle of live traffic or
+    /// recovery fails for want of buffer rather than for want of a snapshot.
+    pub recovery_buffer_datagrams: usize,
+    /// Give up on a recovery attempt after this long.
+    ///
+    /// Must comfortably exceed `feed.snapshot_interval_millis`, or a recovery
+    /// will time out before the snapshot it is waiting for was ever due.
+    pub recovery_timeout_millis: u64,
 }
 
 impl Default for Handler {
@@ -367,6 +408,8 @@ impl Default for Handler {
             idle_timeout_seconds: 0,
             reorder_window_datagrams: 256,
             gap_timeout_millis: 250,
+            recovery_buffer_datagrams: 4096,
+            recovery_timeout_millis: 10_000,
         }
     }
 }

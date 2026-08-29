@@ -99,6 +99,9 @@ pub struct ArmCounters {
     pub messages_first: u64,
     /// Datagrams rejected because they would not decode.
     pub malformed: u64,
+    /// Datagrams discarded because the reorder window was full and the stream
+    /// was already gapped. Only reachable when the caller has stopped draining.
+    pub dropped_window_full: u64,
     pub bytes: u64,
 }
 
@@ -181,6 +184,7 @@ pub struct Arbitrator {
     highest_seen: u64,
     max_window_used: usize,
     started: bool,
+    resyncs: u64,
 }
 
 impl Arbitrator {
@@ -221,6 +225,7 @@ impl Arbitrator {
             highest_seen: 0,
             max_window_used: 0,
             started: false,
+            resyncs: 0,
         }
     }
 
@@ -346,8 +351,11 @@ impl Arbitrator {
 
     /// Files the datagram that forced a gap, now that the frontier has moved.
     ///
-    /// The spare slot guarantees this cannot fail, which is why it returns
-    /// nothing: there is no failure for a caller to handle.
+    /// The spare slot is normally free, but it is not *guaranteed* free: a caller
+    /// that stops draining — as the handler does while recovering — leaves the
+    /// window full, and a second gap then arrives with nowhere to put anything.
+    /// This used to `expect` a slot and panicked in exactly that case. A runtime
+    /// condition a caller can provoke is an error path, not an invariant.
     fn keep_after_gap(&mut self, arm: u8, first: u64, count: u16, datagram: &[u8]) {
         let idx = usize::from(arm);
         let end = first.saturating_add(u64::from(count));
@@ -361,11 +369,19 @@ impl Arbitrator {
             self.deliver(first, count);
             return;
         }
-        let slot_idx = self
-            .free_slot()
-            .expect("the spare slot is reserved for exactly this");
-        self.store(slot_idx, arm, first, count, datagram);
-        self.arms[idx].datagrams_buffered += 1;
+        match self.free_slot() {
+            Some(slot_idx) => {
+                self.store(slot_idx, arm, first, count, datagram);
+                self.arms[idx].datagrams_buffered += 1;
+            }
+            None => {
+                // Nowhere to put it and nothing to evict that is not also
+                // needed. Dropping it is honest as long as it is counted and the
+                // stream is already known to be gapped, which it is: this is
+                // only reachable immediately after declaring one.
+                self.arms[idx].dropped_window_full += 1;
+            }
+        }
     }
 
     /// Releases every buffered datagram that is now contiguous.
@@ -387,6 +403,31 @@ impl Arbitrator {
             self.arms[arm_idx].messages_first += u64::from(count);
             self.deliver(first, count);
         }
+    }
+
+    /// Restarts the stream at `sequence` after recovering from a snapshot.
+    ///
+    /// The snapshot replaced the book wholesale, so anything still buffered is
+    /// either already reflected in it or belongs to the replay the caller is
+    /// about to do. Either way this arbitrator's view of the past is void, and
+    /// carrying it forward would resurrect messages the snapshot superseded.
+    ///
+    /// This clears `Gapped`: the gap that triggered recovery has been closed by
+    /// other means, and leaving the state set would mean the handler could never
+    /// report a clean run again.
+    pub fn resync_to(&mut self, sequence: u64) {
+        for slot in &mut self.window {
+            slot.occupied = false;
+        }
+        self.occupied = 0;
+        self.next_expected = sequence;
+        self.state = FeedState::Live;
+        self.started = true;
+        self.resyncs += 1;
+    }
+
+    pub fn resyncs(&self) -> u64 {
+        self.resyncs
     }
 
     /// Declares the current hole lost. Called when the window is full, and by

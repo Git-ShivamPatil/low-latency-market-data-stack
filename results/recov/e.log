@@ -1,0 +1,13 @@
+matching-engine
+  A: unicast-fanout -> [127.0.0.1:31001] (send buffer 8192 KiB)
+  B: unicast-fanout -> [127.0.0.1:31002] (send buffer 8192 KiB)
+  batching 32 messages per datagram, 1400 byte cap
+  4 symbols, seed 6811297534891234561, digest every 1000 sequences
+  checkpoints -> results/recov/e.txt
+  injecting 0.30% loss per arm, correlated (seed 73477133695975424)
+  snapshot cycle every 200ms; first cycle at snapshot sequence 1                          covered 4 symbols and 310 orders in 8 datagrams, consistent as of                          incremental sequence 3999
+       20000 msgs      1626 datagrams  12.3 msg/datagram  4944 msg/s  314 orders resting
+  8560 orders, 3097 trades (413945 shares), 5146 cancels, 1577 amends
+  20 snapshot cycles, 160 snapshot datagrams
+  dropped 7 datagrams on A and 7 on B of 1626 sent (7 on both)
+  final book top=8e1d4a559d8dd1be full=3a52e0bd909fb613 orders=314

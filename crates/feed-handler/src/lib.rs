@@ -8,4 +8,5 @@
 //! and that harness needs to import [`arbitration`].
 
 pub mod arbitration;
+pub mod recovery;
 pub mod stats;

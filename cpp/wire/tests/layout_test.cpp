@@ -43,7 +43,7 @@ std::vector<std::byte> encode_one_add_order() {
     return buf;
 }
 
-std::vector<std::byte> encode_snapshot_with_levels(std::uint16_t levels) {
+std::vector<std::byte> encode_snapshot_with_orders(std::uint16_t orders) {
     std::vector<std::byte> buf(1024);
     auto ph = encode_packet_header(buf.data(), buf.size(),
                                    static_cast<std::uint8_t>(0),
@@ -53,10 +53,10 @@ std::vector<std::byte> encode_snapshot_with_levels(std::uint16_t levels) {
     auto e = SnapshotEncoder::start(buf.data() + pos, buf.size() - pos, 9ULL,
                                    static_cast<std::uint16_t>(4),
                                    static_cast<std::uint8_t>(1));
-    for (std::uint16_t i = 0; i < levels; ++i) {
-        (void)e->push_level(static_cast<std::int64_t>(1000 + i),
-                            static_cast<std::uint32_t>(10),
-                            static_cast<std::uint16_t>(1), Side::kBid);
+    for (std::uint16_t i = 0; i < orders; ++i) {
+        (void)e->push_order(static_cast<std::uint64_t>(i),
+                            static_cast<std::int64_t>(1000 + i),
+                            static_cast<std::uint32_t>(10), Side::kBid);
     }
     pos += e->finish();
     buf.resize(pos);
@@ -122,7 +122,7 @@ int main() {
     // This is the case that reads the group header to find out how long the
     // message is, so it has to prove the header is present before reading it.
     {
-        auto buf = encode_snapshot_with_levels(3);
+        auto buf = encode_snapshot_with_orders(3);
         const std::byte* msg = buf.data() + kPacketHeaderLen;
         const std::size_t msg_len = buf.size() - kPacketHeaderLen;
         bool all_rejected = true;
@@ -133,17 +133,17 @@ int main() {
 
         auto full = SnapshotDecoder::wrap(msg, msg_len);
         check(full.has_value(), "the untruncated Snapshot still wraps");
-        check(full && full->levels_count() == 3, "levels count survives");
+        check(full && full->orders_count() == 3, "orders count survives");
         check(full && full->total_len() == msg_len, "Snapshot total_len is exact");
     }
 
     // --- an empty group still carries its header ------------------------
     {
-        auto buf = encode_snapshot_with_levels(0);
+        auto buf = encode_snapshot_with_orders(0);
         const std::byte* msg = buf.data() + kPacketHeaderLen;
         auto d = SnapshotDecoder::wrap(msg, buf.size() - kPacketHeaderLen);
         check(d.has_value(), "a Snapshot with no levels wraps");
-        check(d && d->levels_count() == 0, "empty group reports zero entries");
+        check(d && d->orders_count() == 0, "empty group reports zero entries");
         check(d && d->total_len() == kMessageHeaderLen + 12 + kGroupSizeEncodingLen,
               "an empty group still occupies its 4-byte header");
     }

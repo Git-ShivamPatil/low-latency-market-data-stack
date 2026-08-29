@@ -96,6 +96,9 @@ pub struct FeedStats {
     pub size_flushes: u64,
     /// Datagrams sent because the flush interval expired with a partial batch.
     pub timer_flushes: u64,
+    /// Snapshot datagrams sent. Counted separately: they are not part of the
+    /// incremental stream and must not inflate its throughput.
+    pub snapshot_datagrams: u64,
     /// Datagrams deliberately not sent, per arm, by the loss injector.
     pub dropped: [u64; 2],
     /// Datagrams dropped on **both** arms, so redundancy could not help.
@@ -142,6 +145,11 @@ pub struct FeedPublisher {
     /// does not change which orders are produced. Without that, a run with loss
     /// and a run without would not be comparable.
     drop_rng: Rng,
+    /// A separate buffer for snapshot datagrams so a cycle cannot disturb a
+    /// half-filled incremental batch.
+    snapshot_buf: Vec<u8>,
+    /// Snapshot datagrams have their own sequence space; see `publish_snapshot`.
+    snapshot_seq: u64,
     /// When self-checking, every datagram is decoded and replayed into here
     /// before it is sent.
     ///
@@ -170,6 +178,8 @@ impl FeedPublisher {
             drop_rate: 0.0,
             drop_mode: DropMode::Independent,
             drop_rng: Rng::new(0x0105_0B10_5510_0000),
+            snapshot_buf: vec![0u8; max_datagram_bytes],
+            snapshot_seq: 1,
             shadow: None,
         }
     }
@@ -310,17 +320,21 @@ impl FeedPublisher {
             self.stats.messages_lost_both += u64::from(count);
         }
 
-        // The two arms differ only in packetHeader.channel, so the header is
-        // rewritten in place per arm and the body is sent untouched.
+        // The header is written ONCE, before any arm is considered. Writing it
+        // inside the loop meant that a datagram dropped on both arms never got a
+        // header at all, and the self-check below then decoded whatever was left
+        // in the buffer from the previous datagram.
+        wire::encode_packet_header(&mut self.buf, 0, 0, first_seq, now_ns).map_err(wire_to_io)?;
+        wire::patch_message_count(&mut self.buf, count).map_err(wire_to_io)?;
+
+        // The two arms differ only in packetHeader.channel.
         for (channel, publisher) in [(0u8, &self.a), (1u8, &self.b)] {
             let arm = usize::from(channel);
             if drop[arm] {
                 self.stats.dropped[arm] += 1;
                 continue;
             }
-            wire::encode_packet_header(&mut self.buf, channel, 0, first_seq, now_ns)
-                .map_err(wire_to_io)?;
-            wire::patch_message_count(&mut self.buf, count).map_err(wire_to_io)?;
+            wire::patch_packet_channel(&mut self.buf, channel).map_err(wire_to_io)?;
             publisher.send(&self.buf[..len])?;
         }
 
@@ -440,6 +454,165 @@ impl FeedPublisher {
     pub fn heartbeat(&mut self, last_sequence: u64) -> io::Result<u64> {
         self.emit(|buf| wire::encode_heartbeat(buf, last_sequence))
     }
+
+    /// Publishes a full snapshot of every symbol on both arms.
+    ///
+    /// # Why snapshots share the channels but not the sequence space
+    ///
+    /// They ride the same two sockets, marked with `PACKET_FLAG_SNAPSHOT`, and
+    /// carry their **own** sequence numbering. A consumer routes on the flag:
+    /// snapshot datagrams never reach the incremental arbitrator, so they cannot
+    /// look like a gap or a duplicate in the live stream.
+    ///
+    /// Sharing one sequence space would be worse than it sounds. A handler that
+    /// is `LIVE` would see snapshot messages as increments and apply a whole book
+    /// on top of the one it already has; one that is `GAPPED` could not tell
+    /// whether a snapshot filled its hole or widened it.
+    ///
+    /// # Consistency
+    ///
+    /// Each `Snapshot` carries `lastSequence`: the incremental sequence the book
+    /// reflects. Because the engine is single-threaded and the incremental buffer
+    /// is flushed first, that is exactly `last_sequence()` at entry, and nothing
+    /// can change the book while the cycle is being written.
+    ///
+    /// # Fragmentation
+    ///
+    /// A symbol with more resting orders than fit in one datagram is split
+    /// across several `Snapshot` messages, one per datagram, and only the last
+    /// carries `SNAPSHOT_FLAG_LAST_FRAGMENT`. A consumer must not treat a partial
+    /// book as complete.
+    pub fn publish_snapshot(&mut self, books: &book::Books) -> io::Result<SnapshotCycle> {
+        // Anything still buffered belongs before the snapshot, or the snapshot
+        // would claim to reflect messages that have not gone out yet.
+        self.flush()?;
+
+        let last_sequence = self.last_sequence();
+        let mut cycle = SnapshotCycle {
+            sequence: self.snapshot_seq,
+            last_sequence,
+            datagrams: 0,
+            orders: 0,
+            symbols: 0,
+        };
+
+        // The last symbol needs to be known in advance so its final fragment can
+        // carry the cycle-end marker. A consumer recovering from a gap waits for
+        // that marker rather than for any one symbol to finish.
+        let symbol_count = books.iter().count();
+        let mut first_fragment_of_cycle = true;
+        for (index, (symbol_id, bookref)) in books.iter().enumerate() {
+            let is_last_symbol = index + 1 == symbol_count;
+            let mut orders = bookref.orders_in_queue_order(Side::Bid);
+            orders.extend(bookref.orders_in_queue_order(Side::Ask));
+            cycle.symbols += 1;
+
+            let mut written = 0usize;
+            // A symbol with no resting orders still gets one empty fragment.
+            // Silence is ambiguous: a recovering consumer cannot tell "this book
+            // is empty" from "this symbol was omitted" without it.
+            loop {
+                let head = wire::PACKET_HEADER_LEN;
+                let mut packed = 0usize;
+                let n = {
+                    let mut e = wire::SnapshotEncoder::start(
+                        &mut self.snapshot_buf[head..],
+                        last_sequence,
+                        *symbol_id,
+                        0,
+                    )
+                    .map_err(wire_to_io)?;
+                    while written + packed < orders.len() {
+                        let o = orders[written + packed];
+                        if e.push_order(o.order_id, o.price, o.quantity, o.side)
+                            .is_err()
+                        {
+                            break;
+                        }
+                        packed += 1;
+                    }
+                    e.finish()
+                };
+                if packed == 0 && !orders.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "not one snapshot order fits in feed.max_datagram_bytes",
+                    ));
+                }
+                written += packed;
+                // Rewrite the root block with the flags set. Cheaper and less
+                // error-prone than threading them through the encoder, since
+                // whether this is the last fragment is only known now.
+                let last_fragment = written >= orders.len();
+                let mut flags = 0u8;
+                if first_fragment_of_cycle {
+                    flags |= wire::SNAPSHOT_FLAG_CYCLE_START;
+                    first_fragment_of_cycle = false;
+                }
+                if last_fragment {
+                    flags |= wire::SNAPSHOT_FLAG_LAST_FRAGMENT;
+                    if is_last_symbol {
+                        flags |= wire::SNAPSHOT_FLAG_CYCLE_END;
+                    }
+                }
+                if flags != 0 {
+                    wire::patch_snapshot_flags(&mut self.snapshot_buf[head..], flags)
+                        .map_err(wire_to_io)?;
+                }
+
+                self.send_snapshot_datagram(head + n)?;
+                cycle.datagrams += 1;
+                cycle.orders += packed as u64;
+                if last_fragment {
+                    break;
+                }
+            }
+        }
+        Ok(cycle)
+    }
+
+    fn send_snapshot_datagram(&mut self, len: usize) -> io::Result<()> {
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let seq = self.snapshot_seq;
+        self.snapshot_seq += 1;
+
+        // Snapshots are deliberately NOT subject to the loss injector. Injected
+        // loss models the network between the engine and a handler; a snapshot
+        // that recovery depends on being dropped by the test harness would make
+        // recovery untestable rather than more realistic. Real loss on the
+        // snapshot channel is a separate scenario, and the recovery tests drive
+        // it explicitly instead of leaving it to chance.
+        wire::encode_packet_header(
+            &mut self.snapshot_buf,
+            0,
+            wire::PACKET_FLAG_SNAPSHOT,
+            seq,
+            now_ns,
+        )
+        .map_err(wire_to_io)?;
+        wire::patch_message_count(&mut self.snapshot_buf, 1).map_err(wire_to_io)?;
+        for (channel, publisher) in [(0u8, &self.a), (1u8, &self.b)] {
+            wire::patch_packet_channel(&mut self.snapshot_buf, channel).map_err(wire_to_io)?;
+            publisher.send(&self.snapshot_buf[..len])?;
+        }
+        self.stats.snapshot_datagrams += 1;
+        Ok(())
+    }
+}
+
+/// What one snapshot cycle put on the wire.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SnapshotCycle {
+    /// First snapshot-space sequence used by this cycle.
+    pub sequence: u64,
+    /// The incremental sequence the books reflect.
+    pub last_sequence: u64,
+    pub datagrams: u64,
+    pub orders: u64,
+    pub symbols: u64,
 }
 
 fn wire_to_io(e: WireError) -> io::Error {

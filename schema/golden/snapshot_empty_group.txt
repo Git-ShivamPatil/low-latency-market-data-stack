@@ -25,7 +25,7 @@ message 0  sequence = 1048583  Snapshot
   0028  09 00                                             symbol_id = 9
   002a  01                                                flags = 1
   002b  00                                                reserved = 0
-  002c  10 00                                             levels.blockLength = 16
-  002e  00 00                                             levels.numInGroup = 0
+  002c  18 00                                             orders.blockLength = 24
+  002e  00 00                                             orders.numInGroup = 0
 
 total 48 bytes

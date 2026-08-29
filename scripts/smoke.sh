@@ -37,6 +37,16 @@ KEEP=0
 # predict exactly which datagrams die and check the reported gaps against them.
 DROP_RATE=0.02
 DROP_MODE=exclusive
+# The recovery scenario, run after the redundancy one. It forces loss on BOTH
+# arms so redundancy cannot help, then requires the handler to rebuild from a
+# snapshot and end LIVE with a book that matches the engine's.
+RECOVERY=1
+RECOVERY_DROP_RATE=0.003
+RECOVERY_SNAPSHOT_MS=200
+# Rate-limited on purpose: unthrottled, the engine finishes before the first
+# snapshot cycle is due, and the run would test nothing.
+RECOVERY_RATE=20000
+RECOVERY_MESSAGES=20000
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --drop-rate) DROP_RATE="$2"; shift 2 ;;
         --drop-mode) DROP_MODE="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
+        --no-recovery) RECOVERY=0; shift ;;
         -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -322,6 +333,116 @@ PY
     fi
     echo
 done
+
+# --------------------------------------------------------------------------
+# Recovery: loss on both arms, then rebuild from a snapshot.
+# --------------------------------------------------------------------------
+if [[ $RECOVERY -eq 1 ]]; then
+    echo "=============================================================="
+    echo " recovery: ${RECOVERY_DROP_RATE} correlated loss, ${RECOVERY_SNAPSHOT_MS}ms snapshots"
+    echo "=============================================================="
+
+    E_DIG="$OUT/recovery-engine.txt"
+    H_DIG="$OUT/recovery-handler.txt"
+    H_SUM="$OUT/recovery-handler.summary"
+    E_LOG="$OUT/recovery-engine.log"
+    H_LOG="$OUT/recovery-handler.log"
+    rm -f "$E_DIG" "$H_DIG" "$H_SUM" "$E_LOG" "$H_LOG"
+
+    "$HANDLER"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --messages "$RECOVERY_MESSAGES"         --digest-path "$H_DIG"         --digest-interval "$DIGEST_INTERVAL"         --idle-timeout "$IDLE_TIMEOUT"         --summary-path "$H_SUM"         >"$H_LOG" 2>&1 &
+    RPID=$!
+    sleep 1
+
+    "$ENGINE"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --messages "$RECOVERY_MESSAGES"         --rate "$RECOVERY_RATE"         --snapshot-interval "$RECOVERY_SNAPSHOT_MS"         --drop-rate "$RECOVERY_DROP_RATE"         --drop-mode correlated         --digest-path "$E_DIG"         >"$E_LOG" 2>&1
+    wait $RPID && rstatus=0 || rstatus=$?
+
+    echo "--- handler ---"
+    grep -E "GAP|RECOVERED|recovery failed|NOT CLEAN" "$H_LOG" | head -8 | sed 's/^/  /'
+    echo
+
+    rec=0
+    if [[ $rstatus -ne 0 ]]; then
+        echo "FAIL: the handler exited $rstatus after a recovery run" >&2
+        rec=1
+    fi
+
+    python3 - "$H_SUM" "$E_DIG" "$H_DIG" <<'PY' || rec=1
+import sys
+
+summary_path, engine_path, handler_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(summary_path) as f:
+    s = dict(line.strip().split("=", 1) for line in f if "=" in line)
+
+fails = []
+gaps = int(s.get("gaps", 0))
+recoveries = int(s.get("recoveries", 0))
+
+# The scenario has to actually produce gaps, or it proves nothing about
+# recovering from them.
+if gaps == 0:
+    fails.append(
+        "no gap ever occurred, so the recovery path was never exercised - raise "
+        "the drop rate or lengthen the run"
+    )
+if recoveries == 0:
+    fails.append("no recovery completed")
+if s.get("state") != "LIVE":
+    fails.append(f"the run ended {s.get('state')}, not LIVE - it never got back to a good book")
+if int(s.get("recovery_failures", 0)) != 0:
+    fails.append(f"{s['recovery_failures']} recovery attempts failed")
+if s.get("still_recovering") != "false":
+    fails.append("the run ended mid-recovery, holding traffic it never applied")
+if int(s.get("apply_errors", 0)) != 0:
+    fails.append(
+        f"{s['apply_errors']} messages did not apply - a recovered book that "
+        "rejects live traffic was not correctly rebuilt"
+    )
+
+# Recovery has to be bounded, not merely eventual.
+worst = int(s.get("recovery_worst_millis", 0))
+LIMIT = 2000
+if worst > LIMIT:
+    fails.append(f"the worst recovery took {worst}ms, over the {LIMIT}ms budget")
+
+# And the point of it all: the rebuilt book has to be the engine's book.
+def load(path):
+    rows = {}
+    for line in open(path):
+        parts = line.split()
+        if len(parts) == 4:
+            rows[int(parts[0])] = tuple(parts[1:])
+    return rows
+
+engine, handler = load(engine_path), load(handler_path)
+shared = sorted(set(engine) & set(handler))
+if not shared:
+    fails.append("no shared checkpoints, so the books were never compared")
+bad = [x for x in shared if engine[x] != handler[x]]
+if bad:
+    x = bad[0]
+    fails.append(
+        f"the books disagree at {len(bad)} of {len(shared)} checkpoints; first at "
+        f"sequence {x}: engine {engine[x]} vs handler {handler[x]}"
+    )
+
+if fails:
+    for f in fails:
+        print(f"FAIL: {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"  {gaps} gaps, {recoveries} recoveries, worst {worst}ms, ended {s['state']}")
+print(f"  {len(shared)} shared checkpoints after recovery, every one identical")
+print(f"  snapshots seen {s.get('snapshots_seen')}, discarded {s.get('snapshots_discarded')}")
+PY
+
+    if [[ $rec -eq 0 ]]; then
+        echo "  PASS (recovery)"
+    else
+        echo "  FAIL (recovery)"
+        overall=1
+    fi
+    echo
+fi
 
 if [[ $KEEP -eq 0 && $overall -eq 0 ]]; then
     rm -rf "$OUT"

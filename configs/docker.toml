@@ -26,6 +26,17 @@ max_datagram_bytes = 1400
 flush_interval_micros = 500
 heartbeat_millis = 1000
 
+# How often the whole book is published as a snapshot. 0 disables the cycle.
+#
+# Snapshots ride the same two channels marked with the snapshot flag, and carry
+# their own sequence space, so a consumer routes on the flag and they never look
+# like a gap in the incremental stream. Each one says which incremental sequence
+# it reflects.
+#
+# This interval is a recovery-time budget rather than a tuning knob: a handler
+# that has lost messages waits at most this long for a book it can trust.
+snapshot_interval_millis = 2000
+
 [feed.a]
 group = "239.1.1.1:30001"
 # A literal address, not a service name: these are parsed as SocketAddrV4 and
@@ -69,6 +80,17 @@ drop_seed = 73477133695975424
 digest_interval = 1000
 reorder_window_datagrams = 256
 gap_timeout_millis = 250
+
+# How many live datagrams may be held while waiting for a snapshot to recover
+# from a gap. This is the recovery path's memory bound, and it has to cover a
+# full snapshot cycle of live traffic or recovery fails for want of buffer
+# rather than for want of a snapshot.
+recovery_buffer_datagrams = 4096
+
+# Give up on a recovery attempt after this long. Must comfortably exceed
+# feed.snapshot_interval_millis, or recovery would time out before the snapshot
+# it is waiting for was ever due. The config refuses to load otherwise.
+recovery_timeout_millis = 10000
 stats_interval_millis = 5000
 messages = 0
 idle_timeout_seconds = 0

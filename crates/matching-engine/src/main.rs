@@ -115,6 +115,11 @@ struct Args {
     #[arg(long)]
     drop_seed: Option<u64>,
 
+    /// How often to publish a full snapshot of every book, in milliseconds.
+    /// 0 disables the cycle.
+    #[arg(long, value_name = "MS")]
+    snapshot_interval: Option<u64>,
+
     /// Print the resolved configuration and exit without sending anything.
     #[arg(long)]
     dry_run: bool,
@@ -218,10 +223,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rate = cfg.engine.rate_per_second;
     let flush_interval = Duration::from_micros(cfg.feed.flush_interval_micros.max(1));
     let heartbeat_interval = Duration::from_millis(cfg.feed.heartbeat_millis.max(1));
+    // 0 disables the cycle entirely, which is what the tests that want a bare
+    // incremental feed use.
+    let snapshot_interval = (cfg.feed.snapshot_interval_millis > 0)
+        .then(|| Duration::from_millis(cfg.feed.snapshot_interval_millis));
 
     let mut last_flush = Instant::now();
     let mut last_heartbeat = Instant::now();
     let mut last_report = Instant::now();
+    let mut last_snapshot = Instant::now();
+    let mut snapshot_cycles = 0u64;
 
     // Bounded by --messages or --duration. There is deliberately no signal
     // handler: installing one needs a crate or `unsafe`, and this workspace
@@ -287,6 +298,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             feed.heartbeat(feed.last_sequence())?;
             last_heartbeat = now;
         }
+        if let Some(interval) = snapshot_interval {
+            if now.duration_since(last_snapshot) >= interval {
+                let cycle = feed.publish_snapshot(engine.books())?;
+                snapshot_cycles += 1;
+                if snapshot_cycles == 1 {
+                    eprintln!(
+                        "  snapshot cycle every {}ms; first cycle at snapshot sequence {}                          covered {} symbols and {} orders in {} datagrams, consistent as of                          incremental sequence {}",
+                        interval.as_millis(),
+                        cycle.sequence,
+                        cycle.symbols,
+                        cycle.orders,
+                        cycle.datagrams,
+                        cycle.last_sequence
+                    );
+                }
+                last_snapshot = now;
+            }
+        }
         if now.duration_since(last_report) >= Duration::from_secs(5) {
             report(&feed, &engine, started);
             last_report = now;
@@ -298,6 +327,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     feed.flush()?;
+    // Keep publishing snapshots for a short while after the last message.
+    //
+    // A gap in the final moments of a run is only detectable once the feed goes
+    // quiet, which by definition happens after the engine has stopped. A single
+    // parting cycle races that detection and usually loses, leaving a consumer
+    // stuck in GAPPED holding a book it knows is wrong, with nothing further
+    // coming that could fix it.
+    if let Some(interval) = snapshot_interval {
+        let linger_until = Instant::now() + Duration::from_millis(cfg.feed.snapshot_linger_millis);
+        loop {
+            feed.publish_snapshot(engine.books())?;
+            snapshot_cycles += 1;
+            if Instant::now() >= linger_until {
+                break;
+            }
+            std::thread::sleep(interval);
+        }
+    }
     if let Some(shadow) = feed.shadow() {
         // Everything has been flushed, so the shadow covers exactly the same
         // sequence range as the engine's own book. This is the only point where
@@ -322,6 +369,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         s.orders_submitted, s.trades, s.shares_traded, s.cancels, s.modifies
     );
     let f = feed.stats();
+    if snapshot_cycles > 0 {
+        eprintln!(
+            "  {snapshot_cycles} snapshot cycles, {} snapshot datagrams",
+            f.snapshot_datagrams
+        );
+    }
     if feed.loss_enabled() {
         eprintln!(
             "  dropped {} datagrams on A and {} on B of {} sent ({} on both)",
@@ -371,6 +424,9 @@ fn apply_overrides(cfg: &mut Config, args: &Args) {
     }
     if let Some(v) = args.drop_seed {
         cfg.engine.drop_seed = v;
+    }
+    if let Some(v) = args.snapshot_interval {
+        cfg.feed.snapshot_interval_millis = v;
     }
     if args.digest_path.is_some() {
         cfg.engine.digest_path = args.digest_path.clone();

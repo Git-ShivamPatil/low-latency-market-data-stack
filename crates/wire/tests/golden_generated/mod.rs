@@ -82,11 +82,11 @@ pub const VECTORS: &[Vector] = &[
         build: build_sequence_reset,
     },
     Vector {
-        name: "snapshot_two_levels",
-        file: "snapshot_two_levels.bin",
-        why: "The repeating group, and the snapshot flag on the packet header.",
-        check: check_snapshot_two_levels,
-        build: build_snapshot_two_levels,
+        name: "snapshot_two_orders",
+        file: "snapshot_two_orders.bin",
+        why: "The repeating group, the snapshot flag on the packet header, and the last-fragment flag on the message. Orders are listed in queue order: a consumer that re-adds them in this order reproduces price-time priority exactly, which an aggregated snapshot could never do.",
+        check: check_snapshot_two_orders,
+        build: build_snapshot_two_orders,
     },
     Vector {
         name: "snapshot_empty_group",
@@ -448,8 +448,8 @@ pub fn build_sequence_reset(out: &mut [u8]) -> Result<usize, WireError> {
     Ok(w.finish())
 }
 
-/// The repeating group, and the snapshot flag on the packet header.
-pub fn check_snapshot_two_levels(buf: &[u8]) -> Result<(), String> {
+/// The repeating group, the snapshot flag on the packet header, and the last-fragment flag on the message. Orders are listed in queue order: a consumer that re-adds them in this order reproduces price-time priority exactly, which an aggregated snapshot could never do.
+pub fn check_snapshot_two_orders(buf: &[u8]) -> Result<(), String> {
     let r = PacketReader::new(buf).map_err(|e| format!("packet header: {e}"))?;
     let h = r.header();
     eq_u16("packet.schemaId", h.schema_id(), 1)?;
@@ -481,36 +481,36 @@ pub fn check_snapshot_two_levels(buf: &[u8]) -> Result<(), String> {
     eq_u64("message 0.last_sequence", d.last_sequence(), 1048576u64)?;
     eq_u16("message 0.symbol_id", d.symbol_id(), 7u16)?;
     eq_u8("message 0.flags", d.flags(), 1u8)?;
-    eq_u16("message 0.levels.numInGroup", d.levels_count(), 2)?;
-    eq_u16("message 0.levels.blockLength", d.levels_block_length(), 16)?;
-    let mut lv = d.levels();
+    eq_u16("message 0.orders.numInGroup", d.orders_count(), 2)?;
+    eq_u16("message 0.orders.blockLength", d.orders_block_length(), 24)?;
+    let mut lv = d.orders();
     let l = lv
         .next()
         .ok_or_else(|| "message 0: level 0 missing".to_string())?;
-    eq_i64("message 0.levels[0].price", l.price(), 1012500)?;
-    eq_u32("message 0.levels[0].quantity", l.quantity(), 250u32)?;
-    eq_u16("message 0.levels[0].order_count", l.order_count(), 3u16)?;
+    eq_u64("message 0.orders[0].order_id", l.order_id(), 4294967298u64)?;
+    eq_i64("message 0.orders[0].price", l.price(), 1012500)?;
+    eq_u32("message 0.orders[0].quantity", l.quantity(), 250u32)?;
     if l.side()
-        .map_err(|e| format!("message 0.levels[0].side: {e}"))?
+        .map_err(|e| format!("message 0.orders[0].side: {e}"))?
         != Side::Bid
     {
         return Err(format!(
-            "message 0.levels[0].side: expected Side::Bid, got {:?}",
+            "message 0.orders[0].side: expected Side::Bid, got {:?}",
             l.side()
         ));
     }
     let l = lv
         .next()
         .ok_or_else(|| "message 0: level 1 missing".to_string())?;
-    eq_i64("message 0.levels[1].price", l.price(), 1012600)?;
-    eq_u32("message 0.levels[1].quantity", l.quantity(), 100u32)?;
-    eq_u16("message 0.levels[1].order_count", l.order_count(), 1u16)?;
+    eq_u64("message 0.orders[1].order_id", l.order_id(), 4294967299u64)?;
+    eq_i64("message 0.orders[1].price", l.price(), 1012600)?;
+    eq_u32("message 0.orders[1].quantity", l.quantity(), 100u32)?;
     if l.side()
-        .map_err(|e| format!("message 0.levels[1].side: {e}"))?
+        .map_err(|e| format!("message 0.orders[1].side: {e}"))?
         != Side::Ask
     {
         return Err(format!(
-            "message 0.levels[1].side: expected Side::Ask, got {:?}",
+            "message 0.orders[1].side: expected Side::Ask, got {:?}",
             l.side()
         ));
     }
@@ -524,13 +524,13 @@ pub fn check_snapshot_two_levels(buf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Re-encodes `snapshot_two_levels` from the same values `check_snapshot_two_levels` asserts.
-pub fn build_snapshot_two_levels(out: &mut [u8]) -> Result<usize, WireError> {
+/// Re-encodes `snapshot_two_orders` from the same values `check_snapshot_two_orders` asserts.
+pub fn build_snapshot_two_orders(out: &mut [u8]) -> Result<usize, WireError> {
     let mut w = PacketWriter::new(out, 0, 1, 1048582, 1702361767298204934)?;
     let n = {
         let mut e = SnapshotEncoder::start(w.tail(), 1048576, 7, 1)?;
-        e.push_level(1012500, 250, 3, Side::Bid)?;
-        e.push_level(1012600, 100, 1, Side::Ask)?;
+        e.push_order(4294967298, 1012500, 250, Side::Bid)?;
+        e.push_order(4294967299, 1012600, 100, Side::Ask)?;
         e.finish()
     };
     w.commit(n)?;
@@ -570,9 +570,9 @@ pub fn check_snapshot_empty_group(buf: &[u8]) -> Result<(), String> {
     eq_u64("message 0.last_sequence", d.last_sequence(), 1048583u64)?;
     eq_u16("message 0.symbol_id", d.symbol_id(), 9u16)?;
     eq_u8("message 0.flags", d.flags(), 1u8)?;
-    eq_u16("message 0.levels.numInGroup", d.levels_count(), 0)?;
-    eq_u16("message 0.levels.blockLength", d.levels_block_length(), 16)?;
-    let mut lv = d.levels();
+    eq_u16("message 0.orders.numInGroup", d.orders_count(), 0)?;
+    eq_u16("message 0.orders.blockLength", d.orders_block_length(), 24)?;
+    let mut lv = d.orders();
     if lv.next().is_some() {
         return Err("message 0: extra levels".to_string());
     }
@@ -671,51 +671,51 @@ pub fn check_batch_mixed(buf: &[u8]) -> Result<(), String> {
     eq_u64("message 2.last_sequence", d.last_sequence(), 4294967295u64)?;
     eq_u16("message 2.symbol_id", d.symbol_id(), 3u16)?;
     eq_u8("message 2.flags", d.flags(), 0u8)?;
-    eq_u16("message 2.levels.numInGroup", d.levels_count(), 3)?;
-    eq_u16("message 2.levels.blockLength", d.levels_block_length(), 16)?;
-    let mut lv = d.levels();
+    eq_u16("message 2.orders.numInGroup", d.orders_count(), 3)?;
+    eq_u16("message 2.orders.blockLength", d.orders_block_length(), 24)?;
+    let mut lv = d.orders();
     let l = lv
         .next()
         .ok_or_else(|| "message 2: level 0 missing".to_string())?;
-    eq_i64("message 2.levels[0].price", l.price(), 990000)?;
-    eq_u32("message 2.levels[0].quantity", l.quantity(), 1000u32)?;
-    eq_u16("message 2.levels[0].order_count", l.order_count(), 1u16)?;
+    eq_u64("message 2.orders[0].order_id", l.order_id(), 8589934593u64)?;
+    eq_i64("message 2.orders[0].price", l.price(), 990000)?;
+    eq_u32("message 2.orders[0].quantity", l.quantity(), 1000u32)?;
     if l.side()
-        .map_err(|e| format!("message 2.levels[0].side: {e}"))?
+        .map_err(|e| format!("message 2.orders[0].side: {e}"))?
         != Side::Bid
     {
         return Err(format!(
-            "message 2.levels[0].side: expected Side::Bid, got {:?}",
+            "message 2.orders[0].side: expected Side::Bid, got {:?}",
             l.side()
         ));
     }
     let l = lv
         .next()
         .ok_or_else(|| "message 2: level 1 missing".to_string())?;
-    eq_i64("message 2.levels[1].price", l.price(), 990100)?;
-    eq_u32("message 2.levels[1].quantity", l.quantity(), 400u32)?;
-    eq_u16("message 2.levels[1].order_count", l.order_count(), 2u16)?;
+    eq_u64("message 2.orders[1].order_id", l.order_id(), 8589934596u64)?;
+    eq_i64("message 2.orders[1].price", l.price(), 990100)?;
+    eq_u32("message 2.orders[1].quantity", l.quantity(), 400u32)?;
     if l.side()
-        .map_err(|e| format!("message 2.levels[1].side: {e}"))?
+        .map_err(|e| format!("message 2.orders[1].side: {e}"))?
         != Side::Ask
     {
         return Err(format!(
-            "message 2.levels[1].side: expected Side::Ask, got {:?}",
+            "message 2.orders[1].side: expected Side::Ask, got {:?}",
             l.side()
         ));
     }
     let l = lv
         .next()
         .ok_or_else(|| "message 2: level 2 missing".to_string())?;
-    eq_i64("message 2.levels[2].price", l.price(), 990200)?;
-    eq_u32("message 2.levels[2].quantity", l.quantity(), 700u32)?;
-    eq_u16("message 2.levels[2].order_count", l.order_count(), 5u16)?;
+    eq_u64("message 2.orders[2].order_id", l.order_id(), 8589934597u64)?;
+    eq_i64("message 2.orders[2].price", l.price(), 990200)?;
+    eq_u32("message 2.orders[2].quantity", l.quantity(), 700u32)?;
     if l.side()
-        .map_err(|e| format!("message 2.levels[2].side: {e}"))?
+        .map_err(|e| format!("message 2.orders[2].side: {e}"))?
         != Side::Ask
     {
         return Err(format!(
-            "message 2.levels[2].side: expected Side::Ask, got {:?}",
+            "message 2.orders[2].side: expected Side::Ask, got {:?}",
             l.side()
         ));
     }
@@ -815,9 +815,9 @@ pub fn build_batch_mixed(out: &mut [u8]) -> Result<usize, WireError> {
     w.delete_order(8589934594, 3, Side::Ask)?;
     let n = {
         let mut e = SnapshotEncoder::start(w.tail(), 4294967295, 3, 0)?;
-        e.push_level(990000, 1000, 1, Side::Bid)?;
-        e.push_level(990100, 400, 2, Side::Ask)?;
-        e.push_level(990200, 700, 5, Side::Ask)?;
+        e.push_order(8589934593, 990000, 1000, Side::Bid)?;
+        e.push_order(8589934596, 990100, 400, Side::Ask)?;
+        e.push_order(8589934597, 990200, 700, Side::Ask)?;
         e.finish()
     };
     w.commit(n)?;

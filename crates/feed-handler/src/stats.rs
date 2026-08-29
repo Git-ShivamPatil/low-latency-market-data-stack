@@ -14,6 +14,7 @@ use std::time::Instant;
 use book::BookDigest;
 
 use crate::arbitration::{Arbitrator, FeedState};
+use crate::recovery::RecoveryStats;
 
 /// Counters the arbitrator does not own: book-level and message-level facts.
 #[derive(Debug, Default, Clone, Copy)]
@@ -32,6 +33,12 @@ pub struct HandlerStats {
     /// fallout, counted separately so it cannot mask the field above.
     pub apply_errors_after_gap: u64,
     pub joined_mid_stream: bool,
+    /// Recoveries that returned the handler to a trustworthy book.
+    pub recoveries: u64,
+    /// Recovery attempts that ran out of buffer or time.
+    pub recovery_failures: u64,
+    /// Snapshot fragments ignored because they predated the gap.
+    pub snapshots_discarded: u64,
 }
 
 impl HandlerStats {
@@ -54,6 +61,12 @@ impl HandlerStats {
             arb.max_window_used(),
             arb.window_capacity(),
         );
+        if self.recoveries > 0 || self.recovery_failures > 0 {
+            eprintln!(
+                "  recovered {} times, {} failed",
+                self.recoveries, self.recovery_failures
+            );
+        }
 
         // The health question is whether an arm is carrying traffic at all.
         // First-arrival *share* is not a health signal: on a quiet host the two
@@ -140,15 +153,49 @@ impl HandlerStats {
         f.flush()
     }
 
-    /// A run is clean when the stream was complete and everything applied.
+    /// Recovery counters, written alongside the rest of the summary.
+    pub fn write_recovery(&self, path: &Path, r: RecoveryStats, resyncs: u64) -> io::Result<()> {
+        use std::fs::OpenOptions;
+        let mut f = OpenOptions::new().append(true).open(path)?;
+        writeln!(f, "recoveries={}", self.recoveries)?;
+        writeln!(f, "recovery_failures={}", self.recovery_failures)?;
+        writeln!(f, "recovery_attempts={}", r.attempts)?;
+        writeln!(f, "recovery_datagrams_buffered={}", r.datagrams_buffered)?;
+        writeln!(f, "recovery_messages_replayed={}", r.messages_replayed)?;
+        writeln!(f, "recovery_messages_skipped={}", r.messages_skipped)?;
+        writeln!(f, "snapshots_seen={}", r.snapshots_seen)?;
+        writeln!(f, "snapshots_discarded={}", self.snapshots_discarded)?;
+        // The worst case, not the most recent: a threshold assertion that
+        // watched only the last recovery would miss the one that blew it.
+        writeln!(f, "recovery_worst_millis={}", r.worst_recovery_millis)?;
+        writeln!(f, "recovery_last_millis={}", r.last_recovery_millis)?;
+        writeln!(f, "resyncs={resyncs}")?;
+        writeln!(
+            f,
+            "still_recovering={}",
+            r.attempts > self.recoveries + self.recovery_failures
+        )?;
+        f.flush()
+    }
+
+    /// A run is clean when it ends holding a book that can be trusted.
     ///
-    /// `Gapped` is deliberately fatal here even though the handler kept running:
-    /// the whole point of naming the range is that the book downstream of it is
-    /// not trustworthy, and an exit code that shrugged at that would undo the
-    /// honesty.
-    pub fn is_clean(&self, arb: &Arbitrator) -> bool {
+    /// A gap is no longer automatically fatal — that is what the snapshot cycle
+    /// changed. What matters is whether the run *ended* with one outstanding.
+    ///
+    /// Note what this deliberately does not do: compare the gap count against
+    /// the recovery count. Several gaps can open while a single recovery is in
+    /// flight, and one snapshot closes all of them, so requiring one recovery
+    /// per gap would fail a run that behaved perfectly. `Gapped` is cleared only
+    /// by an actual resync, so the state is the honest signal.
+    ///
+    /// `recovering` is passed in because a run that stops while still holding
+    /// traffic never finished the recovery it started, and its books are as
+    /// stale as the moment the gap opened.
+    pub fn is_clean(&self, arb: &Arbitrator, recovering: bool) -> bool {
         arb.state() != FeedState::Gapped
-            && arb.gaps().is_empty()
+            && !recovering
+            && self.recovery_failures == 0
             && self.bad_datagrams == 0
             && self.apply_errors == 0
     }

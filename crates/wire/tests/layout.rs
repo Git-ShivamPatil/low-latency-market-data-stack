@@ -20,13 +20,13 @@ fn one_add_order() -> Vec<u8> {
     buf
 }
 
-fn snapshot_with_levels(levels: u16) -> Vec<u8> {
+fn snapshot_with_orders(orders: u16) -> Vec<u8> {
     let mut buf = vec![0u8; 1024];
     let mut w = PacketWriter::new(&mut buf, 0, PACKET_FLAG_SNAPSHOT, 1, 2).expect("header");
     let n = {
         let mut e = SnapshotEncoder::start(w.tail(), 9, 4, 1).expect("snapshot start");
-        for i in 0..levels {
-            e.push_level(1000 + i64::from(i), 10, 1, Side::Bid)
+        for i in 0..orders {
+            e.push_order(u64::from(i), 1000 + i64::from(i), 10, Side::Bid)
                 .expect("push level");
         }
         e.finish()
@@ -117,7 +117,7 @@ fn every_truncation_is_rejected_rather_than_panicking() {
 /// a panic on a truncated datagram, not a decode error.
 #[test]
 fn every_truncation_of_a_group_message_is_rejected() {
-    let buf = snapshot_with_levels(3);
+    let buf = snapshot_with_orders(3);
     let msg = &buf[PACKET_HEADER_LEN..];
     for n in 0..msg.len() {
         assert!(
@@ -126,18 +126,18 @@ fn every_truncation_of_a_group_message_is_rejected() {
         );
     }
     let full = SnapshotDecoder::wrap(msg).expect("full snapshot");
-    assert_eq!(full.levels_count(), 3);
+    assert_eq!(full.orders_count(), 3);
     assert_eq!(full.total_len(), msg.len());
-    assert_eq!(full.levels().count(), 3);
+    assert_eq!(full.orders().count(), 3);
 }
 
 #[test]
 fn an_empty_group_still_carries_its_header() {
-    let buf = snapshot_with_levels(0);
+    let buf = snapshot_with_orders(0);
     let msg = &buf[PACKET_HEADER_LEN..];
     let d = SnapshotDecoder::wrap(msg).expect("empty snapshot");
-    assert_eq!(d.levels_count(), 0);
-    assert_eq!(d.levels().count(), 0);
+    assert_eq!(d.orders_count(), 0);
+    assert_eq!(d.orders().count(), 0);
     assert_eq!(
         d.total_len(),
         MESSAGE_HEADER_LEN + 12 + GROUP_SIZE_ENCODING_LEN
@@ -254,20 +254,20 @@ fn encoders_refuse_to_write_past_the_end_of_the_buffer() {
 
 #[test]
 fn a_group_encoder_refuses_to_overrun_its_buffer() {
-    let mut buf = vec![0u8; MESSAGE_HEADER_LEN + 12 + GROUP_SIZE_ENCODING_LEN + 16];
+    let mut buf = vec![0u8; MESSAGE_HEADER_LEN + 12 + GROUP_SIZE_ENCODING_LEN + 24];
     let mut e = SnapshotEncoder::start(&mut buf, 1, 1, 0).expect("start");
     assert!(
-        e.push_level(1, 1, 1, Side::Bid).is_ok(),
+        e.push_order(1, 1, 1, Side::Bid).is_ok(),
         "the first entry fits"
     );
     assert!(
-        e.push_level(2, 1, 1, Side::Bid).is_err(),
+        e.push_order(2, 1, 1, Side::Bid).is_err(),
         "the second must not run past the buffer"
     );
     let n = e.finish();
     let d = SnapshotDecoder::wrap(&buf[..n]).expect("wrap");
     assert_eq!(
-        d.levels_count(),
+        d.orders_count(),
         1,
         "the rejected entry must not be counted"
     );
