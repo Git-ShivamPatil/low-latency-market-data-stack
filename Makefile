@@ -101,10 +101,17 @@ clean: ## Remove build output from both toolchains
 	rm -rf $(CPP_BUILD)
 
 # Benchmarks are deliberately not a CI target and deliberately not part of
-# `make test`. They land in milestone 6, and they must never run on a shared
-# runner: numbers from a noisy virtualised host would discredit the honest ones.
+# `make test`. They must never run on a shared runner: numbers from a noisy
+# virtualised host would discredit the honest ones.
+
+.PHONY: hostcheck
+hostcheck: ## Say whether this machine may publish a performance number
+	$(CARGO) run --release -p bench --bin hostcheck
+
 .PHONY: bench
-bench:
-	@echo "Benchmarks arrive in milestone 6. See CLAIMS.md for what has been measured."
-	@echo "Nothing in this repository has been benchmarked yet."
-	@exit 1
+bench: ## Run the benchmark harness behind the host gate
+	scripts/bench.sh all
+
+.PHONY: bench-micro
+bench-micro: ## Criterion microbenchmarks only
+	scripts/bench.sh micro

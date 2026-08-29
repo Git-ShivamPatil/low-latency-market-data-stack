@@ -24,6 +24,8 @@ path = "src/main.rs"
 wire = { path = "../wire" }
 book = { path = "../book" }
 alloc-guard = { path = "../alloc-guard" }
+# The latency histogram and the cycle counter behind --latency-histogram.
+bench-support = { path = "../bench-support" }
 transport = { path = "../transport" }
 mdconfig = { path = "../mdconfig" }
 replay-service = { path = "../replay-service" }

@@ -28,6 +28,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use alloc_guard::{AllocCounts, AllocGuard, CountingAllocator};
+use bench_support::{tsc, Tsc};
 use book::{
     apply_message, BookDigest, BookSet, Books, DigestLog, FastBooks, MboCapacity, OrderBook,
 };
@@ -125,6 +126,16 @@ struct Args {
     /// test.
     #[arg(long, value_enum, default_value_t = BookKind::Fast)]
     books: BookKind,
+
+    /// Time the consume path with the cycle counter and report a latency
+    /// histogram: median, p99 and p99.9, per datagram and per message.
+    ///
+    /// Measures the *timed* path. The `lfence; rdtsc` pair serialises work the
+    /// untimed path overlaps, so the result is an upper bound on the real cost,
+    /// not an estimate of it. Read it next to the Criterion microbenchmarks,
+    /// which give the lower bound, and never on its own.
+    #[arg(long)]
+    latency_histogram: bool,
 
     /// Count heap operations in the steady-state receive loop and report the
     /// total.
@@ -322,6 +333,7 @@ fn run_with<B: BookSet>(
             args.drop_seed
         );
     }
+    let mut latency = args.latency_histogram.then(LatencyProbe::new);
     let mut allocs = AllocProbe::new(args.verify_allocations);
     if args.verify_allocations {
         eprintln!(
@@ -451,7 +463,15 @@ fn run_with<B: BookSet>(
                             }
                         } else {
                             let gapped = arbitrator.state() == FeedState::Gapped;
-                            consume(
+                            // This is the steady-state path: a datagram that
+                            // arrived in order goes straight to the books
+                            // without ever entering the reorder window. Timing
+                            // only `drain_into_books` missed it entirely — the
+                            // first run of the latency harness reported "nothing
+                            // was timed" after 200,000 messages, which is how
+                            // that was found.
+                            let started = latency.as_ref().map(|_| tsc::start());
+                            let outcome = consume(
                                 &buf[..n],
                                 &mut books,
                                 &mut stats,
@@ -459,7 +479,11 @@ fn run_with<B: BookSet>(
                                 digest_interval,
                                 gapped,
                                 0,
-                            )?;
+                            );
+                            if let (Some(probe), Some(t0)) = (latency.as_mut(), started) {
+                                probe.record(tsc::stop().saturating_sub(t0), count);
+                            }
+                            outcome?;
                         }
                         if reached_limit(&arbitrator, &recovery, message_limit) {
                             break 'outer;
@@ -507,6 +531,7 @@ fn run_with<B: BookSet>(
                         &mut stats,
                         &mut digest_log,
                         digest_interval,
+                        &mut latency,
                     )?;
                 }
                 if reached_limit(&arbitrator, &recovery, message_limit) {
@@ -606,6 +631,7 @@ fn run_with<B: BookSet>(
                     &mut stats,
                     &mut digest_log,
                     digest_interval,
+                    &mut latency,
                 )?;
             }
 
@@ -681,8 +707,33 @@ fn run_with<B: BookSet>(
         )?;
         stats.write_recovery(path, recovery.stats(), arbitrator.resyncs())?;
         allocs.write_summary(std::path::Path::new(path), args.books)?;
+        if let Some(probe) = &latency {
+            probe.write_summary(std::path::Path::new(path))?;
+        }
     }
     allocs.report(args.books);
+    if let Some(probe) = &latency {
+        probe.report();
+    }
+
+    // The receiver-side rate the milestone's Verify step names, which is not the
+    // same as messages-delivered over elapsed: it counts the whole sequence
+    // range, so a gap the handler failed to recover makes it *worse* rather than
+    // invisible. That is the honest direction.
+    if stats.last_sequence >= stats.first_sequence && stats.first_sequence > 0 {
+        let spanned = stats.last_sequence - stats.first_sequence + 1;
+        let secs = started.elapsed().as_secs_f64();
+        if secs > 0.0 {
+            eprintln!(
+                "  receiver-side rate: {:.0} msg/s over sequence {}..{} in {:.2}s \
+                 (final minus first, divided by elapsed)",
+                spanned as f64 / secs,
+                stats.first_sequence,
+                stats.last_sequence,
+                secs
+            );
+        }
+    }
 
     if args.show_book {
         print_books(&books, &cfg, args.depth);
@@ -757,7 +808,21 @@ fn apply_replay<B: BookSet>(
     // messages get applied here *and* sit in the held buffer, so reconciling
     // from the requested `through` replayed them a second time and left the book
     // with orders the publisher never added twice.
-    let mut covered_through = result.request.through;
+    // Coverage is a **contiguous run** from the start of the request, not the
+    // highest sequence seen.
+    //
+    // Taking the maximum trusts the answer to have no holes in it. It usually
+    // does not — the service serves a contiguous slice of a ring it keeps
+    // contiguous. But "usually" is doing the work there, and the cost of being
+    // wrong is silent: the held copies of the missing middle are then discarded
+    // as redundant, and the book is permanently short of whatever was in them.
+    // The symptom, several hundred messages later, is "order N is not on the
+    // book" for an order added long before the gap.
+    //
+    // The consumer is the side that can check this, so it checks. A hole makes
+    // the coverage stop there, and the existing reopen path handles the rest.
+    let mut covered_through = result.request.from.saturating_sub(1);
+    let mut contiguous = true;
     for datagram in &result.datagrams {
         consume(
             datagram,
@@ -770,9 +835,23 @@ fn apply_replay<B: BookSet>(
         )?;
         if let Ok(h) = wire::PacketHeaderDecoder::wrap(datagram) {
             messages += u64::from(h.message_count());
-            let end = h.first_sequence() + u64::from(h.message_count());
-            covered_through = covered_through.max(end.saturating_sub(1));
+            let first = h.first_sequence();
+            let end = first + u64::from(h.message_count());
+            if contiguous && first <= covered_through + 1 {
+                covered_through = covered_through.max(end.saturating_sub(1));
+            } else if contiguous {
+                eprintln!(
+                    "  the replay answer for {}..={} jumps from {covered_through} to \
+                     {first}; treating it as covering only up to {covered_through}",
+                    result.request.from, result.request.through
+                );
+                contiguous = false;
+            }
         }
+    }
+    // An answer that covered nothing at all leaves the gap exactly as it was.
+    if covered_through < result.request.from {
+        return Ok(false);
     }
 
     // A replay covers the range that was asked for, and that range was fixed
@@ -1088,23 +1167,32 @@ fn consume<B: BookSet>(
 }
 
 /// Releases everything the arbitrator can now deliver, in sequence order.
+#[allow(clippy::too_many_arguments)]
 fn drain_into_books<B: BookSet>(
     arbitrator: &mut Arbitrator,
     books: &mut B,
     stats: &mut HandlerStats,
     digest_log: &mut DigestLog,
     digest_interval: u64,
+    latency: &mut Option<LatencyProbe>,
 ) -> io::Result<()> {
     let gapped = arbitrator.state() == FeedState::Gapped;
     // The closure cannot return a Result, so a failure is parked and raised
     // once the drain is done. Losing the rest of a ready batch on a write error
     // would be worse than finishing it.
     let mut failure: Option<io::Error> = None;
-    arbitrator.drain_ready(|_first, _count, bytes| {
+    arbitrator.drain_ready(|_first, count, bytes| {
         if failure.is_some() {
             return;
         }
-        if let Err(e) = consume(bytes, books, stats, digest_log, digest_interval, gapped, 0) {
+        // The branch is predictable and the whole probe is absent when the flag
+        // is off, so an untimed run pays nothing for this being here.
+        let started = latency.as_ref().map(|_| tsc::start());
+        let outcome = consume(bytes, books, stats, digest_log, digest_interval, gapped, 0);
+        if let (Some(probe), Some(t0)) = (latency.as_mut(), started) {
+            probe.record(tsc::stop().saturating_sub(t0), count);
+        }
+        if let Err(e) = outcome {
             failure = Some(e);
         }
     });
@@ -1155,6 +1243,118 @@ fn print_books<B: BookSet>(books: &B, cfg: &Config, depth: usize) {
         }
     });
     let _ = io::stdout().flush();
+}
+
+/// In-path timing of the steady-state consume path, when `--latency-histogram`
+/// asks for it.
+///
+/// # Scope
+///
+/// One measurement per datagram, covering decode plus book update for every
+/// message in it. Divided by the message count for the per-message figure, which
+/// is the one that gets quoted — and which is meaningless without the batch
+/// factor beside it.
+///
+/// Recovery replay is deliberately **not** timed. It is a different path, it runs
+/// at a different depth, and folding it into the same histogram would put a
+/// handful of unusual samples into a tail that is supposed to describe steady
+/// state.
+///
+/// # What timing costs the thing being timed
+///
+/// An `lfence; rdtsc` pair is tens of cycles and, worse, it serialises: it stops
+/// the out-of-order window that a decode of thirty-two messages would otherwise
+/// exploit. The measured per-message cost is therefore an **upper bound** on the
+/// untimed cost, not an estimate of it. The timer's own overhead is subtracted;
+/// the serialisation is not, because it cannot be.
+///
+/// That is why the Criterion microbenchmarks exist alongside this: they amortise
+/// the clock across many iterations and do not serialise the work, so they give
+/// the lower bound. A report quotes both and says which is which. One number
+/// from one method would be a claim about the method.
+struct LatencyProbe {
+    tsc: Tsc,
+    /// Nanoseconds for one whole datagram.
+    per_datagram: bench_support::Histogram,
+    /// Nanoseconds per message, the datagram cost divided by its count.
+    per_message: bench_support::Histogram,
+    datagrams: u64,
+    messages: u64,
+}
+
+impl LatencyProbe {
+    fn new() -> Self {
+        let tsc = Tsc::calibrate();
+        eprintln!("  timing the consume path with the cycle counter: {tsc}");
+        for o in tsc.objections() {
+            eprintln!("  NOT PUBLISHABLE: {o}");
+        }
+        Self {
+            tsc,
+            // A millisecond ceiling. A single datagram taking longer than that
+            // is a stall, and it is counted in the overflow rather than
+            // stretching the buckets to accommodate something that is not a
+            // latency.
+            per_datagram: bench_support::Histogram::new(1_000_000),
+            per_message: bench_support::Histogram::new(1_000_000),
+            datagrams: 0,
+            messages: 0,
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, ticks: u64, count: u16) {
+        let nanos = self.tsc.ticks_to_nanos(ticks);
+        self.per_datagram.record(nanos);
+        if count > 0 {
+            self.per_message.record(nanos / u64::from(count));
+            self.messages += u64::from(count);
+        }
+        self.datagrams += 1;
+    }
+
+    fn report(&self) {
+        if self.datagrams == 0 {
+            eprintln!("  latency: nothing was timed");
+            return;
+        }
+        eprintln!(
+            "  latency per datagram (ns): {}\n  latency per message  (ns): {}",
+            self.per_datagram, self.per_message
+        );
+        eprintln!(
+            "  measured over {} datagrams / {} messages, batch factor {:.1}",
+            self.datagrams,
+            self.messages,
+            self.messages as f64 / self.datagrams as f64
+        );
+        if !self.tsc.is_trustworthy() {
+            eprintln!(
+                "  these numbers are NOT publishable: run `cargo run --release -p bench \\
+                 --bin hostcheck` for why"
+            );
+        }
+    }
+
+    fn write_summary(&self, path: &std::path::Path) -> io::Result<()> {
+        use std::fs::OpenOptions;
+        let mut f = OpenOptions::new().append(true).open(path)?;
+        writeln!(f, "{}", self.per_datagram.to_fields("latency_datagram_ns"))?;
+        writeln!(f, "{}", self.per_message.to_fields("latency_message_ns"))?;
+        writeln!(f, "latency_datagrams={}", self.datagrams)?;
+        writeln!(f, "latency_messages={}", self.messages)?;
+        writeln!(f, "latency_batch_factor={:.2}", {
+            if self.datagrams == 0 {
+                0.0
+            } else {
+                self.messages as f64 / self.datagrams as f64
+            }
+        })?;
+        writeln!(f, "tsc_megahertz={:.1}", self.tsc.megahertz())?;
+        writeln!(f, "tsc_overhead_ticks={}", self.tsc.overhead_ticks())?;
+        writeln!(f, "latency_publishable={}", self.tsc.is_trustworthy())?;
+        f.flush()
+    }
 }
 
 /// Which book implementation the handler rebuilds into.

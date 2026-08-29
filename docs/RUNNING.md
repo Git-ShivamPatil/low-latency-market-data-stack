@@ -233,5 +233,45 @@ operations per message in steady state. A count does not depend on the host, so
 it can be asserted honestly from this laptop. See
 [BOOKS.md](BOOKS.md#the-allocation-claim).
 
+### Measuring it properly
+
+```bash
+cargo run --release -p bench --bin hostcheck
+```
+
+Says whether this machine may publish a performance number, and if not, exactly
+which preconditions failed. Run it on any host **before** provisioning anything
+expensive — it takes a fraction of a second and it is the difference between a
+rented burn day that produces a number and one that produces a lesson about
+`constant_tsc`.
+
+```bash
+scripts/bench.sh check        # the gate alone
+scripts/bench.sh micro        # Criterion: decode, and the book against its baseline
+scripts/bench.sh inpath       # engine + handler, rdtsc histogram over the real path
+scripts/bench.sh throughput   # 60s sustained, receiver-side, three runs
+scripts/bench.sh all
+```
+
+The gate runs first. On a host it refuses, the benchmarks **still run** —
+exercising them is how the harness gets debugged — but the output lands in
+`results/bench/NOT-PUBLISHABLE.md` and `bench/REPORT.md` is not touched.
+
+The handler's own `--latency-histogram` does the in-path measurement directly:
+
+```
+--latency-histogram
+```
+
+It reports median, p99 and p99.9 per datagram and per message, and writes them
+to `--summary-path`. Read it next to the Criterion numbers and never alone: the
+`lfence; rdtsc` pair serialises work the untimed path overlaps, so it is an
+**upper** bound while Criterion gives the lower one. Both belong in a report,
+labelled.
+
+[bench/REPORT.md](../bench/REPORT.md) is the methodology — what "decode" includes
+and excludes, why the batch factor has to appear next to every throughput figure,
+and what the numbers do not show.
+
 See [CLAIMS.md](../CLAIMS.md) for the ledger. As of milestone 5, no *performance*
 figure has been measured.

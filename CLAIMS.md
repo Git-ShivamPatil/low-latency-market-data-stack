@@ -7,7 +7,7 @@ Every number published about this project — in [its README](README.md), on the
 | | |
 |---|---|
 | **Advertised on the portfolio** | `1M+ msg/s · ~100ns decode` |
-| **Substantiated so far** | nothing yet |
+| **Substantiated so far** | zero heap operations per message (a count, not a rate) |
 | **Feasibility assessment** | `yes-with-caveats` |
 
 ## Measurements
@@ -26,6 +26,8 @@ reconstructing them at benchmark time, is the point of this file.
 |-------|----------|------------------------------|
 | M1 · 2026-08-29 | **Messages are batched behind one packet header, and a message carries no sequence number of its own** — sequence is `firstSequence + i`. See [docs/WIRE.md](docs/WIRE.md#framing). | `1M+ msg/s` is only reachable with many messages per datagram: a kernel UDP receive path tops out around 300–600K pps per core, so one message per packet would need kernel bypass. Batching is standard on real exchange feeds, but **the batch factor has to be published with any throughput figure** — a reader who assumes one message per packet is reading a much stronger claim than the one this project makes. |
 | M1 · 2026-08-29 | `.cargo/config.toml` sets `-C target-cpu=native`. | Every number this project produces will come from a binary compiled for the exact host it ran on. That must be stated, not implied. |
+| M6 · 2026-08-30 | **The benchmark harness runs behind a host gate** (`crates/bench-support/src/hostcheck.rs`). A host with fewer than 4 physical cores, a masked TSC, a debug build, or a hypervisor is refused, and `scripts/bench.sh` writes `results/bench/NOT-PUBLISHABLE.md` instead of a report. | The refusal can be overridden with `--force`, and a forced run is stamped. **No CLAIMS row may ever cite a forced run.** If a future row appears here without a matching `bench/REPORT.md` whose gate said PUBLISHABLE, that row is wrong. |
+| M6 · 2026-08-30 | **Two timing methods, bounding the answer from opposite sides.** Criterion amortises the clock and does not serialise; the in-path `rdtsc` histogram serialises what it measures. | The first is a lower bound and the second an upper bound on the same quantity. Publishing one alone would be a claim about the method, so any latency figure from this project has to carry both and say which is which. |
 | M5 · 2026-08-30 | **The fast book refuses an order rather than growing**: a price outside its window that cannot be rebased onto, or more resting orders than its slab holds, is an error, not a resize. Sizing comes from `handler.book_levels` and `handler.book_orders`. | Any throughput or latency figure is only valid for a run that stayed inside those bounds. A benchmark that quietly widened the window to finish would be measuring a different program, so the sizing has to be published with the number. |
 | M5 · 2026-08-30 | **The counting allocator is compiled into the handler unconditionally**, not switched on by `--verify-allocations`. | Every future measurement includes one thread-local increment per allocation. In steady state there are none, so the cost is zero where it matters — but it is in the binary being measured, and that is the point: a flag that swapped the allocator would benchmark a different program. |
 | M1 · 2026-08-29 | CI runs correctness suites only; benchmarks are excluded by design. | Shared GitHub runners are noisy, oversubscribed and virtualised. Numbers from there would be wrong rather than imprecise, and would discredit the honest ones. |

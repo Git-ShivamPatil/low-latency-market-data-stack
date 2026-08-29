@@ -5,7 +5,7 @@
 **Price-time-priority matching engine publishing a binary feed over redundant A/B UDP multicast, with a Rust feed handler that arbitrates the two and rebuilds MBP/MBO books without allocating.**
 
 ![status](https://img.shields.io/badge/status-in%20development-22D3EE?style=for-the-badge)
-![progress](https://img.shields.io/badge/milestones-4%20of%209-334155?style=for-the-badge)
+![progress](https://img.shields.io/badge/milestones-5%20of%209-334155?style=for-the-badge)
 ![licence](https://img.shields.io/badge/licence-MIT-3b82f6?style=for-the-badge)
 
 ![](https://img.shields.io/badge/Rust-1.98-CE422B?logo=rust&logoColor=white) ![](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white) ![](https://img.shields.io/badge/FIX-4.4-334155) 
@@ -17,7 +17,7 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 5 of 9 milestones complete.**
+> **This is a build in progress — 5 of 9 milestones complete, and M6's harness built.**
 >
 > The target figure below (`1M+ msg/s · ~100ns decode`) is a **goal, not a measurement.** Nothing here has been benchmarked yet.
 > Every number this project eventually publishes will land in [CLAIMS.md](CLAIMS.md) first, with the commit it was measured at,
@@ -75,7 +75,7 @@ flowchart LR
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[█████████████░░░░░░░░░░░] 5/9 milestones · 56%
+[█████████████▓░░░░░░░░░░] 5.5/9 milestones · 61%
 ```
 
 - [x] **M1 · Workspace, wire schema, and cross-language codegen**  
@@ -93,8 +93,9 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - [x] **M5 · MBP and MBO books on an allocation-free path**  
   Both book views are maintained with zero heap allocations per message, and that is proved by a test rather than asserted in a README.  
   <sub>Verified: `--verify-allocations` reports **0 allocations, 0 deallocations, 0 reallocations** over 32,601 steady-state receive passes across two processes — while the same run with `--books reference` reports 10,814, so the counter is measuring something. A `#[test]` asserts exactly zero across **1,000,000 messages including a forced both-arm blackout and the snapshot recovery that follows**, over 125,021 measured scopes. The fast book is differentially tested against the reference book over **5,000,000 random operations** — every return value, every aggregated level, and the exact queue order within each level — and both reconcile with the engine across a process boundary. See [docs/BOOKS.md](docs/BOOKS.md).</sub>
-- [ ] **M6 · Benchmark harness, tuning, and an honest report**  
-  The advertised 1M+ msg/s and ~100ns decode are measured, reproducible, and published with the methodology that makes them mean something.
+- [ ] **M6 · Benchmark harness, tuning, and an honest report** — *harness built, measurement pending*  
+  The advertised 1M+ msg/s and ~100ns decode are measured, reproducible, and published with the methodology that makes them mean something.  
+  <sub>**Half done, and recorded as half done.** The apparatus exists and is tested: an HDR-layout latency histogram with a checked error bound that records without allocating, a calibrated `rdtsc` timer that refuses to convert cycles to nanoseconds when the host masks `constant_tsc`, Criterion microbenchmarks whose work is pinned by a test that flips a payload bit and requires the answer to change, and `scripts/bench.sh` running behind a host gate. **No number has been measured, because this machine cannot honestly produce one** — the gate refuses it on four independent counts, and refusing is what it is for. The measurement needs a rented host with ≥4 physical cores. See [bench/REPORT.md](bench/REPORT.md).</sub>
 - [ ] **M7 · C++ FIX 4.4 gateway — the session layer**  
   A FIX session that survives a hard kill: correct sequence numbers, correct resend, correct gap fill, verified against an independent implementation.
 - [ ] **M8 · Risk service, order path into the engine, and restart reconciliation**  
@@ -213,6 +214,8 @@ crates/book/ — reference book, digest, and the shared apply path              
              — MBO: slab + open-addressed order-id map + intrusive per-level FIFO lists      [M5]
              — MBP: a dense tick-indexed level array maintained over the same store          [M5]
 crates/alloc-guard/ — counting #[global_allocator] and the zero-allocation assertions        [M5]
+crates/bench-support/ — latency histogram, calibrated rdtsc, and the host gate               [M6]
+bench/ — Criterion microbenches, the hostcheck binary, and the report template               [M6]
 crates/transport/ — multicast and unicast-fanout backends, one send path                     [M2]
 crates/mdconfig/ — the configuration file both binaries read                                 [M2]
 crates/matching-engine/ — bin name MUST be `matching-engine`; price-time priority, A/B publisher, loss injection, snapshot cycle

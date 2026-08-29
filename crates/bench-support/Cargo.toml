@@ -1,0 +1,19 @@
+[package]
+name = "bench-support"
+description = "Timing, histograms and the host gate the benchmark harness runs behind (milestone 6)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# The in-path histogram is recorded on the hot path, so "it does not allocate"
+# is a claim, and milestone 5 built the thing that checks claims like that.
+alloc-guard = { path = "../alloc-guard" }
