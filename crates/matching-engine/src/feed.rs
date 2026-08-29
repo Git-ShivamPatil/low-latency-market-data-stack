@@ -29,6 +29,7 @@ use transport::Publisher;
 use wire::{ModifyReason, Side, WireError};
 
 use crate::rng::Rng;
+use crate::uplink::Uplink;
 
 /// How simulated loss is correlated between the two arms.
 ///
@@ -150,6 +151,9 @@ pub struct FeedPublisher {
     snapshot_buf: Vec<u8>,
     /// Snapshot datagrams have their own sequence space; see `publish_snapshot`.
     snapshot_seq: u64,
+    /// Optional lossless feed to the replay service. Never on the critical path:
+    /// offering a datagram copies it into a bounded queue and returns.
+    uplink: Option<Uplink>,
     /// When self-checking, every datagram is decoded and replayed into here
     /// before it is sent.
     ///
@@ -180,6 +184,7 @@ impl FeedPublisher {
             drop_rng: Rng::new(0x0105_0B10_5510_0000),
             snapshot_buf: vec![0u8; max_datagram_bytes],
             snapshot_seq: 1,
+            uplink: None,
             shadow: None,
         }
     }
@@ -199,6 +204,15 @@ impl FeedPublisher {
 
     pub fn loss_enabled(&self) -> bool {
         self.drop_rate > 0.0
+    }
+
+    /// Starts feeding the replay service.
+    pub fn set_uplink(&mut self, uplink: Uplink) {
+        self.uplink = Some(uplink);
+    }
+
+    pub fn uplink(&self) -> Option<&Uplink> {
+        self.uplink.as_ref()
     }
 
     /// Decides, once per datagram, which arms will not receive it.
@@ -356,6 +370,14 @@ impl FeedPublisher {
                     )
                 })?;
             }
+        }
+
+        // The replay service gets the datagram whether or not the arms dropped
+        // it. Simulated loss models the network between the engine and a
+        // consumer; the uplink is a different, reliable link, and a recovery
+        // service that lost exactly what the consumer lost would be useless.
+        if let Some(uplink) = self.uplink.as_ref() {
+            uplink.offer(&self.buf[..len]);
         }
 
         self.stats.datagrams += 1;

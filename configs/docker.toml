@@ -94,3 +94,12 @@ recovery_timeout_millis = 10000
 stats_interval_millis = 5000
 messages = 0
 idle_timeout_seconds = 0
+
+[replay]
+# Inside the compose network. The static addresses match docker-compose.yml.
+uplink_bind = "0.0.0.0:32001"
+request_bind = "0.0.0.0:32002"
+uplink_connect = "172.28.0.12:32001"
+request_connect = "172.28.0.12:32002"
+history_datagrams = 8192
+request_timeout_millis = 2000

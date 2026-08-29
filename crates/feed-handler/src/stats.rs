@@ -39,6 +39,9 @@ pub struct HandlerStats {
     pub recovery_failures: u64,
     /// Snapshot fragments ignored because they predated the gap.
     pub snapshots_discarded: u64,
+    /// Which recovery attempt a replay has already been requested for, so one
+    /// gap does not produce a stream of duplicate requests.
+    pub replay_requested: u64,
 }
 
 impl HandlerStats {
@@ -170,6 +173,10 @@ impl HandlerStats {
         writeln!(f, "recovery_worst_millis={}", r.worst_recovery_millis)?;
         writeln!(f, "recovery_last_millis={}", r.last_recovery_millis)?;
         writeln!(f, "resyncs={resyncs}")?;
+        writeln!(f, "recovered_by_replay={}", r.by_replay)?;
+        writeln!(f, "recovered_by_snapshot={}", r.by_snapshot)?;
+        writeln!(f, "replay_refused={}", r.replay_refused)?;
+        writeln!(f, "replay_messages={}", r.replay_messages)?;
         writeln!(
             f,
             "still_recovering={}",

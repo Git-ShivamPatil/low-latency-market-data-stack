@@ -12,6 +12,7 @@ mod engine;
 mod feed;
 mod generator;
 mod rng;
+mod uplink;
 
 use std::io::{self, Write};
 use std::net::SocketAddrV4;
@@ -120,6 +121,13 @@ struct Args {
     #[arg(long, value_name = "MS")]
     snapshot_interval: Option<u64>,
 
+    /// Stream every published datagram to a replay service at this address.
+    ///
+    /// Optional infrastructure: if the service is down the engine runs normally
+    /// and says so. Never on the publish path — see `uplink`.
+    #[arg(long, value_name = "ADDR")]
+    replay_uplink: Option<String>,
+
     /// Print the resolved configuration and exit without sending anything.
     #[arg(long)]
     dry_run: bool,
@@ -185,6 +193,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let self_check = args.self_check || cfg.engine.self_check;
     if self_check {
         feed.enable_self_check();
+    }
+
+    let uplink_target = args
+        .replay_uplink
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(cfg.replay.uplink_connect.clone()).filter(|s| !s.is_empty()));
+    if let Some(target) = uplink_target {
+        match target.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                // 4096 datagrams of slack. Enough to ride out a service restart
+                // at the rates this engine publishes; beyond that the store
+                // notices the hole rather than serving around it.
+                feed.set_uplink(uplink::Uplink::connect(addr, 4096));
+                eprintln!("  replay uplink -> {addr}");
+            }
+            Err(e) => {
+                return Err(format!("--replay-uplink {target:?} is not an address: {e}").into())
+            }
+        }
     }
 
     let drop_mode: DropMode = cfg
@@ -369,6 +397,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         s.orders_submitted, s.trades, s.shares_traded, s.cancels, s.modifies
     );
     let f = feed.stats();
+    if let Some(uplink) = feed.uplink() {
+        eprintln!(
+            "  replay uplink: {} datagrams sent, {} dropped, {}",
+            uplink.sent(),
+            uplink.dropped(),
+            if uplink.is_connected() {
+                "connected"
+            } else {
+                "not connected"
+            }
+        );
+        if uplink.dropped() > 0 {
+            eprintln!(
+                "  note: dropped uplink datagrams shorten the replay horizon. The store                  discards its history at the discontinuity rather than serving around it,                  so nothing is served wrongly - but a consumer that needed that range will                  be told it is too old."
+            );
+        }
+    }
     if snapshot_cycles > 0 {
         eprintln!(
             "  {snapshot_cycles} snapshot cycles, {} snapshot datagrams",

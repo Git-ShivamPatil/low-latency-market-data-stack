@@ -25,6 +25,7 @@ wire = { path = "../wire" }
 book = { path = "../book" }
 transport = { path = "../transport" }
 mdconfig = { path = "../mdconfig" }
+replay-service = { path = "../replay-service" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"

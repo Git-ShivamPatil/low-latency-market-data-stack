@@ -66,10 +66,11 @@ OUT="$REPO/results/smoke"
 mkdir -p "$OUT"
 
 echo "building release binaries"
-cargo build --release --bin matching-engine --bin feed-handler
+cargo build --release --bin matching-engine --bin feed-handler --bin replay-service
 ENGINE="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release/matching-engine"
 HANDLER="$(dirname "$ENGINE")/feed-handler"
+REPLAY="$(dirname "$ENGINE")/replay-service"
 echo "  engine  $ENGINE"
 echo "  handler $HANDLER"
 echo
@@ -439,6 +440,119 @@ PY
         echo "  PASS (recovery)"
     else
         echo "  FAIL (recovery)"
+        overall=1
+    fi
+    echo
+
+    # ----------------------------------------------------------------------
+    # The same scenario with a replay service, which should fill the gaps
+    # exactly rather than fall back to waiting for a snapshot.
+    # ----------------------------------------------------------------------
+    echo "=============================================================="
+    echo " replay: same loss, with a replay service to fill gaps exactly"
+    echo "=============================================================="
+
+    RE_DIG="$OUT/replay-engine.txt"
+    RH_DIG="$OUT/replay-handler.txt"
+    RH_SUM="$OUT/replay-handler.summary"
+    RE_LOG="$OUT/replay-engine.log"
+    RH_LOG="$OUT/replay-handler.log"
+    RS_LOG="$OUT/replay-service.log"
+    rm -f "$RE_DIG" "$RH_DIG" "$RH_SUM" "$RE_LOG" "$RH_LOG" "$RS_LOG"
+
+    "$REPLAY" --config configs/local.toml         --uplink-bind 127.0.0.1:32001 --request-bind 127.0.0.1:32002         --history 4096 --duration 60 >"$RS_LOG" 2>&1 &
+    RSPID=$!
+    sleep 1
+
+    "$HANDLER"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --replay 127.0.0.1:32002         --messages "$RECOVERY_MESSAGES"         --digest-path "$RH_DIG"         --digest-interval "$DIGEST_INTERVAL"         --idle-timeout "$IDLE_TIMEOUT"         --summary-path "$RH_SUM"         >"$RH_LOG" 2>&1 &
+    RHPID=$!
+    sleep 1
+
+    "$ENGINE"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --replay-uplink 127.0.0.1:32001         --messages "$RECOVERY_MESSAGES"         --rate "$RECOVERY_RATE"         --snapshot-interval "$RECOVERY_SNAPSHOT_MS"         --drop-rate "$RECOVERY_DROP_RATE"         --drop-mode correlated         --digest-path "$RE_DIG"         >"$RE_LOG" 2>&1
+    wait $RHPID && rpstatus=0 || rpstatus=$?
+    kill $RSPID 2>/dev/null || true
+    wait $RSPID 2>/dev/null || true
+
+    echo "--- handler ---"
+    grep -E "RECOVERED|replay refused|recovery failed|NOT CLEAN" "$RH_LOG" | head -6 | sed 's/^/  /'
+    echo
+
+    rp=0
+    if [[ $rpstatus -ne 0 ]]; then
+        echo "FAIL: the handler exited $rpstatus during the replay run" >&2
+        rp=1
+    fi
+
+    python3 - "$RH_SUM" "$RE_DIG" "$RH_DIG" <<'PY' || rp=1
+import sys
+
+summary_path, engine_path, handler_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(summary_path) as f:
+    s = dict(line.strip().split("=", 1) for line in f if "=" in line)
+
+fails = []
+by_replay = int(s.get("recovered_by_replay", 0))
+by_snapshot = int(s.get("recovered_by_snapshot", 0))
+
+# The point of this run: gaps get filled by replay rather than fallen back on.
+if by_replay == 0:
+    fails.append(
+        "no gap was recovered by replay - the service was up and holding the "
+        "history, so either the request never went out or it was refused"
+    )
+if int(s.get("gaps", 0)) == 0:
+    fails.append("no gap occurred, so nothing about replay was exercised")
+if s.get("state") != "LIVE":
+    fails.append(f"the run ended {s.get('state')}, not LIVE")
+if int(s.get("recovery_failures", 0)) != 0:
+    fails.append(f"{s['recovery_failures']} recovery attempts failed")
+if int(s.get("apply_errors", 0)) != 0:
+    fails.append(
+        f"{s['apply_errors']} messages did not apply - a replayed range that "
+        "double-applies or misses messages shows up here first"
+    )
+if s.get("still_recovering") != "false":
+    fails.append("the run ended mid-recovery")
+
+# The books have to agree. A replay that filled the hole with the wrong bytes,
+# or applied its edges twice, fails here and nowhere else.
+def load(path):
+    rows = {}
+    for line in open(path):
+        parts = line.split()
+        if len(parts) == 4:
+            rows[int(parts[0])] = tuple(parts[1:])
+    return rows
+
+engine, handler = load(engine_path), load(handler_path)
+shared = sorted(set(engine) & set(handler))
+if not shared:
+    fails.append("no shared checkpoints, so the books were never compared")
+bad = [x for x in shared if engine[x] != handler[x]]
+if bad:
+    x = bad[0]
+    fails.append(
+        f"the books disagree at {len(bad)} of {len(shared)} checkpoints; first at "
+        f"sequence {x}: engine {engine[x]} vs handler {handler[x]}"
+    )
+
+if fails:
+    for f in fails:
+        print(f"FAIL: {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(
+    f"  {s['gaps']} gaps: {by_replay} filled by replay, {by_snapshot} by snapshot, "
+    f"{s.get('replay_refused')} refused"
+)
+print(f"  {s['replay_messages']} messages recovered from the replay service")
+print(f"  {len(shared)} shared checkpoints, every one identical")
+PY
+
+    if [[ $rp -eq 0 ]]; then
+        echo "  PASS (replay)"
+    else
+        echo "  FAIL (replay)"
         overall=1
     fi
     echo

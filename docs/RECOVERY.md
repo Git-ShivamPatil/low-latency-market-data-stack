@@ -285,14 +285,97 @@ The checkpoint comparison is the assertion that matters. A handler that recovere
 
 ---
 
-## What is still missing
+## Recovering: the replay service
 
-The `replay-service` binary in the milestone plan is **not built**. Recovery here
-is snapshot-based only.
+A snapshot rebuilds the book. It does not give back the **messages** — the trades
+that printed inside the gap, the orders that came and went. A consumer keeping
+its own audit trail, or driving something downstream from the message stream
+rather than from the book, needs those.
 
-That is a real gap against the plan, and worth being precise about what it costs:
-a snapshot recovers the book but loses the messages between the gap and the
-snapshot — a consumer that needs the actual trades in that window (for its own
-audit trail, or to drive something downstream) cannot get them. Replay over TCP
-would serve exactly that range. Snapshot recovery is sufficient for rebuilding
-*state*, which is what a book is, and that is why it was built first.
+`crates/replay-service` serves them. Ask for a sequence range over TCP, get the
+datagrams back.
+
+```bash
+cargo run --release --bin replay-service -- --config configs/local.toml
+cargo run --release --bin matching-engine -- --replay-uplink 127.0.0.1:32001 ...
+cargo run --release --bin feed-handler   -- --replay 127.0.0.1:32002 ...
+```
+
+A consumer tries replay first and falls back to the snapshot cycle when the
+service is down or the range has aged out. Neither mechanism makes the other
+redundant:
+
+| | Replay | Snapshot |
+|---|---|---|
+| Recovers | the messages | the book |
+| Book is | filled in place | discarded and rebuilt |
+| Latency | a round trip | up to one cycle |
+| Needs | a service holding the range | nothing |
+| Horizon | the ring | unlimited |
+
+### The uplink must be lossless, so it is TCP
+
+The engine streams every published datagram to the service over TCP. Not another
+multicast subscriber: a replay service that had itself missed the datagrams a
+consumer is asking for would answer confidently and wrongly.
+
+But the publish path must not depend on it. A publisher that blocks on a
+downstream consumer has handed that consumer control of the market data. So the
+uplink is a bounded queue and a writer thread — offering a datagram copies it and
+returns, and a full queue **drops and counts** rather than waiting.
+
+Dropping is safe because the store notices. Every datagram carries its own
+`firstSequence`, so a discontinuity is detectable on arrival, and the store
+**discards everything before it** rather than hold a history with a hole in the
+middle. A dropped uplink datagram costs recovery horizon, never correctness.
+
+### The store refuses to hold a hole
+
+That discarding is deliberately destructive, and the alternative is worse. A
+store that kept both sides of a hole would have to check every request against
+every hole, and getting that wrong means serving a range with a silent gap in it
+— a consumer that asked for help and got corruption. Holding only a contiguous
+run makes "can I serve this?" a comparison of two numbers.
+
+### Requests run off the receive loop
+
+A replay request is a connect, a round trip, and a stream of datagrams. Doing
+that inline would stop the handler reading its sockets — and a handler that stops
+reading loses datagrams, which is how recovering from one gap manufactures the
+next. The request runs on its own thread; the loop polls it and keeps buffering
+live traffic meanwhile, exactly as it does when waiting for a snapshot.
+
+### Three edges that each cost a debugging cycle
+
+**The service serves whole datagrams**, so the first can begin before the hole
+did and the last can end after it. The leading overlap is skipped on the way in.
+The trailing overlap was missed at first: those messages get applied *and* sit in
+the held buffer, so reconciling from the requested `through` replayed them a
+second time and left the book with orders the publisher never added twice.
+Reconciliation now uses what the replay actually covered, not what was asked for.
+
+**A request runs on another thread**, so its answer can arrive after a snapshot
+already closed the same gap. Applying it then re-applies messages the book has.
+`adopt_replay` refuses unless the recovery is still outstanding.
+
+**A second gap can open while a request is in flight**, and the answer will not
+contain it — the range was fixed when the request went out. Completing on that
+answer alone leaves a hole while reporting success; the symptom is
+`order N is not on the book` a couple of hundred messages later. The handler now
+checks that the held traffic starts where the replay ended, and stays in recovery
+if it does not.
+
+### What is measured
+
+`scripts/smoke.sh` runs the replay scenario alongside the snapshot one, on the
+same injected loss, with all three processes:
+
+```
+  5 gaps: 4 filled by replay, 1 by snapshot, 0 refused
+  2783 messages recovered from the replay service
+  14 shared checkpoints, every one identical
+```
+
+The mix is the interesting part: replay handles most gaps, and the snapshot cycle
+catches the one whose range had aged past what the run's small history held. Both
+paths are live in the same run.

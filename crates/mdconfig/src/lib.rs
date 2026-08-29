@@ -52,6 +52,7 @@ pub struct Config {
     pub market: Market,
     pub engine: Engine,
     pub handler: Handler,
+    pub replay: Replay,
 }
 
 impl Config {
@@ -410,6 +411,47 @@ impl Default for Handler {
             gap_timeout_millis: 250,
             recovery_buffer_datagrams: 4096,
             recovery_timeout_millis: 10_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Replay {
+    /// Where the service listens for the engine's uplink.
+    ///
+    /// The uplink is TCP rather than another multicast subscriber because it has
+    /// to be lossless: a replay service that had itself missed the datagrams a
+    /// consumer is asking for would answer confidently and wrongly.
+    pub uplink_bind: SocketAddrV4,
+    /// Where the service listens for consumers asking for a range.
+    pub request_bind: SocketAddrV4,
+    /// Where the engine connects to feed the service. Empty disables the uplink,
+    /// and the engine runs normally without it.
+    pub uplink_connect: String,
+    /// Where a consumer sends range requests. Empty disables replay recovery,
+    /// and the handler falls back to the snapshot cycle.
+    pub request_connect: String,
+    /// How many datagrams of history to keep.
+    ///
+    /// This is the recovery horizon: a consumer asking for a range older than
+    /// this is told so and has to use a snapshot instead. At a batch of 32,
+    /// 8192 datagrams is roughly 260K messages and about 11MB.
+    pub history_datagrams: usize,
+    /// How long a consumer waits on a replay request before giving up and
+    /// falling back to the snapshot cycle.
+    pub request_timeout_millis: u64,
+}
+
+impl Default for Replay {
+    fn default() -> Self {
+        Self {
+            uplink_bind: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 32001),
+            request_bind: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 32002),
+            uplink_connect: String::new(),
+            request_connect: String::new(),
+            history_datagrams: 8192,
+            request_timeout_millis: 2000,
         }
     }
 }

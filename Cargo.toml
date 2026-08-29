@@ -10,6 +10,7 @@ members = [
     "crates/mdconfig",
     "crates/matching-engine",
     "crates/feed-handler",
+    "crates/replay-service",
 ]
 
 [workspace.package]

@@ -36,6 +36,7 @@ use wire::{Message, PacketReader};
 use feed_handler::arbitration::{Accepted, Arbitrator, FeedState};
 use feed_handler::recovery::RecoveryBuffer;
 use feed_handler::stats::HandlerStats;
+use replay_service::{protocol::Status, RangeRequest, ReplayResult};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -106,6 +107,15 @@ struct Args {
     /// Prove the steady-state loop allocates nothing (milestone 5).
     #[arg(long)]
     verify_allocations: bool,
+
+    /// Ask a replay service at this address to fill a gap exactly, instead of
+    /// waiting for the next snapshot cycle.
+    ///
+    /// Replay recovers the *messages*; a snapshot recovers only the state they
+    /// produced. Falls back to the snapshot cycle when the service is down or
+    /// the range has aged out of its history.
+    #[arg(long, value_name = "ADDR")]
+    replay: Option<String>,
 }
 
 /// SplitMix64, for the input-loss injector.
@@ -252,6 +262,26 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         );
     }
 
+    // Replay is optional: without it, recovery waits for the snapshot cycle.
+    let replay_addr: Option<std::net::SocketAddr> = args
+        .replay
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(cfg.replay.request_connect.clone()).filter(|s| !s.is_empty()))
+        .map(|t| {
+            t.parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("--replay {t:?} is not an address: {e}"))
+        })
+        .transpose()?;
+    if let Some(addr) = replay_addr {
+        eprintln!("  replay service -> {addr}");
+    }
+    let replay_timeout = Duration::from_millis(cfg.replay.request_timeout_millis.max(1));
+    // At most one request outstanding: a second would race the first to fill the
+    // same hole, and the two answers could disagree about how much they cover.
+    let mut pending_replay: Option<std::sync::mpsc::Receiver<io::Result<ReplayResult>>> = None;
+    let mut last_replay_from: Option<u64> = None;
+
     let mut last_data = Instant::now();
     let mut last_report = Instant::now();
 
@@ -362,7 +392,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                                 0,
                             )?;
                         }
-                        if reached_limit(&arbitrator, message_limit) {
+                        if reached_limit(&arbitrator, &recovery, message_limit) {
                             break 'outer;
                         }
                     }
@@ -410,8 +440,83 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                         digest_interval,
                     )?;
                 }
-                if reached_limit(&arbitrator, message_limit) {
+                if reached_limit(&arbitrator, &recovery, message_limit) {
                     break 'outer;
+                }
+            }
+        }
+
+        // Poll the outstanding replay request, if there is one. Deliberately off
+        // the receive path: a synchronous request would stop this loop reading
+        // its sockets, and a handler that stops reading loses datagrams — which
+        // is how recovering from one gap manufactures the next.
+        if let Some(rx) = pending_replay.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(r)) if r.is_ok() => {
+                    pending_replay = None;
+                    // The answer may have arrived after a snapshot already
+                    // closed this gap, in which case applying it would re-apply
+                    // messages the book already has. `apply_replay` checks and
+                    // says so rather than trusting the caller to remember.
+                    if !apply_replay(
+                        &r,
+                        &mut recovery,
+                        &mut arbitrator,
+                        &mut books,
+                        &mut stats,
+                        &mut digest_log,
+                        digest_interval,
+                    )? {
+                        eprintln!(
+                            "  a replay of {}..={} arrived after the gap was already closed;                              discarded",
+                            r.request.from, r.request.through
+                        );
+                    }
+                }
+                Ok(Ok(r)) => {
+                    pending_replay = None;
+                    eprintln!(
+                        "  replay refused for {}..={}: {} (the service holds {}..{}); \
+                         falling back to the snapshot cycle",
+                        r.request.from,
+                        r.request.through,
+                        r.header.status,
+                        r.header.first_available,
+                        r.header.last_available
+                    );
+                    recovery.note_replay_refused();
+                }
+                Ok(Err(e)) => {
+                    pending_replay = None;
+                    eprintln!("  replay request failed: {e}; falling back to the snapshot cycle");
+                    recovery.note_replay_refused();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    pending_replay = None;
+                    recovery.note_replay_refused();
+                }
+            }
+        }
+
+        // A recovery that has just begun, with a replay service available, asks
+        // for the exact range rather than waiting for the next cycle.
+        if pending_replay.is_none() {
+            if let (Some(addr), Some(from)) = (replay_addr, recovery.gap_from()) {
+                let through = arbitrator.next_expected().saturating_sub(1);
+                // Keyed on the outstanding hole rather than the attempt number:
+                // a recovery that reopened after a partial replay has a new
+                // `gap_from` and needs a fresh request, but is still the same
+                // attempt.
+                if through >= from && last_replay_from != Some(from) {
+                    last_replay_from = Some(from);
+                    eprintln!("  requesting replay of {from}..={through}");
+                    pending_replay = Some(replay_service::request_in_background(
+                        addr,
+                        RangeRequest { from, through },
+                        replay_timeout,
+                        cfg.feed.max_datagram_bytes.max(65_536),
+                    ));
                 }
             }
         }
@@ -420,6 +525,20 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         if got_any {
             last_data = now;
         } else {
+            // Drain first. A quiet period with traffic still buffered usually
+            // means it is simply waiting to be applied, not that anything is
+            // missing — and asking about a stall before draining is how a
+            // non-hole gets mistaken for one.
+            if !recovery.is_recovering() {
+                drain_into_books(
+                    &mut arbitrator,
+                    &mut books,
+                    &mut stats,
+                    &mut digest_log,
+                    digest_interval,
+                )?;
+            }
+
             // A hole that has stayed open through a quiet period is not late
             // any more.
             if now.duration_since(last_data) >= gap_timeout {
@@ -515,8 +634,121 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
 /// a recovery is in progress nothing reaches the books, so a limit on applied
 /// messages would never fire and a bounded run would only end on its idle
 /// timeout — which looks like a hang and reports the wrong thing.
-fn reached_limit(arbitrator: &Arbitrator, limit: u64) -> bool {
-    limit > 0 && arbitrator.messages_delivered() >= limit
+fn reached_limit(arbitrator: &Arbitrator, recovery: &RecoveryBuffer, limit: u64) -> bool {
+    // Never stop mid-recovery. Finishing it is part of consuming the stream, and
+    // a run that stopped here would report GAPPED for a hole it was about to
+    // close. The idle timeout is the backstop for a recovery that never lands.
+    limit > 0 && !recovery.is_recovering() && arbitrator.messages_delivered() >= limit
+}
+
+/// Applies a served replay: the missing messages themselves, in order, followed
+/// by the live traffic held while waiting.
+///
+/// Unlike a snapshot this does **not** discard the book. The hole is filled where
+/// it is, so everything before it stays, and everything held after it is replayed
+/// in full because none of it was covered by anything.
+fn apply_replay(
+    result: &ReplayResult,
+    recovery: &mut RecoveryBuffer,
+    arbitrator: &mut Arbitrator,
+    books: &mut Books,
+    stats: &mut HandlerStats,
+    digest_log: &mut DigestLog,
+    digest_interval: u64,
+) -> io::Result<bool> {
+    debug_assert_eq!(result.header.status, Status::Ok);
+    // Nothing is applied until the recovery is confirmed still outstanding: the
+    // request ran on another thread and a snapshot may have closed the gap while
+    // it was in flight.
+    if !recovery.is_recovering() {
+        return Ok(false);
+    }
+    let mut messages = 0u64;
+    // The highest sequence the replay actually delivered, which is NOT the same
+    // as the range that was asked for.
+    //
+    // The service serves whole datagrams, so the first can begin before the hole
+    // did and the last can end past it. `skip_below` handles the leading
+    // overlap. The trailing overlap is subtler and was a real bug: those
+    // messages get applied here *and* sit in the held buffer, so reconciling
+    // from the requested `through` replayed them a second time and left the book
+    // with orders the publisher never added twice.
+    let mut covered_through = result.request.through;
+    for datagram in &result.datagrams {
+        consume(
+            datagram,
+            books,
+            stats,
+            digest_log,
+            digest_interval,
+            false,
+            result.request.from,
+        )?;
+        if let Ok(h) = wire::PacketHeaderDecoder::wrap(datagram) {
+            messages += u64::from(h.message_count());
+            let end = h.first_sequence() + u64::from(h.message_count());
+            covered_through = covered_through.max(end.saturating_sub(1));
+        }
+    }
+
+    // A replay covers the range that was asked for, and that range was fixed
+    // when the request went out. If another gap opened while it was in flight,
+    // the held traffic does not start where the replay ended — and completing
+    // here would leave that hole in the book while reporting success. This is
+    // the bug that produced "order N is not on the book" two hundred messages
+    // after a recovery that looked clean.
+    if let Some(held_start) = recovery.first_held_sequence() {
+        if held_start > covered_through + 1 {
+            eprintln!(
+                "  replay closed {}..={covered_through} but {}..={} opened while it was in                  flight; staying in recovery",
+                result.request.from,
+                covered_through + 1,
+                held_start - 1
+            );
+            recovery.reopen(covered_through + 1);
+            return Ok(false);
+        }
+    }
+
+    if !recovery.adopt_replay(covered_through, messages) {
+        return Ok(false);
+    }
+
+    let mut failure: Option<io::Error> = None;
+    recovery.replay(|skip_below, bytes| {
+        if failure.is_some() {
+            return;
+        }
+        if let Err(e) = consume(
+            bytes,
+            books,
+            stats,
+            digest_log,
+            digest_interval,
+            false,
+            skip_below,
+        ) {
+            failure = Some(e);
+        }
+    });
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    // The hole was filled where it was, so the frontier and the window are
+    // already right — but the arbitrator is still flagged Gapped from when it
+    // reported the range, and nothing else will clear it.
+    arbitrator.clear_gapped();
+
+    let elapsed = recovery.complete(Instant::now());
+    stats.recoveries += 1;
+    eprintln!(
+        "  RECOVERED in {}ms by replaying {}..={}; the book was never discarded",
+        elapsed.as_millis(),
+        result.request.from,
+        result.request.through
+    );
+    Ok(true)
 }
 
 /// True when this datagram belongs to a snapshot cycle rather than the

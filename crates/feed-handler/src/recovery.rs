@@ -48,6 +48,18 @@ pub enum Recovery {
     Reconciling { from_sequence: u64 },
 }
 
+/// How a recovery ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveredBy {
+    /// The replay service served the exact missing range. The book was never
+    /// discarded and the messages themselves were recovered, not just the state
+    /// they produced.
+    Replay,
+    /// A snapshot cycle replaced the books wholesale. Cheaper on the publisher
+    /// and always available, but the messages in the gap are gone for good.
+    Snapshot,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecoveryStats {
     pub attempts: u64,
@@ -60,6 +72,14 @@ pub struct RecoveryStats {
     /// Messages replayed from the buffer on top of the snapshot.
     pub messages_replayed: u64,
     pub snapshots_seen: u64,
+    /// Recoveries closed by the replay service.
+    pub by_replay: u64,
+    /// Recoveries closed by a snapshot cycle.
+    pub by_snapshot: u64,
+    /// Replay requests that came back unusable, so the snapshot path was used.
+    pub replay_refused: u64,
+    /// Messages the replay service handed back.
+    pub replay_messages: u64,
     /// Snapshot fragments discarded because their cycle was already stale.
     pub snapshots_discarded: u64,
     pub last_recovery_millis: u64,
@@ -209,9 +229,47 @@ impl RecoveryBuffer {
     /// Moves to reconciliation after a snapshot has been adopted.
     pub fn adopt_snapshot(&mut self, last_sequence: u64) {
         self.stats.snapshots_seen += 1;
+        self.stats.by_snapshot += 1;
         self.state = Recovery::Reconciling {
             from_sequence: last_sequence + 1,
         };
+    }
+
+    /// The range this recovery is waiting to have filled, if any.
+    pub fn gap_from(&self) -> Option<u64> {
+        match self.state {
+            Recovery::AwaitingSnapshot { gap_from } => Some(gap_from),
+            _ => None,
+        }
+    }
+
+    /// Moves to reconciliation after the replay service filled the hole exactly.
+    ///
+    /// Unlike a snapshot, replay does not replace the book — it supplies the
+    /// missing messages, which the caller applies before this is called. So the
+    /// held traffic is replayed in full from `through + 1`: none of it was
+    /// covered by anything.
+    ///
+    /// Returns `false` when this recovery is no longer outstanding. A replay
+    /// request runs on its own thread, so its answer can arrive *after* a
+    /// snapshot has already closed the same gap — and applying it then would
+    /// re-apply messages the book already has. The caller must not proceed on a
+    /// `false`.
+    #[must_use]
+    pub fn adopt_replay(&mut self, through: u64, messages: u64) -> bool {
+        if !matches!(self.state, Recovery::AwaitingSnapshot { .. }) {
+            return false;
+        }
+        self.stats.by_replay += 1;
+        self.stats.replay_messages += messages;
+        self.state = Recovery::Reconciling {
+            from_sequence: through + 1,
+        };
+        true
+    }
+
+    pub fn note_replay_refused(&mut self) {
+        self.stats.replay_refused += 1;
     }
 
     /// Replays the held datagrams that the snapshot did not already cover.
@@ -281,6 +339,30 @@ impl RecoveryBuffer {
 
     pub fn held_datagrams(&self) -> usize {
         self.occupied
+    }
+
+    /// The lowest sequence still held, if anything is.
+    ///
+    /// Used to check that a replay actually closed the hole: if the held traffic
+    /// does not start where the replay ended, another gap opened while the
+    /// request was in flight and there is still something missing.
+    pub fn first_held_sequence(&self) -> Option<u64> {
+        self.held
+            .iter()
+            .take(self.occupied)
+            .map(|h| h.first_sequence)
+            .min()
+    }
+
+    /// Keeps the recovery open with a new starting point.
+    ///
+    /// A replay covers the range that was asked for, which was fixed when the
+    /// request went out. Gaps that opened while it was in flight are not in it,
+    /// so completing on the answer alone would leave a hole in the book while
+    /// reporting success. This puts the recovery back into waiting with the
+    /// remaining hole named, so the next request or the next snapshot closes it.
+    pub fn reopen(&mut self, gap_from: u64) {
+        self.state = Recovery::AwaitingSnapshot { gap_from };
     }
 
     pub fn capacity(&self) -> usize {

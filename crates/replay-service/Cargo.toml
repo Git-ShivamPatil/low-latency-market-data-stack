@@ -1,0 +1,25 @@
+[package]
+name = "replay-service"
+description = "Serves ranges of the market-data stream over TCP so a consumer can fill a gap exactly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "replay_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "replay-service"
+path = "src/main.rs"
+
+[dependencies]
+wire = { path = "../wire" }
+mdconfig = { path = "../mdconfig" }
+clap = { version = "4", features = ["derive"] }

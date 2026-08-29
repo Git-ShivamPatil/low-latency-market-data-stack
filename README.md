@@ -87,9 +87,9 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - [x] **M3 · A/B redundancy, loss injection, arbitration and gap detection**  
   Two independent channels carry the same stream, the handler takes whichever datagram lands first, and it knows the difference between 'late' and 'lost'.  
   <sub>Verified: 10M messages at 2% single-arm loss produce **zero gaps**, with both arms contributing first arrivals. Under *independent* 2% loss, 124 datagrams died on both arms — 0.040%, matching the p² prediction — and the handler named gaps covering exactly those 3,968 sequences, no more and no less. Correlated loss transitions to `GAPPED` with the range named. `scripts/smoke.sh` now injects loss over real sockets too. See [docs/RECOVERY.md](docs/RECOVERY.md).</sub>
-- [~] **M4 · Snapshot cycle and recovery** *(snapshot recovery done; TCP replay service not built)*  
+- [x] **M4 · Snapshot cycle and TCP replay recovery**  
   A handler that has fallen behind rejoins the live stream with a correct book instead of being restarted.  
-  <sub>Verified: a range lost on both arms, and a 1,600-message blackout, both recover to a book **identical to the publisher's** — including queue position, not just quantity. `scripts/smoke.sh` runs it across two processes: 4 gaps, 2 recoveries, worst 48ms, ending `LIVE` with every shared checkpoint matching. The `Snapshot` message now carries **orders in queue order** rather than aggregated levels, because an aggregate cannot restore price-time priority. The `replay-service` binary is **not built** — see [docs/RECOVERY.md](docs/RECOVERY.md#what-is-still-missing) for what that costs.</sub>
+  <sub>Verified: a range lost on both arms, and a 1,600-message blackout, both recover to a book **identical to the publisher's** — including queue position, not just quantity. `scripts/smoke.sh` runs both recovery paths across three processes: snapshot-only (4 gaps, 2 recoveries, worst 48ms) and with the replay service (5 gaps, 4 filled by replay, 1 by snapshot, 2,783 messages recovered), each ending `LIVE` with every shared checkpoint matching. `Snapshot` carries **orders in queue order** rather than aggregated levels, because an aggregate cannot restore price-time priority. See [docs/RECOVERY.md](docs/RECOVERY.md).</sub>
 - [ ] **M5 · MBP and MBO books on an allocation-free path**  
   Both book views are maintained with zero heap allocations per message, and that is proved by a test rather than asserted in a README.
 - [ ] **M6 · Benchmark harness, tuning, and an honest report**  
@@ -215,7 +215,7 @@ crates/transport/ — multicast and unicast-fanout backends, one send path      
 crates/mdconfig/ — the configuration file both binaries read                                 [M2]
 crates/matching-engine/ — bin name MUST be `matching-engine`; price-time priority, A/B publisher, loss injection, snapshot cycle
 crates/feed-handler/ — bin name MUST be `feed-handler`; arbitration, gap detection, recovery, --verify-allocations
-crates/replay-service/ — TCP range replay                                                    [M4]
+crates/replay-service/ — bounded datagram history + TCP range server         [M4]
 cpp/CMakeLists.txt
 cpp/wire/ — generated headers, shared with the Rust codec via the same schema
 cpp/gateway/ — FIX 4.4 session and application layer, sequence persistence

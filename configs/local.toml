@@ -183,3 +183,38 @@ recovery_buffer_datagrams = 4096
 # feed.snapshot_interval_millis, or recovery would time out before the snapshot
 # it is waiting for was ever due. The config refuses to load otherwise.
 recovery_timeout_millis = 10000
+
+[replay]
+# The replay service serves ranges of the stream over TCP, so a consumer that
+# lost messages can fill the hole exactly instead of waiting for a snapshot.
+#
+# Snapshot recovery rebuilds the *book*. Replay recovers the *messages* — the
+# trades that printed in the gap, the orders that came and went. A consumer
+# keeping its own audit trail needs those; one that only trades off the book does
+# not. So both mechanisms exist and neither makes the other redundant.
+
+# Where the service listens for the engine's uplink.
+#
+# TCP rather than another multicast subscriber, because this link has to be
+# lossless: a replay service that had itself missed the datagrams a consumer is
+# asking for would answer confidently and wrongly.
+uplink_bind = "127.0.0.1:32001"
+
+# Where the service listens for consumers asking for a range.
+request_bind = "127.0.0.1:32002"
+
+# Where the engine connects to feed the service, and where a consumer sends its
+# requests. Empty disables each side: the engine publishes normally without an
+# uplink, and the handler falls back to the snapshot cycle without a request
+# address. Both are also settable with --replay-uplink and --replay.
+uplink_connect = ""
+request_connect = ""
+
+# How many datagrams of history to keep. This is the recovery horizon: a consumer
+# asking for a range older than this is told so, and has to use a snapshot
+# instead. At a batch of 32, 8192 datagrams is roughly 260K messages and ~11MB.
+history_datagrams = 8192
+
+# How long a consumer waits on a replay request before giving up and falling back
+# to the snapshot cycle.
+request_timeout_millis = 2000

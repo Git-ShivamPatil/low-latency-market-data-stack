@@ -118,8 +118,14 @@ impl Gap {
     /// How many sequences the gap covers. Never zero: a gap always spans at
     /// least the one message that went missing, which is why this is not `len`
     /// — there is no such thing as an empty gap to ask about.
+    ///
+    /// Saturating rather than plain subtraction. An inverted gap is a bug, and
+    /// this used to underflow and report it as "0 messages" — which read as
+    /// harmless and hid a loop that declared the same non-gap thousands of
+    /// times. Constructing one is now prevented at the source; this is the
+    /// second line of defence.
     pub fn messages(&self) -> u64 {
-        self.through - self.from + 1
+        (self.through + 1).saturating_sub(self.from)
     }
 }
 
@@ -430,12 +436,35 @@ impl Arbitrator {
         self.resyncs
     }
 
+    /// Clears `Gapped` after the named range was filled by other means.
+    ///
+    /// Replay fills a hole *in place*: the frontier does not move, the window is
+    /// untouched, and the book keeps everything it already had. So there is
+    /// nothing for [`resync_to`](Self::resync_to) to do — but the state still has
+    /// to be cleared, or a handler that recovered from every gap it reported
+    /// would finish the run claiming to be GAPPED and exit non-zero.
+    ///
+    /// The gap stays in [`gaps`](Self::gaps): it happened, and the record of it
+    /// is what lets a run report seven gaps and seven recoveries.
+    pub fn clear_gapped(&mut self) {
+        if self.state == FeedState::Gapped {
+            self.state = FeedState::Live;
+        }
+    }
+
     /// Declares the current hole lost. Called when the window is full, and by
     /// the caller when the feed has gone quiet with a hole outstanding.
     ///
     /// Returns `None` when there is no hole to give up on.
     pub fn declare_gap_if_stalled(&mut self) -> Option<Gap> {
         if self.occupied == 0 {
+            return None;
+        }
+        // Something buffered covering the frontier is not a hole — it is traffic
+        // waiting to be drained, and declaring a gap over it produced an
+        // inverted range that then repeated forever. The caller's answer to this
+        // is to drain, not to give up.
+        if self.find_slot_covering(self.next_expected).is_some() {
             return None;
         }
         Some(self.declare_gap())
@@ -452,9 +481,16 @@ impl Arbitrator {
             // Only called with the window non-empty.
             .unwrap_or(self.next_expected + 1);
 
+        debug_assert!(
+            target > self.next_expected,
+            "declare_gap called with no hole: frontier {}, lowest buffered {target}",
+            self.next_expected
+        );
         let gap = Gap {
             from: self.next_expected,
-            through: target.saturating_sub(1),
+            // `target` is strictly greater than the frontier, guaranteed by the
+            // caller checks above, so this cannot invert.
+            through: target.saturating_sub(1).max(self.next_expected),
         };
         self.messages_missed += gap.messages();
         self.gaps.push(gap);
@@ -671,6 +707,34 @@ mod tests {
             }
         });
         assert_eq!(h.delivered, vec![1, 2, 3, 4, 9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn a_buffered_datagram_at_the_frontier_is_not_a_gap() {
+        // This produced an inverted range that repeated for the rest of the run:
+        // the window held a datagram starting exactly at the frontier, which is
+        // traffic waiting to be drained, not a hole.
+        let mut h = Harness::new(8);
+        h.feed(0, &datagram(1, 4, 0));
+        // Arrange for slot content at exactly next_expected without draining it,
+        // by resyncing the frontier back onto a buffered datagram.
+        h.feed(0, &datagram(9, 4, 0));
+        h.arb.resync_to(9);
+        assert_eq!(
+            h.arb.declare_gap_if_stalled(),
+            None,
+            "there is no hole here, only undrained traffic"
+        );
+        assert_eq!(h.arb.state(), FeedState::Live);
+    }
+
+    #[test]
+    fn a_gap_never_reports_a_negative_span() {
+        let g = Gap {
+            from: 10,
+            through: 9,
+        };
+        assert_eq!(g.messages(), 0, "an inverted gap must not underflow");
     }
 
     #[test]

@@ -57,22 +57,31 @@ docker compose logs -f handler
 docker compose down
 ```
 
-This puts the engine and the handler on a user-defined bridge with a fixed
-subnet and sends the feed across it as real multicast. If it does not work:
+This puts the engine, the replay service and the handler on a user-defined
+bridge with a fixed subnet, and sends the feed across it as real multicast. If it
+does not work:
 
 ```bash
 MDSTACK_TRANSPORT=unicast-fanout docker compose up -d
 ```
 
 > **A note on the case study's step ordering.** The published steps read
-> `docker compose up -d`, then run the engine, then run the handler. As of
-> milestone 2 that would start *two* engines — one in the container and one on
-> the host — both publishing to the same groups with independent sequence
-> numbers, and the handler would report a torrent of gaps. Compose here is the
-> whole stack, not infrastructure the host binaries attach to. That becomes
-> coherent in milestone 4, when the replay service is the thing compose brings
-> up and the host binaries genuinely do connect to it. Until then, pick one path
-> or the other. This is tracked as copy that needs correcting before v1.0.
+> `docker compose up -d`, then run the engine, then run the handler. Taken
+> literally that starts *two* engines — one in the container and one on the host
+> — both publishing to the same groups with independent sequence numbers, and the
+> handler would report a torrent of gaps.
+>
+> The replay service is genuinely infrastructure a host binary attaches to, so
+> the intent of step 1 now has something real behind it. To follow the published
+> steps as written:
+>
+> ```bash
+> docker compose up -d replay
+> ```
+>
+> then run the engine and handler on the host with `--replay-uplink` and
+> `--replay`. Bringing up the *whole* compose stack is the alternative, all-in-one
+> path. The published copy still needs a word changed before v1.0 to say which.
 
 ---
 
@@ -107,6 +116,27 @@ It also asserts the things that quietly break a batched feed:
 
 Both transports are tested. The unicast fallback is not a second-class path.
 
+Two further scenarios run after them: **recovery**, which forces loss on both
+arms and requires the handler to rebuild from a snapshot and end `LIVE` with
+matching books; and **replay**, which does the same with a replay service running
+and requires the gaps to be filled by replay rather than fallen back on.
+
+### With the replay service
+
+Three processes. The service holds a bounded history of the stream and serves
+ranges of it, so a consumer that loses messages can fill the hole exactly instead
+of waiting for the next snapshot.
+
+```bash
+cargo run --release --bin replay-service -- --config configs/local.toml
+```
+
+Then add `--replay-uplink 127.0.0.1:32001` to the engine and
+`--replay 127.0.0.1:32002` to the handler. Both are optional: without the uplink
+the engine publishes normally, and without the request address the handler falls
+back to the snapshot cycle. [RECOVERY.md](RECOVERY.md) explains why both
+mechanisms exist.
+
 ### Injecting loss
 
 The smoke test runs with 2% loss injected — one arm per dropped datagram — and
@@ -125,14 +155,15 @@ before it arrived, so its book diverges from the engine's for the rest of the
 run. It detects this and says so:
 
 ```
-joined mid-stream at sequence 40312. The book will be incomplete until the
-snapshot cycle lands in milestone 4 — start this handler before the engine for
-a clean run.
+joined mid-stream at sequence 40312; waiting for a snapshot to build a book that
+can be trusted.
 ```
 
-Starting it first is not papering over the gap; it is the honest scope of
-milestone 2. Recovering from a late join is exactly what the 2-second snapshot
-cycle and the TCP replay service in milestone 4 are for.
+A mid-stream join is treated as a gap by another name — everything before it is
+missing — so it goes through the same recovery path, and the next snapshot cycle
+gives it a book it can trust. The smoke test still starts the handler first
+because that makes the *whole* run comparable against the engine's checkpoints
+rather than only the part after recovery.
 
 ---
 
@@ -163,4 +194,4 @@ reported with p99 and p99.9 alongside the median, and reproduced three times
 within 10%. That is milestone 6, on rented hardware.
 
 See [CLAIMS.md](../CLAIMS.md) for what has actually been measured. As of
-milestone 2: nothing.
+milestone 4: nothing.

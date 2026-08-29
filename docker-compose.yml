@@ -38,6 +38,17 @@ services:
       - --transport=${MDSTACK_TRANSPORT:-multicast}
     restart: unless-stopped
 
+  replay:
+    <<: *build
+    container_name: mdstack-replay
+    entrypoint: ["replay-service"]
+    networks:
+      feed:
+        ipv4_address: 172.28.0.12
+    command:
+      - --config=/app/configs/docker.toml
+    restart: unless-stopped
+
   handler:
     <<: *build
     container_name: mdstack-handler
@@ -51,6 +62,7 @@ services:
       - --show-book
     depends_on:
       - engine
+      - replay
     restart: unless-stopped
 
 networks:
