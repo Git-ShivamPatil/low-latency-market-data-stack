@@ -67,8 +67,18 @@ impl HostFacts {
     pub fn gather() -> Self {
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
         Self {
-            cpu_model: field(&cpuinfo, "model name").unwrap_or_else(|| "unknown".into()),
-            physical_cores: physical_cores(&cpuinfo),
+            // `model name` is an x86 field. aarch64 has `CPU implementer` and
+            // `CPU part` instead, and the arm64 runner reported "unknown"
+            // until this looked for them.
+            cpu_model: field(&cpuinfo, "model name")
+                .or_else(|| {
+                    let imp = field(&cpuinfo, "CPU implementer")?;
+                    let part = field(&cpuinfo, "CPU part")?;
+                    Some(format!("aarch64 implementer {imp} part {part}"))
+                })
+                .or_else(|| read_trimmed("/sys/devices/virtual/dmi/id/product_name"))
+                .unwrap_or_else(|| "unknown".into()),
+            physical_cores: physical_cores_from_sysfs().or_else(|| physical_cores(&cpuinfo)),
             logical_cores: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(0),
@@ -109,9 +119,19 @@ impl HostFacts {
                  prefers. Usable, but the report has to say so."
             )),
             Some(_) => {}
-            None => warnings.push(
+            // Unknown is not the same as fine.
+            //
+            // This was a caveat, and the free arm64 runner walked straight
+            // through it: `/proc/cpuinfo` on aarch64 carries no `core id`, so
+            // the count came back `None`, and the gate printed PUBLISHABLE while
+            // admitting in the next line that the most important precondition
+            // was unverified. That is exactly the failure this whole crate
+            // exists to prevent, so it blocks.
+            None => blockers.push(
                 "the physical core count could not be determined, so the most important \
-                 precondition is unverified."
+                 precondition is unverified. A number from a host that has not been shown \
+                 to meet the requirement is not publishable, whatever the requirement \
+                 turns out to be."
                     .to_string(),
             ),
         }
@@ -324,6 +344,38 @@ fn read_trimmed(path: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Distinct physical cores, from sysfs.
+///
+/// `/sys/devices/system/cpu/cpuN/topology/` is the portable source: it exists on
+/// aarch64, where `/proc/cpuinfo` has no `core id` at all. Preferred over the
+/// `/proc/cpuinfo` scan below, which only ever worked on x86.
+fn physical_cores_from_sysfs() -> Option<usize> {
+    let mut pairs = std::collections::BTreeSet::new();
+    let entries = std::fs::read_dir("/sys/devices/system/cpu").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if name.len() == 3 {
+            continue;
+        }
+        let base = entry.path().join("topology");
+        let core = read_trimmed(base.join("core_id").to_str()?);
+        // Single-socket machines sometimes omit the package id; treating a
+        // missing one as socket 0 is right there and harmless elsewhere,
+        // because two sockets that both omit it would be indistinguishable
+        // anyway and that is a machine nobody is benchmarking on.
+        let package = read_trimmed(base.join("physical_package_id").to_str()?)
+            .unwrap_or_else(|| "0".to_string());
+        if let Some(core) = core {
+            pairs.insert((package, core));
+        }
+    }
+    (!pairs.is_empty()).then_some(pairs.len())
+}
+
 /// Distinct `(physical id, core id)` pairs — logical CPUs that share a core
 /// through SMT collapse to one.
 fn physical_cores(cpuinfo: &str) -> Option<usize> {
@@ -370,14 +422,33 @@ fn detect_virtualisation() -> Option<&'static str> {
             return Some("Xen");
         }
     }
-    // A bare-metal Linux host has no `hypervisor` flag; every common VM sets it.
-    // Not conclusive on its own, which is why it is last.
+    // A bare-metal Linux host has no `hypervisor` flag; every common x86 VM sets
+    // it. Not conclusive on its own, which is why it is not first.
     if let Ok(c) = std::fs::read_to_string("/proc/cpuinfo") {
         if c.lines()
             .find(|l| l.starts_with("flags"))
             .is_some_and(|l| l.split_whitespace().any(|f| f == "hypervisor"))
         {
             return Some("a hypervisor");
+        }
+    }
+    // The `hypervisor` flag is x86 CPUID and does not exist on aarch64, so the
+    // check above reported the arm64 CI runner — an Azure VM — as bare metal.
+    // DMI knows better and is architecture-independent.
+    if let Some(vendor) = read_trimmed("/sys/devices/virtual/dmi/id/sys_vendor") {
+        let v = vendor.to_ascii_lowercase();
+        for (needle, name) in [
+            ("microsoft", "a Microsoft hypervisor"),
+            ("amazon", "an Amazon hypervisor"),
+            ("google", "a Google hypervisor"),
+            ("qemu", "QEMU/KVM"),
+            ("vmware", "VMware"),
+            ("xen", "Xen"),
+            ("oracle", "an Oracle hypervisor"),
+        ] {
+            if v.contains(needle) {
+                return Some(name);
+            }
         }
     }
     None
@@ -565,12 +636,16 @@ core id\t\t: 1
     }
 
     #[test]
-    fn missing_topology_reads_as_unknown_rather_than_as_a_pass() {
-        // WSL2 omits these fields. "Unknown" must not be mistaken for "fine".
+    fn an_unknown_core_count_blocks_rather_than_passing_with_a_note() {
+        // The hole the free arm64 runner found. `/proc/cpuinfo` on aarch64 has
+        // no `core id`, the count came back None, and the gate printed
+        // PUBLISHABLE while saying in the next line that the most important
+        // precondition was unverified.
         let cpuinfo = "processor\t: 0\nmodel name\t: something\n";
         assert_eq!(physical_cores(cpuinfo), None);
         let v = facts(None, None, true).verdict();
-        assert!(v.warnings().iter().any(|w| w.contains("unverified")));
+        assert!(!v.is_publishable(), "unknown is not the same as fine: {v}");
+        assert!(v.blockers().iter().any(|b| b.contains("unverified")));
     }
 
     #[test]
