@@ -43,6 +43,9 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 /// What the host says about its own cycle counter.
+///
+/// The two x86 flags are meaningless on aarch64, where the equivalent guarantee
+/// is architectural rather than advertised — see [`TscQuality::detect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TscQuality {
     /// The TSC ticks at a constant rate regardless of the core's frequency.
@@ -52,16 +55,50 @@ pub struct TscQuality {
     /// `/proc/cpuinfo` was readable at all. False on non-Linux, where the flags
     /// are simply unknown rather than absent.
     pub flags_readable: bool,
+    /// aarch64 only: the generic timer's fixed frequency from `cntfrq_el0`.
+    ///
+    /// Recorded because it is usually far lower than an x86 TSC — 25MHz and
+    /// 100MHz are both common on server ARM — and that sets a floor on what can
+    /// be resolved. A report from an ARM host has to state it.
+    pub counter_hz: Option<u64>,
 }
 
 impl TscQuality {
+    /// Reads the flags from `/proc/cpuinfo`, or the timer frequency on aarch64.
+    ///
+    /// # Why aarch64 is different
+    ///
+    /// `constant_tsc` and `nonstop_tsc` are x86 CPUID bits and do not exist on
+    /// ARM. The equivalent property is not advertised there because it is
+    /// architectural: the generic timer (`cntvct_el0`) runs at the fixed
+    /// frequency in `cntfrq_el0`, independent of the core clock and of idle
+    /// states, by definition of the architecture. Requiring the x86 flag names
+    /// on an ARM host would refuse every ARM host for lacking a bit that ARM
+    /// does not have.
+    ///
+    /// This matters because the only free host that meets this project's core
+    /// requirement is an ARM one.
+    #[cfg(target_arch = "aarch64")]
+    pub fn detect() -> Self {
+        let hz = counter_frequency();
+        Self {
+            // Architectural, not advertised. See above.
+            constant_tsc: hz.is_some(),
+            nonstop_tsc: hz.is_some(),
+            flags_readable: true,
+            counter_hz: hz,
+        }
+    }
+
     /// Reads the flags from `/proc/cpuinfo`.
+    #[cfg(not(target_arch = "aarch64"))]
     pub fn detect() -> Self {
         let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") else {
             return Self {
                 constant_tsc: false,
                 nonstop_tsc: false,
                 flags_readable: false,
+                counter_hz: None,
             };
         };
         let flags = text
@@ -74,7 +111,22 @@ impl TscQuality {
             constant_tsc: flags.split_whitespace().any(|f| f == "constant_tsc"),
             nonstop_tsc: flags.split_whitespace().any(|f| f == "nonstop_tsc"),
             flags_readable: true,
+            counter_hz: None,
         }
+    }
+
+    /// Nanoseconds per tick — the finest interval this counter can distinguish.
+    ///
+    /// On x86 the TSC runs at roughly the core's nominal frequency, so this is
+    /// well under a nanosecond and nothing needs saying. On ARM the generic
+    /// timer is commonly 25MHz, which is 40ns a tick — coarser than the decode
+    /// being measured. That does not make it useless, because the measurement
+    /// is per datagram and divided by the batch factor, but it does have to
+    /// appear in the report.
+    pub fn granularity_nanos(&self) -> Option<f64> {
+        self.counter_hz
+            .filter(|hz| *hz > 0)
+            .map(|hz| 1e9 / hz as f64)
     }
 
     /// Whether a cycle count from this host can be converted to a duration.
@@ -86,6 +138,13 @@ impl TscQuality {
     pub fn why_not(&self) -> Option<String> {
         if self.is_invariant() {
             return None;
+        }
+        if cfg!(target_arch = "aarch64") {
+            return Some(
+                "cntfrq_el0 read as zero or could not be read, so the generic timer's \
+                 frequency is unknown and a tick count cannot be converted to a duration."
+                    .to_string(),
+            );
         }
         if !self.flags_readable {
             return Some(
@@ -137,7 +196,23 @@ pub fn start() -> u64 {
             core::arch::x86_64::_rdtsc()
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    // ARM's generic timer needs an instruction barrier for the same reason x86
+    // needs `lfence`: `mrs` is not ordered against surrounding work, so without
+    // the `isb` the read can float out of the region being timed.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let t: u64;
+        unsafe {
+            core::arch::asm!(
+                "isb",
+                "mrs {t}, cntvct_el0",
+                t = out(reg) t,
+                options(nomem, nostack)
+            );
+        }
+        t
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         0
     }
@@ -158,15 +233,41 @@ pub fn stop() -> u64 {
             t
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        let t: u64;
+        unsafe {
+            core::arch::asm!(
+                "isb",
+                "mrs {t}, cntvct_el0",
+                t = out(reg) t,
+                options(nomem, nostack)
+            );
+        }
+        t
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         0
     }
 }
 
+/// The generic timer's fixed frequency, in hertz.
+#[cfg(target_arch = "aarch64")]
+fn counter_frequency() -> Option<u64> {
+    let hz: u64;
+    unsafe {
+        core::arch::asm!("mrs {hz}, cntfrq_el0", hz = out(reg) hz, options(nomem, nostack));
+    }
+    // Zero means firmware never programmed it, which is a real and reported
+    // condition on some boards. A frequency outside a plausible range means
+    // something is wrong enough not to build a measurement on.
+    (1_000_000..=1_000_000_000).contains(&hz).then_some(hz)
+}
+
 /// Whether this build can read a cycle counter at all.
 pub const fn available() -> bool {
-    cfg!(target_arch = "x86_64")
+    cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")
 }
 
 impl Tsc {
@@ -426,6 +527,7 @@ mod tests {
                 constant_tsc: true,
                 nonstop_tsc: true,
                 flags_readable: true,
+                counter_hz: None,
             },
             calibration_spread: 0.0,
             overhead_ticks: 30,
@@ -437,11 +539,41 @@ mod tests {
     }
 
     #[test]
+    fn an_arm_timer_reports_its_granularity() {
+        // The number an ARM report has to carry. A 25MHz generic timer is 40ns
+        // a tick, which is coarser than the decode being measured — usable
+        // because the measurement is per datagram, but not something to leave
+        // out of a report.
+        let q = TscQuality {
+            constant_tsc: true,
+            nonstop_tsc: true,
+            flags_readable: true,
+            counter_hz: Some(25_000_000),
+        };
+        assert_eq!(q.granularity_nanos(), Some(40.0));
+        assert!(q.is_invariant());
+        assert!(q.why_not().is_none());
+
+        let x86 = TscQuality {
+            constant_tsc: true,
+            nonstop_tsc: true,
+            flags_readable: true,
+            counter_hz: None,
+        };
+        assert_eq!(
+            x86.granularity_nanos(),
+            None,
+            "x86 has no fixed tick to report"
+        );
+    }
+
+    #[test]
     fn missing_flags_produce_an_explanation_naming_them() {
         let q = TscQuality {
             constant_tsc: false,
             nonstop_tsc: true,
             flags_readable: true,
+            counter_hz: None,
         };
         let why = q
             .why_not()
@@ -456,6 +588,7 @@ mod tests {
             constant_tsc: false,
             nonstop_tsc: false,
             flags_readable: true,
+            counter_hz: None,
         };
         let why = both.why_not().unwrap();
         assert!(why.contains("constant_tsc") && why.contains("nonstop_tsc"));
@@ -464,6 +597,7 @@ mod tests {
             constant_tsc: true,
             nonstop_tsc: true,
             flags_readable: true,
+            counter_hz: None,
         };
         assert!(good.why_not().is_none());
         assert!(good.is_invariant());

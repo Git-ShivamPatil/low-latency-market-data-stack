@@ -116,10 +116,25 @@ impl HostFacts {
             ),
         }
 
+        // Virtualisation is a caveat, not a blocker.
+        //
+        // It used to be a blocker, which was wrong in a way that only showed up
+        // once the budget for this programme went to zero: every free host is a
+        // VM, so blocking on virtualisation blocks on everything and the gate
+        // becomes a gate against measuring at all.
+        //
+        // What actually matters about a VM is whether it masks the cycle counter
+        // and whether it gives you real cores — and both of those are checked on
+        // their own terms above. WSL2 fails both and is still refused. A
+        // dedicated ephemeral runner that exposes an invariant counter and four
+        // unshared cores is a legitimate host, and the requirement that three
+        // runs agree within 10% is what decides whether it was quiet enough.
         if let Some(kind) = self.virtualised {
-            blockers.push(format!(
-                "running under {kind}. The scheduler and the timers belong to a host this \
-                 process cannot see, so tail latencies measure that host as much as this code."
+            warnings.push(format!(
+                "running under {kind}. The scheduler belongs to a host this process cannot \
+                 see, so the tail latencies are partly a measurement of that host. The \
+                 report has to say so, and the three-runs-within-10% requirement is what \
+                 decides whether it was quiet enough to matter."
             ));
         }
 
@@ -395,6 +410,7 @@ mod tests {
                 constant_tsc: true,
                 nonstop_tsc: true,
                 flags_readable: true,
+                counter_hz: None,
             },
             optimised_build: optimised,
             target_cpu_native: true,
@@ -431,10 +447,31 @@ mod tests {
     }
 
     #[test]
-    fn virtualisation_blocks() {
-        let v = facts(Some(16), Some("WSL2"), true).verdict();
-        assert!(!v.is_publishable());
-        assert!(v.blockers().iter().any(|b| b.contains("WSL2")));
+    fn virtualisation_is_a_caveat_not_a_refusal() {
+        // Every free host is a VM. Blocking on virtualisation blocks on
+        // everything, which turns the gate into a gate against measuring at all.
+        // What matters about a VM is checked on its own terms: a masked counter
+        // and too few cores are both still blockers, and WSL2 fails both.
+        let v = facts(Some(16), Some("a hypervisor"), true).verdict();
+        assert!(v.is_publishable(), "{v}");
+        assert!(v.warnings().iter().any(|w| w.contains("hypervisor")));
+    }
+
+    #[test]
+    fn wsl2_is_still_refused_on_its_own_merits() {
+        // The case the gate exists for. It must keep failing after
+        // virtualisation stopped being a blocker, or demoting that check
+        // quietly opened the door this whole crate is here to hold shut.
+        let mut f = facts(Some(2), Some("WSL2"), true);
+        f.tsc = TscQuality {
+            constant_tsc: false,
+            nonstop_tsc: false,
+            flags_readable: true,
+            counter_hz: None,
+        };
+        let v = f.verdict();
+        assert!(!v.is_publishable(), "{v}");
+        assert_eq!(v.blockers().len(), 2, "cores and the counter, both: {v}");
     }
 
     #[test]
@@ -451,6 +488,7 @@ mod tests {
             constant_tsc: false,
             nonstop_tsc: false,
             flags_readable: true,
+            counter_hz: None,
         };
         let v = f.verdict();
         assert!(!v.is_publishable());
@@ -475,9 +513,14 @@ mod tests {
             constant_tsc: false,
             nonstop_tsc: false,
             flags_readable: true,
+            counter_hz: None,
         };
         let v = f.verdict();
-        assert_eq!(v.blockers().len(), 4, "{v}");
+        assert_eq!(
+            v.blockers().len(),
+            3,
+            "cores, counter and build profile. Virtualisation is a caveat: {v}"
+        );
     }
 
     #[test]

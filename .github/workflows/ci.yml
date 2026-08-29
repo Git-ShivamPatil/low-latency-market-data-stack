@@ -65,6 +65,29 @@ jobs:
           BOOK_DIFF_OPS: 5000000
       - run: cargo test --workspace
 
+  # arm64 is free for public repositories, and it is the only free host that
+  # meets this project's four-physical-core requirement -- server ARM has no
+  # SMT, so 4 vCPU is 4 real cores. That makes it the likeliest place milestone
+  # 6 is ever measured, so the ARM code path is compiled and tested on every
+  # push rather than discovered to be broken on the day it matters.
+  #
+  # The cycle counter is `cntvct_el0` there rather than `rdtsc`; see
+  # crates/bench-support/src/tsc.rs for why the x86 invariance flags do not
+  # apply and what replaces them.
+  rust-arm64:
+    name: Rust on arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      # Not a benchmark -- benchmarks never run in CI. This only asks the host
+      # gate what it thinks of a free arm64 runner, which is the question the
+      # zero-budget plan turns on.
+      - name: What does the host gate say about a free arm64 runner?
+        run: cargo run --release -p bench --bin hostcheck || true
+
   cpp:
     name: C++
     runs-on: ubuntu-24.04

@@ -104,6 +104,13 @@ clean: ## Remove build output from both toolchains
 # `make test`. They must never run on a shared runner: numbers from a noisy
 # virtualised host would discredit the honest ones.
 
+# RUSTFLAGS is cleared because .cargo/config.toml sets -C target-cpu=native,
+# which is an x86 option and fails the cross-check.
+.PHONY: check-arm64
+check-arm64: ## Type-check the aarch64 paths without an ARM machine
+	rustup target add aarch64-unknown-linux-gnu
+	RUSTFLAGS= $(CARGO) check --workspace --all-targets --target aarch64-unknown-linux-gnu
+
 .PHONY: hostcheck
 hostcheck: ## Say whether this machine may publish a performance number
 	$(CARGO) run --release -p bench --bin hostcheck
