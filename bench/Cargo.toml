@@ -20,9 +20,17 @@ wire = { path = "../crates/wire" }
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
+# `cargo bench` would otherwise try to run the library's and the binary's test
+# harnesses as bench targets. They do not accept Criterion's arguments, so
+# `scripts/bench.sh micro` died on `Unrecognized option: 'sample-size'` before
+# reaching a single benchmark.
+[lib]
+bench = false
+
 [[bin]]
 name = "hostcheck"
 path = "src/bin/hostcheck.rs"
+bench = false
 
 [[bench]]
 name = "decode"
