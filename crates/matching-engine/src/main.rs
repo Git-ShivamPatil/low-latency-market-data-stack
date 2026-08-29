@@ -24,7 +24,7 @@ use mdconfig::Config;
 use transport::{Publisher, TransportMode};
 
 use crate::engine::Engine;
-use crate::feed::FeedPublisher;
+use crate::feed::{DropMode, FeedPublisher};
 use crate::generator::{Generator, Intent, Shape};
 use book::DigestLog;
 
@@ -91,6 +91,30 @@ struct Args {
     #[arg(long)]
     self_check: bool,
 
+    /// Fraction of datagrams to drop per arm, 0.0 to 1.0.
+    ///
+    /// Injected at the publisher rather than with `tc qdisc`: it needs no
+    /// privileges, no second machine, and replays exactly from a seed. What the
+    /// handler has to survive is a datagram that never arrives, and this
+    /// produces exactly that.
+    #[arg(long, value_name = "RATE")]
+    drop_rate: Option<f64>,
+
+    /// How loss is correlated between the arms.
+    ///
+    /// `exclusive` drops on exactly one arm, which is the model under which
+    /// "single-arm loss costs nothing" is a theorem rather than a probability.
+    /// `independent` is what a real network does and unavoidably loses some
+    /// datagrams on both. `correlated` drops the same ones on both arms and is
+    /// how the GAPPED path gets exercised.
+    #[arg(long, value_name = "MODE")]
+    drop_mode: Option<String>,
+
+    /// Seed for the loss injector. Separate from `--seed` so that turning loss
+    /// on does not change which orders are generated.
+    #[arg(long)]
+    drop_seed: Option<u64>,
+
     /// Print the resolved configuration and exit without sending anything.
     #[arg(long)]
     dry_run: bool,
@@ -136,6 +160,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("symbols        {}", cfg.market.symbols.len());
         println!("seed           {}", cfg.engine.seed);
         println!("digest every   {} sequences", cfg.engine.digest_interval);
+        println!(
+            "loss           {} ({})",
+            cfg.engine.drop_rate, cfg.engine.drop_mode
+        );
         return Ok(());
     }
 
@@ -154,6 +182,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         feed.enable_self_check();
     }
 
+    let drop_mode: DropMode = cfg
+        .engine
+        .drop_mode
+        .parse()
+        .map_err(|e: String| -> Box<dyn std::error::Error> { e.into() })?;
+    if cfg.engine.drop_rate > 0.0 {
+        feed.set_loss(cfg.engine.drop_rate, drop_mode, cfg.engine.drop_seed);
+    }
+
     eprintln!("matching-engine");
     eprintln!("  {}", feed.describe());
     eprintln!(
@@ -165,6 +202,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(p) = cfg.engine.digest_path.as_deref() {
         eprintln!("  checkpoints -> {}", p.display());
+    }
+    if feed.loss_enabled() {
+        eprintln!(
+            "  injecting {:.2}% loss per arm, {drop_mode} (seed {})",
+            cfg.engine.drop_rate * 100.0,
+            cfg.engine.drop_seed
+        );
     }
 
     let started = Instant::now();
@@ -277,6 +321,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "  {} orders, {} trades ({} shares), {} cancels, {} amends",
         s.orders_submitted, s.trades, s.shares_traded, s.cancels, s.modifies
     );
+    let f = feed.stats();
+    if feed.loss_enabled() {
+        eprintln!(
+            "  dropped {} datagrams on A and {} on B of {} sent ({} on both)",
+            f.dropped[0], f.dropped[1], f.datagrams, f.dropped_both
+        );
+    }
     eprintln!("  final book {}", engine.digest());
     engine
         .books()
@@ -311,6 +362,15 @@ fn apply_overrides(cfg: &mut Config, args: &Args) {
     }
     if let Some(v) = args.digest_interval {
         cfg.engine.digest_interval = v;
+    }
+    if let Some(v) = args.drop_rate {
+        cfg.engine.drop_rate = v.clamp(0.0, 1.0);
+    }
+    if let Some(v) = args.drop_mode.clone() {
+        cfg.engine.drop_mode = v;
+    }
+    if let Some(v) = args.drop_seed {
+        cfg.engine.drop_seed = v;
     }
     if args.digest_path.is_some() {
         cfg.engine.digest_path = args.digest_path.clone();

@@ -11,6 +11,10 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "feed_handler"
+path = "src/lib.rs"
+
 # Load-bearing: the case study tells visitors to run `--bin feed-handler`.
 [[bin]]
 name = "feed-handler"
@@ -24,3 +28,7 @@ mdconfig = { path = "../mdconfig" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+[dev-dependencies]
+# The redundancy tests build datagrams directly to inject an exact loss pattern.
+wire = { path = "../wire" }

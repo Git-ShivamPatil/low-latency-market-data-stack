@@ -30,12 +30,21 @@ DIGEST_INTERVAL=1000
 IDLE_TIMEOUT=10
 MODES=(multicast unicast-fanout)
 KEEP=0
+# Loss injected on exactly one arm per dropped datagram. Under that model
+# "single-arm loss costs nothing" is a property the code either has or does not,
+# so zero gaps here is a real assertion rather than a lucky run. The statistics
+# of independent loss are covered by the redundancy integration tests, which can
+# predict exactly which datagrams die and check the reported gaps against them.
+DROP_RATE=0.02
+DROP_MODE=exclusive
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --transport) MODES=("$2"); shift 2 ;;
         --messages) MESSAGES="$2"; shift 2 ;;
         --digest-interval) DIGEST_INTERVAL="$2"; shift 2 ;;
+        --drop-rate) DROP_RATE="$2"; shift 2 ;;
+        --drop-mode) DROP_MODE="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
         -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -58,7 +67,7 @@ overall=0
 
 for MODE in "${MODES[@]}"; do
     echo "=============================================================="
-    echo " transport: $MODE"
+    echo " transport: $MODE   loss: $DROP_RATE $DROP_MODE"
     echo "=============================================================="
 
     ENGINE_DIGESTS="$OUT/engine-$MODE.txt"
@@ -110,6 +119,8 @@ for MODE in "${MODES[@]}"; do
         --messages "$MESSAGES" \
         --digest-path "$ENGINE_DIGESTS" \
         --digest-interval "$DIGEST_INTERVAL" \
+        --drop-rate "$DROP_RATE" \
+        --drop-mode "$DROP_MODE" \
         --self-check \
         >"$ENGINE_LOG" 2>&1
     engine_status=$?
@@ -229,11 +240,29 @@ def want(key, value, why):
 want("messages", expected, "the handler must consume the whole run, not a prefix")
 want("first_sequence", 1, "starting anywhere else means it joined mid-stream")
 want("last_sequence", expected, "the stream must run to the end")
-want("gaps", 0, "a gap means a message was lost between the two processes")
+want("state", "LIVE", "a run that ends GAPPED has lost messages it cannot recover")
+want("gaps", 0, "with loss on only one arm at a time, redundancy must cover every one")
 want("messages_missed", 0, "nothing may be skipped")
 want("bad_datagrams", 0, "every datagram must decode")
 want("apply_errors", 0, "every message must apply to the book it describes")
 want("joined_mid_stream", "false", "the handler must have seen sequence 1")
+
+# Loss was injected, so the reorder window must actually have been used. If
+# nothing was ever buffered out of order, the arbitration path this milestone
+# exists for was not exercised and the zero-gap result proves nothing.
+buffered = int(s.get("datagrams_buffered_a", 0)) + int(s.get("datagrams_buffered_b", 0))
+if buffered == 0:
+    fails.append(
+        "no datagram was ever buffered out of order, so the reorder window was "
+        "never exercised - the run cannot support a claim about arbitration"
+    )
+window_used = int(s.get("reorder_window_used", 0))
+window_cap = int(s.get("reorder_window_capacity", 1))
+if window_used >= window_cap:
+    fails.append(
+        f"the reorder window peaked at {window_used} of {window_cap}; it was at its "
+        "limit, so a slightly worse run would have forced gaps that are not real"
+    )
 
 # Sequence 1..N with N messages accepted and zero gaps is what "strictly
 # monotonic, nothing missing, nothing counted twice" reduces to.
@@ -250,11 +279,16 @@ if last - first + 1 != msgs:
 # and the winner is decided by poll order, not by health.
 for arm in ("a", "b"):
     if int(s.get(f"datagrams_{arm}", 0)) == 0:
-        fails.append(f"arm {arm.upper()} received no datagrams — the second channel is not live")
+        fails.append(f"arm {arm.upper()} received no datagrams - the second channel is not live")
+    if int(s.get(f"messages_first_{arm}", 0)) == 0:
+        fails.append(
+            f"arm {arm.upper()} never delivered a message first - with loss on both arms it "
+            "must have covered for the other one at some point"
+        )
 
 # A mirrored arm that never delivers a duplicate means only one arm is really
 # being read.
-if int(s.get("duplicates_a", 0)) + int(s.get("duplicates_b", 0)) == 0:
+if int(s.get("datagrams_duplicate_a", 0)) + int(s.get("datagrams_duplicate_b", 0)) == 0:
     fails.append("no duplicates were seen at all, so the two arms are not both being consumed")
 
 if fails:
@@ -262,12 +296,14 @@ if fails:
         print(f"FAIL: {f}", file=sys.stderr)
     sys.exit(1)
 
+print(f"  handler: {msgs} messages, sequence {first}..{last}, {s['state']}, 0 gaps")
 print(
-    f"  handler: {msgs} messages, sequence {first}..{last}, 0 gaps"
+    f"  arms: A {s['messages_first_a']} msgs first / {s['datagrams_duplicate_a']} dup, "
+    f"B {s['messages_first_b']} msgs first / {s['datagrams_duplicate_b']} dup"
 )
 print(
-    f"  arms: A {s['first_arrivals_a']} first / {s['duplicates_a']} dup, "
-    f"B {s['first_arrivals_b']} first / {s['duplicates_b']} dup"
+    f"  reorder: {buffered} datagrams held out of order, window peaked at "
+    f"{window_used}/{window_cap}"
 )
 PY
 

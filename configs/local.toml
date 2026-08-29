@@ -112,9 +112,52 @@ modify_chance = 0.15
 min_quantity = 1
 max_quantity = 500
 
+# Simulated packet loss, injected at the publisher. 0 disables it.
+#
+# Injected here rather than with `tc qdisc` because it needs no privileges, no
+# second machine, and replays exactly from a seed — and what the handler has to
+# survive is simply a datagram that never arrives.
+drop_rate = 0.0
+
+# How loss is correlated between the two arms. This decides what a test can
+# actually prove, so it is worth understanding before quoting any result:
+#
+#   exclusive    A dropped datagram is dropped on exactly one arm. Redundancy
+#                can always recover, so "zero gaps" is a property of the code
+#                rather than a probability. This is what scripts/smoke.sh uses.
+#   independent  Each arm decides on its own, which is what a real network does.
+#                At rate p, about p*p of datagrams die on BOTH arms and cannot be
+#                recovered by anything: at 2%, roughly 0.04%. "Zero gaps under
+#                independent loss" is arithmetically impossible and this project
+#                does not claim it.
+#   correlated   The same datagrams die on both arms. Redundancy cannot help, so
+#                this is how the GAPPED path gets exercised.
+drop_mode = "exclusive"
+
+# Seeded separately from `seed` so that turning loss on does not change which
+# orders are generated — a run with loss and a run without stay comparable.
+drop_seed = 73477133695975424
+
 [handler]
 digest_interval = 1000
 # digest_path = "results/handler-digests.txt"
 stats_interval_millis = 2000
 messages = 0
 idle_timeout_seconds = 0
+
+# How many out-of-order datagrams may be held before the hole ahead of them is
+# declared lost.
+#
+# This is the bound that turns "wait for the other arm" into something with a
+# worst case. The amount of reordering it must absorb is set by how far the two
+# arms drift apart, which on a host where the handler cannot keep up with the
+# publisher is far larger than any real network reordering. A window that is too
+# small does not fail safe: it invents gaps that never happened.
+#
+# 256 costs about 350KB. Measured peak on this machine under 2% loss: 15.
+reorder_window_datagrams = 256
+
+# Declare an outstanding hole lost after this long with nothing arriving at all.
+# Without it, a publisher that stops mid-stream would leave the messages behind
+# the hole buffered forever.
+gap_timeout_millis = 250

@@ -28,6 +28,63 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use transport::Publisher;
 use wire::{ModifyReason, Side, WireError};
 
+use crate::rng::Rng;
+
+/// How simulated loss is correlated between the two arms.
+///
+/// This distinction is not pedantry — it decides what the redundancy test can
+/// actually prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropMode {
+    /// Each arm decides on its own. This is what a real network does, and it
+    /// means some datagrams are lost on *both* arms: at 2% per arm, 0.04% of
+    /// datagrams vanish entirely. Over 10M messages in ~333K datagrams that is
+    /// around 133 unavoidable double-losses, so "zero gaps" is arithmetically
+    /// impossible here and claiming it would be false.
+    Independent,
+    /// A dropped datagram is dropped on exactly one arm, chosen at random.
+    ///
+    /// Not physically realistic, and that is the point: it isolates the
+    /// arbitration logic from the statistics. Under this mode "single-arm loss
+    /// costs nothing" is a property the code either has or does not, and zero
+    /// arbitrated gaps is a theorem rather than a probability.
+    Exclusive,
+    /// The same datagrams are dropped on both arms. Redundancy cannot help, so
+    /// the handler must detect the loss and name the range.
+    Correlated,
+}
+
+impl DropMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Independent => "independent",
+            Self::Exclusive => "exclusive",
+            Self::Correlated => "correlated",
+        }
+    }
+}
+
+impl std::fmt::Display for DropMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DropMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "independent" => Ok(Self::Independent),
+            "exclusive" => Ok(Self::Exclusive),
+            "correlated" => Ok(Self::Correlated),
+            other => Err(format!(
+                "unknown drop mode {other:?}: expected independent, exclusive or correlated"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FeedStats {
     pub messages: u64,
@@ -39,6 +96,17 @@ pub struct FeedStats {
     pub size_flushes: u64,
     /// Datagrams sent because the flush interval expired with a partial batch.
     pub timer_flushes: u64,
+    /// Datagrams deliberately not sent, per arm, by the loss injector.
+    pub dropped: [u64; 2],
+    /// Datagrams dropped on **both** arms, so redundancy could not help.
+    ///
+    /// This is the number that predicts how many gaps the handler must report.
+    /// Under `exclusive` loss it is zero by construction; under `independent`
+    /// loss at rate p it is about p² of all datagrams, which is why "zero gaps
+    /// under independent loss" is not a claim this project can make.
+    pub dropped_both: u64,
+    /// Messages carried by datagrams dropped on both arms.
+    pub messages_lost_both: u64,
 }
 
 impl FeedStats {
@@ -66,6 +134,14 @@ pub struct FeedPublisher {
     next_seq: u64,
     batch_size: u16,
     stats: FeedStats,
+    /// Probability that a datagram is dropped rather than sent. 0 disables the
+    /// injector entirely, including its RNG draw.
+    drop_rate: f64,
+    drop_mode: DropMode,
+    /// Seeded separately from the order-flow generator so that turning loss on
+    /// does not change which orders are produced. Without that, a run with loss
+    /// and a run without would not be comparable.
+    drop_rng: Rng,
     /// When self-checking, every datagram is decoded and replayed into here
     /// before it is sent.
     ///
@@ -91,7 +167,56 @@ impl FeedPublisher {
             next_seq: 1,
             batch_size: batch_size.max(1),
             stats: FeedStats::default(),
+            drop_rate: 0.0,
+            drop_mode: DropMode::Independent,
+            drop_rng: Rng::new(0x0105_0B10_5510_0000),
             shadow: None,
+        }
+    }
+
+    /// Turns on simulated packet loss.
+    ///
+    /// The publisher simply does not call `send` for a dropped datagram. That is
+    /// deliberately cruder than a network emulator and deliberately at the right
+    /// layer: what the handler has to survive is a datagram that never arrives,
+    /// and reproducing that exactly needs no `tc qdisc`, no privileges, and no
+    /// second machine.
+    pub fn set_loss(&mut self, rate: f64, mode: DropMode, seed: u64) {
+        self.drop_rate = rate.clamp(0.0, 1.0);
+        self.drop_mode = mode;
+        self.drop_rng = Rng::new(seed);
+    }
+
+    pub fn loss_enabled(&self) -> bool {
+        self.drop_rate > 0.0
+    }
+
+    /// Decides, once per datagram, which arms will not receive it.
+    fn drop_arms(&mut self) -> [bool; 2] {
+        if self.drop_rate <= 0.0 {
+            return [false, false];
+        }
+        match self.drop_mode {
+            DropMode::Independent => [
+                self.drop_rng.chance(self.drop_rate),
+                self.drop_rng.chance(self.drop_rate),
+            ],
+            DropMode::Exclusive => {
+                if self.drop_rng.chance(self.drop_rate) {
+                    // Exactly one arm, chosen fairly.
+                    if self.drop_rng.chance(0.5) {
+                        [true, false]
+                    } else {
+                        [false, true]
+                    }
+                } else {
+                    [false, false]
+                }
+            }
+            DropMode::Correlated => {
+                let lost = self.drop_rng.chance(self.drop_rate);
+                [lost, lost]
+            }
         }
     }
 
@@ -177,9 +302,22 @@ impl FeedPublisher {
         let count = self.count;
         let first_seq = self.first_seq;
 
+        // Decided once per datagram so both arms see the same coin flip where
+        // the mode says they should.
+        let drop = self.drop_arms();
+        if drop[0] && drop[1] {
+            self.stats.dropped_both += 1;
+            self.stats.messages_lost_both += u64::from(count);
+        }
+
         // The two arms differ only in packetHeader.channel, so the header is
         // rewritten in place per arm and the body is sent untouched.
         for (channel, publisher) in [(0u8, &self.a), (1u8, &self.b)] {
+            let arm = usize::from(channel);
+            if drop[arm] {
+                self.stats.dropped[arm] += 1;
+                continue;
+            }
             wire::encode_packet_header(&mut self.buf, channel, 0, first_seq, now_ns)
                 .map_err(wire_to_io)?;
             wire::patch_message_count(&mut self.buf, count).map_err(wire_to_io)?;
@@ -207,7 +345,10 @@ impl FeedPublisher {
         }
 
         self.stats.datagrams += 1;
-        self.stats.bytes += (len as u64) * 2;
+        // Only what actually went on the wire. Counting both arms
+        // unconditionally would overstate bytes sent whenever loss is injected.
+        let sent_arms = u64::from(!drop[0]) + u64::from(!drop[1]);
+        self.stats.bytes += (len as u64) * sent_arms;
         self.pos = wire::PACKET_HEADER_LEN;
         self.count = 0;
         self.first_seq = self.next_seq;

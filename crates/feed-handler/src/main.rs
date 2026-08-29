@@ -7,17 +7,19 @@
 //! Published on the case-study page, so the binary name and the flag names are
 //! part of the public surface.
 //!
-//! # What this milestone does and does not do
+//! # What this does and does not do
 //!
-//! It reads both arms, discards duplicates, rebuilds the books, and reports what
-//! it sees. It **notices** a sequence gap and says so.
+//! It arbitrates between the two arms — taking whichever datagram arrives first,
+//! holding out-of-order ones in a bounded reorder window until the hole ahead of
+//! them fills, and telling *late* from *lost*. A datagram lost on one arm costs
+//! nothing. One lost on both is named as a range and the feed moves to `GAPPED`.
+//! See `feed_handler::arbitration` for why the window is bounded and why it holds datagrams
+//! rather than messages.
 //!
-//! It does not yet *recover* from one. Proper A/B arbitration with a bounded
-//! dedup window and an explicit SYNCING/LIVE/GAPPED state machine is milestone
-//! 3, and rebuilding after a gap from a snapshot or a replay is milestone 4.
-//! Until then a gap is reported and the stream is resumed past it, with the
-//! books explicitly marked as no longer trustworthy — which is honest, and is
-//! also exactly the hole the next two milestones exist to fill.
+//! It does not *recover* from a real gap. Rebuilding after one, from the snapshot
+//! cycle or the replay service, is milestone 4. Until then `GAPPED` is a terminal
+//! diagnosis: the books are explicitly no longer trustworthy, which is honest and
+//! is exactly the hole the next milestone fills.
 
 use std::io::{self, Write};
 use std::net::SocketAddrV4;
@@ -31,9 +33,8 @@ use mdconfig::Config;
 use transport::{is_timeout, Receiver, TransportMode};
 use wire::{Message, PacketReader};
 
-mod stats;
-
-use crate::stats::HandlerStats;
+use feed_handler::arbitration::{Accepted, Arbitrator, FeedState};
+use feed_handler::stats::HandlerStats;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -176,15 +177,34 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let stats_interval = Duration::from_millis(cfg.handler.stats_interval_millis.max(1));
     let message_limit = cfg.handler.messages;
 
+    let mut arbitrator = Arbitrator::new(
+        cfg.handler.reorder_window_datagrams,
+        cfg.feed.max_datagram_bytes.max(65_536),
+    );
+    let mut started_stream = false;
+
     let mut last_data = Instant::now();
     let mut last_report = Instant::now();
-    let mut next_expected: Option<u64> = None;
 
-    // Which arm is polled first alternates each pass. Draining A to empty
-    // before ever looking at B would make A win every race on a quiet host and
-    // make the first-arrival counts meaningless. Proper arbitration with a
-    // bounded dedup window is milestone 3; this is just fairness.
+    // Which arm is polled first alternates each pass. Draining A to empty before
+    // ever looking at B would make A win every race on a quiet host and make the
+    // first-arrival counts meaningless.
     let mut poll_b_first = false;
+    // ...and each pass reads at most this many datagrams from an arm before
+    // switching.
+    //
+    // Without the cap, a handler that has fallen behind reads everything queued
+    // on one arm before touching the other, so the two arms drift apart by the
+    // whole socket backlog. Every datagram that arm lost then has to be held
+    // until the *other* arm is finally read, and the reorder window fills with
+    // traffic that was never actually out of order. Measured on a 2-core box:
+    // uncapped, the window peaked at 56 of 64 on an otherwise healthy run —
+    // close enough to the bound to start inventing gaps under any extra load.
+    const READS_PER_ARM_PER_PASS: usize = 16;
+    // How long a hole may stay open on a quiet feed before it is declared lost.
+    // Without this a stalled publisher would leave buffered messages held
+    // forever, waiting for a datagram that is not coming.
+    let gap_timeout = Duration::from_millis(cfg.handler.gap_timeout_millis.max(1));
 
     'outer: loop {
         let mut got_any = false;
@@ -196,96 +216,75 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         };
 
         for (channel, sock) in arms {
-            loop {
+            for _ in 0..READS_PER_ARM_PER_PASS {
                 let n = match sock.recv(&mut buf) {
                     Ok(n) => n,
                     Err(e) if is_timeout(&e) => break,
                     Err(e) => return Err(e.into()),
                 };
                 got_any = true;
-                stats.datagrams[usize::from(channel)] += 1;
-                stats.bytes += n as u64;
 
-                let reader = match PacketReader::new(&buf[..n]) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        stats.bad_datagrams += 1;
-                        eprintln!("  dropping a datagram on arm {channel}: {e}");
-                        continue;
-                    }
-                };
-
-                for m in reader.messages() {
-                    let (seq, msg) = match m {
-                        Ok(v) => v,
-                        Err(e) => {
-                            stats.bad_datagrams += 1;
-                            eprintln!("  truncated datagram on arm {channel}: {e}");
-                            break;
-                        }
-                    };
-
-                    match next_expected {
-                        None => {
-                            // First message ever seen. Milestone 4 replaces this
-                            // with a snapshot-driven start.
-                            if seq != 1 {
+                // Arbitration decides what, if anything, this datagram
+                // contributes. Everything downstream sees one ordered stream.
+                let outcome = arbitrator.accept(channel, &buf[..n]);
+                match outcome {
+                    Accepted::Ready {
+                        first_sequence,
+                        count,
+                    } => {
+                        if !started_stream {
+                            started_stream = true;
+                            stats.first_sequence = first_sequence;
+                            if first_sequence != 1 {
                                 eprintln!(
-                                    "  joined mid-stream at sequence {seq}. The book will be \
-                                     incomplete until the snapshot cycle lands in milestone 4 — \
-                                     start this handler before the engine for a clean run."
+                                    "  joined mid-stream at sequence {first_sequence}. The book \
+                                     will be incomplete until the snapshot cycle lands in \
+                                     milestone 4 — start this handler before the engine for a \
+                                     clean run."
                                 );
                                 stats.joined_mid_stream = true;
                             }
-                            stats.first_sequence = seq;
                         }
-                        Some(expected) if seq < expected => {
-                            // The other arm already delivered this one.
-                            stats.duplicates[usize::from(channel)] += 1;
-                            continue;
-                        }
-                        Some(expected) if seq > expected => {
-                            let missing = seq - expected;
-                            stats.gaps += 1;
-                            stats.messages_missed += missing;
-                            eprintln!(
-                                "  GAP: expected sequence {expected}, got {seq} ({missing} \
-                                 missing). Recovery arrives in milestone 4; continuing with a \
-                                 book that is no longer trustworthy."
-                            );
-                        }
-                        Some(_) => {}
-                    }
-
-                    // Every path that reaches here has accepted `seq`, so the
-                    // expectation advances in exactly one place.
-                    next_expected = Some(seq + 1);
-                    stats.first_arrivals[usize::from(channel)] += 1;
-                    stats.messages += 1;
-                    stats.last_sequence = seq;
-
-                    if let Err(e) = apply_message(&mut books, &msg) {
-                        // Only worth reporting once the book is supposed to be
-                        // complete; after a gap these are the expected fallout.
-                        if stats.gaps == 0 && !stats.joined_mid_stream {
-                            stats.apply_errors += 1;
-                            eprintln!("  sequence {seq} does not apply: {e}");
-                        } else {
-                            stats.apply_errors_after_gap += 1;
+                        let _ = count;
+                        let gapped = arbitrator.state() == FeedState::Gapped;
+                        consume(
+                            &buf[..n],
+                            &mut books,
+                            &mut stats,
+                            &mut digest_log,
+                            digest_interval,
+                            gapped,
+                        )?;
+                        if message_limit > 0 && stats.messages >= message_limit {
+                            break 'outer;
                         }
                     }
-                    if let Message::Trade(t) = msg {
-                        stats.trades += 1;
-                        stats.shares_traded += u64::from(t.quantity());
+                    Accepted::ForcedGap(gap) => {
+                        eprintln!(
+                            "  GAP: sequence {gap} was lost on both arms. Redundancy cannot \
+                             help here; recovery from a snapshot or the replay service arrives \
+                             in milestone 4. The book is no longer trustworthy."
+                        );
                     }
+                    Accepted::Buffered | Accepted::Duplicate => {}
+                    Accepted::Malformed(e) => {
+                        stats.bad_datagrams += 1;
+                        eprintln!("  dropping a datagram on arm {channel}: {e}");
+                    }
+                }
 
-                    if digest_interval > 0 && seq.is_multiple_of(digest_interval) {
-                        digest_log.write(seq, BookDigest::of(&books))?;
-                    }
-
-                    if message_limit > 0 && stats.messages >= message_limit {
-                        break 'outer;
-                    }
+                // Whatever the hole filling just unblocked, in sequence order.
+                // `books` and `arbitrator` are separate bindings, so the closure
+                // can borrow one while the other is borrowed mutably.
+                drain_into_books(
+                    &mut arbitrator,
+                    &mut books,
+                    &mut stats,
+                    &mut digest_log,
+                    digest_interval,
+                )?;
+                if message_limit > 0 && stats.messages >= message_limit {
+                    break 'outer;
                 }
             }
         }
@@ -294,6 +293,23 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         if got_any {
             last_data = now;
         } else {
+            // A hole that has stayed open through a quiet period is not late
+            // any more.
+            if now.duration_since(last_data) >= gap_timeout {
+                if let Some(gap) = arbitrator.declare_gap_if_stalled() {
+                    eprintln!(
+                        "  GAP: sequence {gap} did not arrive within {}ms of the feed going                          quiet. Giving up on it so the messages buffered behind it can be                          delivered.",
+                        gap_timeout.as_millis()
+                    );
+                    drain_into_books(
+                        &mut arbitrator,
+                        &mut books,
+                        &mut stats,
+                        &mut digest_log,
+                        digest_interval,
+                    )?;
+                }
+            }
             if let Some(limit) = idle_limit {
                 if now.duration_since(last_data) >= limit {
                     eprintln!("  no data for {}s; stopping", limit.as_secs());
@@ -305,17 +321,25 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         }
 
         if now.duration_since(last_report) >= stats_interval {
-            stats.report(started);
+            stats.report(&arbitrator, started);
             last_report = now;
         }
     }
 
     digest_log.flush()?;
-    stats.report(started);
+    stats.report(&arbitrator, started);
     let final_digest = BookDigest::of(&books);
     eprintln!("  final book {final_digest}");
+    for gap in arbitrator.gaps() {
+        eprintln!("  gap: sequence {gap}");
+    }
     if let Some(path) = args.summary_path.as_deref() {
-        stats.write_summary(path, final_digest, started.elapsed().as_secs_f64())?;
+        stats.write_summary(
+            path,
+            &arbitrator,
+            final_digest,
+            started.elapsed().as_secs_f64(),
+        )?;
     }
 
     if args.show_book {
@@ -327,16 +351,103 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(false);
     }
 
-    // A run that saw a gap, dropped a datagram, or failed to apply a message on
-    // a complete stream did not do its job, and says so in its exit code.
-    let clean = stats.gaps == 0 && stats.bad_datagrams == 0 && stats.apply_errors == 0;
+    // A run that ended GAPPED, dropped a datagram, or failed to apply a message
+    // on a complete stream did not do its job, and says so in its exit code.
+    let clean = stats.is_clean(&arbitrator);
     if !clean {
         eprintln!(
-            "  NOT CLEAN: {} gaps, {} bad datagrams, {} messages that did not apply",
-            stats.gaps, stats.bad_datagrams, stats.apply_errors
+            "  NOT CLEAN: state {}, {} gaps, {} bad datagrams, {} messages that did not apply",
+            arbitrator.state(),
+            arbitrator.gaps().len(),
+            stats.bad_datagrams,
+            stats.apply_errors
         );
     }
     Ok(clean)
+}
+
+/// Decodes one datagram and applies every message in it.
+///
+/// Returns whether anything was consumed, so the caller can check its message
+/// limit without re-deriving the count.
+fn consume(
+    datagram: &[u8],
+    books: &mut Books,
+    stats: &mut HandlerStats,
+    digest_log: &mut DigestLog,
+    digest_interval: u64,
+    gapped: bool,
+) -> io::Result<bool> {
+    let reader = match PacketReader::new(datagram) {
+        Ok(r) => r,
+        Err(e) => {
+            stats.bad_datagrams += 1;
+            eprintln!("  dropping a datagram: {e}");
+            return Ok(false);
+        }
+    };
+    let mut any = false;
+    for m in reader.messages() {
+        let (seq, msg) = match m {
+            Ok(v) => v,
+            Err(e) => {
+                stats.bad_datagrams += 1;
+                eprintln!("  truncated datagram: {e}");
+                break;
+            }
+        };
+        any = true;
+        stats.messages += 1;
+        stats.last_sequence = seq;
+
+        if let Err(e) = apply_message(books, &msg) {
+            // Only a bug while the stream is supposed to be complete. After a
+            // real gap these are the expected fallout of the missing messages,
+            // and counting them together would let a genuine bug hide behind an
+            // explained one.
+            if gapped || stats.joined_mid_stream {
+                stats.apply_errors_after_gap += 1;
+            } else {
+                stats.apply_errors += 1;
+                eprintln!("  sequence {seq} does not apply: {e}");
+            }
+        }
+        if let Message::Trade(t) = msg {
+            stats.trades += 1;
+            stats.shares_traded += u64::from(t.quantity());
+        }
+        if digest_interval > 0 && seq.is_multiple_of(digest_interval) {
+            digest_log.write(seq, BookDigest::of(books))?;
+        }
+    }
+    Ok(any)
+}
+
+/// Releases everything the arbitrator can now deliver, in sequence order.
+fn drain_into_books(
+    arbitrator: &mut Arbitrator,
+    books: &mut Books,
+    stats: &mut HandlerStats,
+    digest_log: &mut DigestLog,
+    digest_interval: u64,
+) -> io::Result<()> {
+    let gapped = arbitrator.state() == FeedState::Gapped;
+    // The closure cannot return a Result, so a failure is parked and raised
+    // once the drain is done. Losing the rest of a ready batch on a write error
+    // would be worse than finishing it.
+    let mut failure: Option<io::Error> = None;
+    arbitrator.drain_ready(|_first, _count, bytes| {
+        if failure.is_some() {
+            return;
+        }
+        if let Err(e) = consume(bytes, books, stats, digest_log, digest_interval, gapped) {
+            failure = Some(e);
+        }
+    });
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn print_books(books: &Books, cfg: &Config, depth: usize) {

@@ -61,9 +61,14 @@ cancel_chance = 0.25
 modify_chance = 0.15
 min_quantity = 1
 max_quantity = 500
+drop_rate = 0.0
+drop_mode = "exclusive"
+drop_seed = 73477133695975424
 
 [handler]
 digest_interval = 1000
+reorder_window_datagrams = 256
+gap_timeout_millis = 250
 stats_interval_millis = 5000
 messages = 0
 idle_timeout_seconds = 0

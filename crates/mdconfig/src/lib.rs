@@ -289,6 +289,20 @@ pub struct Engine {
     pub modify_chance: f64,
     pub min_quantity: u32,
     pub max_quantity: u32,
+    /// Fraction of datagrams deliberately not sent, per arm. 0 disables it.
+    ///
+    /// Loss is injected at the publisher rather than with `tc qdisc` because it
+    /// needs no privileges, no second machine, and reproduces exactly from a
+    /// seed — and what the handler must survive is simply a datagram that never
+    /// arrives.
+    pub drop_rate: f64,
+    /// `independent`, `exclusive` or `correlated`. See `DropMode` in the engine:
+    /// only `exclusive` makes "zero arbitrated gaps" a theorem rather than a
+    /// probability, and `correlated` is what forces the GAPPED path.
+    pub drop_mode: String,
+    /// Seeded separately from `seed` so that turning loss on does not change
+    /// which orders are generated.
+    pub drop_seed: u64,
 }
 
 impl Default for Engine {
@@ -308,6 +322,9 @@ impl Default for Engine {
             modify_chance: 0.15,
             min_quantity: 1,
             max_quantity: 500,
+            drop_rate: 0.0,
+            drop_mode: "independent".into(),
+            drop_seed: 0x0105_0B10_5510_0000,
         }
     }
 }
@@ -322,6 +339,22 @@ pub struct Handler {
     pub messages: u64,
     /// Give up if no datagram arrives for this long. 0 waits forever.
     pub idle_timeout_seconds: u64,
+    /// How many out-of-order datagrams may be held before the hole ahead of
+    /// them is declared lost.
+    ///
+    /// This is the bound that turns "wait for the other arm" into something with
+    /// a worst case, capping both memory and the delay a single loss can add.
+    ///
+    /// 256 datagrams is ~8000 messages of slack at a batch of 32, and costs
+    /// about 350KB. That is deliberately generous: the amount of reordering the
+    /// window has to absorb is set by how far the two arms drift apart, which on
+    /// a host where the handler cannot keep up with the publisher is far larger
+    /// than any real network reordering. A window that is too small does not
+    /// fail safe — it invents gaps that never happened.
+    pub reorder_window_datagrams: usize,
+    /// Declare an outstanding hole lost after this long with nothing arriving.
+    /// Without it a stalled feed would hold buffered messages forever.
+    pub gap_timeout_millis: u64,
 }
 
 impl Default for Handler {
@@ -332,6 +365,8 @@ impl Default for Handler {
             stats_interval_millis: 1000,
             messages: 0,
             idle_timeout_seconds: 0,
+            reorder_window_datagrams: 256,
+            gap_timeout_millis: 250,
         }
     }
 }

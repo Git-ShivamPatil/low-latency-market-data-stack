@@ -5,7 +5,7 @@
 **Price-time-priority matching engine publishing a binary feed over redundant A/B UDP multicast, with a Rust feed handler that arbitrates the two and rebuilds MBP/MBO books without allocating.**
 
 ![status](https://img.shields.io/badge/status-in%20development-22D3EE?style=for-the-badge)
-![progress](https://img.shields.io/badge/milestones-2%20of%209-334155?style=for-the-badge)
+![progress](https://img.shields.io/badge/milestones-3%20of%209-334155?style=for-the-badge)
 ![licence](https://img.shields.io/badge/licence-MIT-3b82f6?style=for-the-badge)
 
 ![](https://img.shields.io/badge/Rust-1.98-CE422B?logo=rust&logoColor=white) ![](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white) ![](https://img.shields.io/badge/FIX-4.4-334155) 
@@ -17,7 +17,7 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 2 of 9 milestones complete.**
+> **This is a build in progress — 3 of 9 milestones complete.**
 >
 > The target figure below (`1M+ msg/s · ~100ns decode`) is a **goal, not a measurement.** Nothing here has been benchmarked yet.
 > Every number this project eventually publishes will land in [CLAIMS.md](CLAIMS.md) first, with the commit it was measured at,
@@ -75,7 +75,7 @@ flowchart LR
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[█████░░░░░░░░░░░░░░░░░░░] 2/9 milestones · 22%
+[████████░░░░░░░░░░░░░░░░] 3/9 milestones · 33%
 ```
 
 - [x] **M1 · Workspace, wire schema, and cross-language codegen**  
@@ -84,8 +84,9 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - [x] **M2 · Matching engine publishing a live binary feed, end to end**  
   The two advertised commands run and a handler prints a book built from real UDP datagrams — the whole pipeline exists, badly, before anything is made fast.  
   <sub>Verified: `scripts/smoke.sh` runs the engine and the handler as separate processes over real UDP and requires the handler's book to match the engine's own at the same sequence number — 100 shared checkpoints, every one identical, sequence 1..100000, zero gaps, on **both** multicast and the unicast fallback. See [docs/RUNNING.md](docs/RUNNING.md).</sub>
-- [ ] **M3 · A/B redundancy, loss injection, arbitration and gap detection**  
-  Two independent channels carry the same stream, the handler takes whichever datagram lands first, and it knows the difference between 'late' and 'lost'.
+- [x] **M3 · A/B redundancy, loss injection, arbitration and gap detection**  
+  Two independent channels carry the same stream, the handler takes whichever datagram lands first, and it knows the difference between 'late' and 'lost'.  
+  <sub>Verified: 10M messages at 2% single-arm loss produce **zero gaps**, with both arms contributing first arrivals. Under *independent* 2% loss, 124 datagrams died on both arms — 0.040%, matching the p² prediction — and the handler named gaps covering exactly those 3,968 sequences, no more and no less. Correlated loss transitions to `GAPPED` with the range named. `scripts/smoke.sh` now injects loss over real sockets too. See [docs/RECOVERY.md](docs/RECOVERY.md).</sub>
 - [ ] **M4 · Snapshot cycle and TCP replay recovery**  
   A handler that has fallen behind rejoins the live stream with a correct book instead of being restarted.
 - [ ] **M5 · MBP and MBO books on an allocation-free path**  
