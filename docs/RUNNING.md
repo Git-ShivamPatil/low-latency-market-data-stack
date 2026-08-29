@@ -107,6 +107,17 @@ It also asserts the things that quietly break a batched feed:
 
 Both transports are tested. The unicast fallback is not a second-class path.
 
+### Injecting loss
+
+The smoke test runs with 2% loss injected — one arm per dropped datagram — and
+requires zero gaps. See [RECOVERY.md](RECOVERY.md) for why the loss *model*
+decides what a result can prove, and why "zero gaps under independent loss" is
+not a claim this project makes.
+
+```bash
+scripts/smoke.sh --drop-rate 0.05 --drop-mode correlated
+```
+
 ### Why the handler starts first
 
 A handler that joins mid-stream has no way to rebuild the orders that rested
