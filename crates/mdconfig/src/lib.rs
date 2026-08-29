@@ -295,7 +295,12 @@ pub struct Engine {
     /// Seeds the order-flow generator. The same seed produces the same stream,
     /// which is what makes the smoke test reproducible rather than flaky.
     pub seed: u64,
-    /// Stop after this many published messages. 0 runs until interrupted.
+    /// Stop after at least this many published messages. 0 runs until
+    /// interrupted.
+    ///
+    /// A floor, not an exact count: the engine finishes the order intent it
+    /// started, and one intent can publish a trade plus the fill describing
+    /// it. Overshoot is at most a couple of messages.
     pub messages: u64,
     /// Stop after this long. 0 runs until interrupted.
     pub duration_seconds: u64,

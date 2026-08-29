@@ -61,7 +61,15 @@ struct Args {
     #[arg(long)]
     batch_size: Option<u16>,
 
-    /// Stop after this many messages. 0 runs until interrupted.
+    /// Stop after at least this many messages. 0 runs until interrupted.
+    ///
+    /// A **floor, not an exact count.** One order intent can publish several
+    /// messages — a `Submit` that crosses emits a `Trade` and the `ModifyOrder`
+    /// or `DeleteOrder` describing the fill — and the loop finishes the intent
+    /// it started. Stopping mid-intent would publish a trade whose fill never
+    /// arrives, which is precisely the inconsistency the rest of this project
+    /// exists to avoid, so the overshoot is deliberate. It is at most a couple
+    /// of messages.
     #[arg(long)]
     messages: Option<u64>,
 
@@ -273,6 +281,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
         }
+        // Checked between intents, never inside one. See `Args::messages`: a
+        // crossing order publishes a trade and the fill that follows it, and
+        // splitting that pair to hit an exact count would put the feed in a
+        // state no consumer could reconcile.
         if message_limit > 0 && feed.stats().messages >= message_limit {
             break;
         }

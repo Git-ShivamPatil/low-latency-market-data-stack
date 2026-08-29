@@ -29,6 +29,10 @@ pub struct HandlerStats {
     /// Messages that did not apply while the stream was supposed to be complete.
     /// These are real bugs.
     pub apply_errors: u64,
+    /// Held messages discarded during a recovery without evidence that the
+    /// recovery covered them. Should always be zero; see
+    /// `RecoveryBuffer::drain_contiguous`.
+    pub unverified_drops: u64,
     /// Messages that did not apply after a gap or a mid-stream join. Expected
     /// fallout, counted separately so it cannot mask the field above.
     pub apply_errors_after_gap: u64,
@@ -126,6 +130,7 @@ impl HandlerStats {
 
         writeln!(f, "bad_datagrams={}", self.bad_datagrams)?;
         writeln!(f, "apply_errors={}", self.apply_errors)?;
+        writeln!(f, "unverified_drops={}", self.unverified_drops)?;
         writeln!(f, "apply_errors_after_gap={}", self.apply_errors_after_gap)?;
 
         for (counters, name) in [(a, "a"), (b, "b")] {
@@ -143,6 +148,14 @@ impl HandlerStats {
             )?;
             writeln!(f, "messages_first_{name}={}", counters.messages_first)?;
             writeln!(f, "malformed_{name}={}", counters.malformed)?;
+            // Counted since milestone 3 and reported by nothing until now. A
+            // datagram dropped here is real message loss that no gap covers,
+            // and a run that did it looked clean.
+            writeln!(
+                f,
+                "dropped_window_full_{name}={}",
+                counters.dropped_window_full
+            )?;
             writeln!(f, "bytes_{name}={}", counters.bytes)?;
         }
 
@@ -206,5 +219,13 @@ impl HandlerStats {
             && self.recovery_failures == 0
             && self.bad_datagrams == 0
             && self.apply_errors == 0
+            // A datagram dropped because the reorder window was full is message
+            // loss that no gap range covers, so nothing downstream reports it.
+            // It was counted from milestone 3 and read by nothing, which is the
+            // definition of a silent failure.
+            && arb.arm(0).dropped_window_full == 0
+            && arb.arm(1).dropped_window_full == 0
+            // Held traffic discarded without evidence anything applied it.
+            && self.unverified_drops == 0
     }
 }

@@ -511,14 +511,32 @@ fn run_with<B: BookSet>(
                     // or its window fills with traffic nobody is consuming and
                     // the next gap has nowhere to go. What changes is the
                     // destination: held for replay, not applied to the books.
+                    // `drain_ready` consumes the slot and advances the frontier
+                    // whether or not `hold` accepted the datagram, so once the
+                    // buffer has overflowed every further datagram in this drain
+                    // is lost outright — no gap covers it, because the
+                    // arbitrator believes it was delivered. Counting it is the
+                    // difference between a recovery that failed loudly and a
+                    // book that is quietly short.
                     let mut overflow = None;
+                    let mut lost_to_overflow = 0u64;
                     arbitrator.drain_ready(|first, count, bytes| {
                         if overflow.is_none() {
                             if let Err(e) = recovery.hold(first, count, bytes) {
                                 overflow = Some(e);
+                                lost_to_overflow += u64::from(count);
                             }
+                        } else {
+                            lost_to_overflow += u64::from(count);
                         }
                     });
+                    if lost_to_overflow > 0 {
+                        eprintln!(
+                            "  {lost_to_overflow} messages were dropped while the recovery \
+                             buffer was full; no gap covers them"
+                        );
+                        stats.unverified_drops += lost_to_overflow;
+                    }
                     if let Some(e) = overflow {
                         eprintln!("  recovery failed: {e}");
                         recovery.fail();
@@ -911,7 +929,7 @@ fn apply_replay<B: BookSet>(
                  of {}..={covered_through} covered them. See the open issue in RESUME.md.",
                 outcome.unverified_messages, result.request.from
             );
-            stats.apply_errors += outcome.unverified_messages;
+            stats.unverified_drops += outcome.unverified_messages;
         }
         recovery.reopen(from);
         return Ok(false);

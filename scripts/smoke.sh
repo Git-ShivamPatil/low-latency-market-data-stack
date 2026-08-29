@@ -269,9 +269,29 @@ def want(key, value, why):
         fails.append(f"{key} is {got}, expected {value} — {why}")
 
 
-want("messages", expected, "the handler must consume the whole run, not a prefix")
+def want_at_least(key, value, why):
+    # `--messages` on the engine is a floor, not an exact count: one order
+    # intent can publish a trade and the fill describing it, and the loop
+    # finishes the intent it started rather than splitting the pair. So the
+    # handler sees a couple more than were asked for.
+    #
+    # This used to assert equality and passed only because the default 100000
+    # happens to divide by the batch size. `--messages 2000` failed it with
+    # 2002 and looked like a bug in the engine; the engine is right and the
+    # assertion was wrong.
+    got = s.get(key)
+    try:
+        n = int(got)
+    except (TypeError, ValueError):
+        fails.append(f"{key} is {got}, which is not a number — {why}")
+        return
+    if not value <= n <= value + 16:
+        fails.append(f"{key} is {n}, expected {value}..{value + 16} — {why}")
+
+
+want_at_least("messages", expected, "the handler must consume the whole run, not a prefix")
 want("first_sequence", 1, "starting anywhere else means it joined mid-stream")
-want("last_sequence", expected, "the stream must run to the end")
+want_at_least("last_sequence", expected, "the stream must run to the end")
 want("state", "LIVE", "a run that ends GAPPED has lost messages it cannot recover")
 want("gaps", 0, "with loss on only one arm at a time, redundancy must cover every one")
 want("messages_missed", 0, "nothing may be skipped")
