@@ -1,0 +1,77 @@
+name: Benchmark
+
+# Manual only. Never on push.
+#
+# Benchmarks do not belong in CI: they would run on every commit, on whatever
+# runner was free, and produce a stream of numbers nobody asked for and nobody
+# could reproduce. This is a deliberate act — the equivalent of the rented burn
+# day this project can no longer afford.
+#
+# It runs on `ubuntu-24.04-arm` because that is the only free host that meets
+# the project's requirements, and it does so by a margin worth stating: 4
+# physical cores with no SMT, an invariant counter at ~1000MHz with a
+# calibration spread under 0.01%, and an optimised build. The host gate agrees —
+# see the `hostcheck` step, which runs first and whose verdict is what decides
+# whether anything here may be published.
+#
+# The x64 runner would not do: its 4 vCPU are two cores plus hyperthreading.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds per throughput run
+        required: false
+        default: "60"
+      runs:
+        description: Throughput repetitions (the 10% agreement check needs at least 3)
+        required: false
+        default: "3"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  benchmark:
+    name: Measure on a free arm64 runner
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # First, and on its own, so the verdict is legible in the log before any
+      # number exists to be tempted by. A non-zero exit here does not stop the
+      # run — the harness still writes NOT-PUBLISHABLE and the numbers are still
+      # worth having for tuning — but it does decide whether anything may be
+      # quoted.
+      - name: Host gate
+        run: cargo run --release -p bench --bin hostcheck
+
+      - name: Benchmark
+        run: |
+          scripts/bench.sh all \
+            --duration "${{ inputs.duration || '60' }}" \
+            --runs "${{ inputs.runs || '3' }}"
+
+      # Kept whatever happened. A refused run is still evidence — of what the
+      # host was, which is the thing a reader needs in order to discount it.
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: results/bench/
+          retention-days: 30
+
+      # Deliberately not automated: no step here writes bench/REPORT.md or a
+      # CLAIMS.md row. The methodology paragraphs are what make the numbers mean
+      # something, and a generated report would be a number with a template
+      # around it. A human reads the artifact and writes the report.
+      - name: What happens next
+        if: always()
+        run: |
+          echo "Download the bench-results artifact."
+          echo "If results/bench/NOT-PUBLISHABLE.md exists, nothing here may be quoted."
+          echo "Otherwise fill in bench/REPORT.md by hand, then add the CLAIMS.md rows."
