@@ -578,11 +578,6 @@ mod tests {
         let why = q
             .why_not()
             .expect("a non-invariant TSC must explain itself");
-        assert!(why.contains("constant_tsc"));
-        assert!(
-            !why.contains("nonstop_tsc and"),
-            "it named a flag that is present"
-        );
 
         let both = TscQuality {
             constant_tsc: false,
@@ -590,8 +585,23 @@ mod tests {
             flags_readable: true,
             counter_hz: None,
         };
-        let why = both.why_not().unwrap();
-        assert!(why.contains("constant_tsc") && why.contains("nonstop_tsc"));
+        let why_both = both.why_not().unwrap();
+
+        // The flag names are an x86 concept. On aarch64 the same value is
+        // explained in terms of `cntfrq_el0`, because that is what is actually
+        // missing there — and asserting the x86 wording unconditionally is what
+        // failed this test on the arm64 runner the first time it ran.
+        if cfg!(target_arch = "aarch64") {
+            assert!(why.contains("cntfrq_el0"), "{why}");
+            assert!(why_both.contains("cntfrq_el0"), "{why_both}");
+        } else {
+            assert!(why.contains("constant_tsc"), "{why}");
+            assert!(
+                !why.contains("nonstop_tsc and"),
+                "it named a flag that is present"
+            );
+            assert!(why_both.contains("constant_tsc") && why_both.contains("nonstop_tsc"));
+        }
 
         let good = TscQuality {
             constant_tsc: true,

@@ -86,6 +86,22 @@ pub struct RecoveryStats {
     pub worst_recovery_millis: u64,
 }
 
+/// What [`RecoveryBuffer::drain_contiguous`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainOutcome {
+    /// The book is complete through this sequence, exclusive.
+    pub complete_through: u64,
+    /// Messages dropped without being applied and **without evidence** that the
+    /// recovery covered them.
+    ///
+    /// Should always be zero. Non-zero means a held datagram was discarded on an
+    /// assumption rather than on a fact, which is the shape of the intermittent
+    /// replay failure recorded in RESUME.md. The caller reports it rather than
+    /// guessing whether to apply or drop: applying might double-apply, dropping
+    /// might lose it, and picking one silently is how this became hard to find.
+    pub unverified_messages: u64,
+}
+
 /// One datagram held during recovery.
 #[derive(Debug)]
 struct Held {
@@ -411,9 +427,15 @@ impl RecoveryBuffer {
     ///
     /// The callback takes the same `(skip_below, bytes)` pair as `replay`, so a
     /// datagram straddling `from` is applied without double-applying its head.
-    pub fn drain_contiguous(&mut self, from: u64, mut f: impl FnMut(u64, &[u8])) -> u64 {
-        let mut expected = from;
+    pub fn drain_contiguous(
+        &mut self,
+        covered: (u64, u64),
+        mut f: impl FnMut(u64, &[u8]),
+    ) -> DrainOutcome {
+        let (covered_from, covered_through) = covered;
+        let mut expected = covered_through + 1;
         let mut drained = 0usize;
+        let mut unverified = 0u64;
         for i in 0..self.occupied {
             let (first, count, len) = {
                 let slot = &self.held[i];
@@ -427,8 +449,22 @@ impl RecoveryBuffer {
                 f(expected, &self.held[i].buf[..len]);
                 self.stats.messages_replayed += first + count - expected;
                 expected = first + count;
+            } else if first >= covered_from {
+                // Provably in the book: it lies inside the range the recovery
+                // just applied.
+                self.stats.messages_skipped += count;
             } else {
-                // Wholly below the frontier: already in the book.
+                // Below the frontier but NOT inside what was recovered, so
+                // there is no evidence it is in the book.
+                //
+                // Dropping it on the assumption that something must have
+                // covered it is the assumption this whole path used to make,
+                // and it is the one remaining candidate for the intermittent
+                // failure recorded in RESUME.md. It is counted and reported
+                // rather than guessed at: applying it might double-apply, and
+                // dropping it might lose it, and picking one silently is how
+                // this became hard to find in the first place.
+                unverified += count;
                 self.stats.messages_skipped += count;
             }
             drained = i + 1;
@@ -439,7 +475,10 @@ impl RecoveryBuffer {
             self.held[..self.occupied].rotate_left(drained);
             self.occupied -= drained;
         }
-        expected
+        DrainOutcome {
+            complete_through: expected,
+            unverified_messages: unverified,
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -504,11 +543,15 @@ mod tests {
         b.hold(122, 4, &[3u8; 32]).unwrap();
 
         let mut applied = Vec::new();
-        let through = b.drain_contiguous(110, |skip_below, bytes| {
+        let outcome = b.drain_contiguous((110, 109), |skip_below, bytes| {
             applied.push((skip_below, bytes[0]));
         });
 
-        assert_eq!(through, 118, "the book is complete through 117");
+        assert_eq!(
+            outcome.complete_through, 118,
+            "the book is complete through 117"
+        );
+        assert_eq!(outcome.unverified_messages, 0);
         assert_eq!(
             applied,
             vec![(110, 1u8), (114, 2u8)],
@@ -532,17 +575,49 @@ mod tests {
         b.hold(114, 4, &[2u8; 32]).unwrap();
 
         let mut applied = Vec::new();
-        let through = b.drain_contiguous(114, |skip_below, bytes| {
+        let outcome = b.drain_contiguous((110, 113), |skip_below, bytes| {
             applied.push((skip_below, bytes[0]));
         });
 
-        assert_eq!(through, 118);
+        assert_eq!(outcome.complete_through, 118);
         assert_eq!(
             applied,
             vec![(114, 2u8)],
             "110..=113 was already in the book"
         );
+        assert_eq!(
+            outcome.unverified_messages, 0,
+            "110..=113 lies inside the recovered range, so dropping it is evidenced"
+        );
         assert_eq!(b.first_held_sequence(), None, "both slots were consumed");
+    }
+
+    #[test]
+    fn dropping_a_slot_the_recovery_did_not_cover_is_reported_not_assumed() {
+        // The one assumption left in this path: a held datagram below the
+        // frontier used to be dropped on the belief that the recovery applied
+        // it. Here it did not — the recovered range starts after the slot — so
+        // the slot is counted rather than silently discarded.
+        //
+        // Applying it might double-apply and dropping it might lose it, and
+        // picking one quietly is how the intermittent replay failure recorded in
+        // RESUME.md stayed hidden across two sessions. Reporting it makes a run
+        // fail where the cause is rather than several hundred messages later.
+        let mut b = buffer();
+        b.begin(100, Instant::now());
+        b.hold(110, 4, &[1u8; 32]).unwrap();
+        b.hold(114, 4, &[2u8; 32]).unwrap();
+
+        let mut applied = 0;
+        // The recovery covered only 114 onwards, so nothing evidences the slot
+        // at 110..=113.
+        let outcome = b.drain_contiguous((114, 117), |_, _| applied += 1);
+
+        assert_eq!(applied, 0, "both slots are at or below the frontier");
+        assert_eq!(
+            outcome.unverified_messages, 4,
+            "the slot at 110..=113 was outside the recovered range and must be reported"
+        );
     }
 
     #[test]
@@ -551,8 +626,8 @@ mod tests {
         b.begin(100, Instant::now());
         b.hold(110, 4, &[0u8; 32]).unwrap();
         b.hold(114, 4, &[0u8; 32]).unwrap();
-        let through = b.drain_contiguous(110, |_, _| {});
-        assert_eq!(through, 118);
+        let outcome = b.drain_contiguous((110, 109), |_, _| {});
+        assert_eq!(outcome.complete_through, 118);
         assert_eq!(b.first_held_sequence(), None);
     }
 
@@ -562,8 +637,11 @@ mod tests {
         b.begin(100, Instant::now());
         b.hold(120, 4, &[0u8; 32]).unwrap();
         let mut applied = 0;
-        let through = b.drain_contiguous(110, |_, _| applied += 1);
-        assert_eq!(through, 110, "nothing was applied, so nothing advanced");
+        let outcome = b.drain_contiguous((110, 109), |_, _| applied += 1);
+        assert_eq!(
+            outcome.complete_through, 110,
+            "nothing was applied, so nothing advanced"
+        );
         assert_eq!(applied, 0);
         assert_eq!(b.first_held_sequence(), Some(120), "the slot is still held");
     }

@@ -492,7 +492,14 @@ mod tests {
         };
         let v = f.verdict();
         assert!(!v.is_publishable());
-        assert!(v.blockers().iter().any(|b| b.contains("constant_tsc")));
+        // The property, not the wording. A counter that cannot be trusted must
+        // block; *why* it cannot be trusted is architecture-specific, and
+        // asserting the x86 phrasing failed this test on the arm64 runner where
+        // the honest explanation names `cntfrq_el0` instead.
+        assert!(
+            v.blockers().iter().any(|b| b.contains("cycle counter")),
+            "a masked counter must block, whatever the architecture calls it: {v}"
+        );
     }
 
     #[test]

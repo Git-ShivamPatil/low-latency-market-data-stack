@@ -877,24 +877,41 @@ fn apply_replay<B: BookSet>(
         // Leaving it buffered loses it: the next adoption reconciles from the
         // far side of the hole and skips every slot below that as covered.
         let mut failure: Option<io::Error> = None;
-        recovery.drain_contiguous(covered_through + 1, |skip_below, bytes| {
-            if failure.is_some() {
-                return;
-            }
-            if let Err(e) = consume(
-                bytes,
-                books,
-                stats,
-                digest_log,
-                digest_interval,
-                false,
-                skip_below,
-            ) {
-                failure = Some(e);
-            }
-        });
+        let outcome = recovery.drain_contiguous(
+            (result.request.from, covered_through),
+            |skip_below, bytes| {
+                if failure.is_some() {
+                    return;
+                }
+                if let Err(e) = consume(
+                    bytes,
+                    books,
+                    stats,
+                    digest_log,
+                    digest_interval,
+                    false,
+                    skip_below,
+                ) {
+                    failure = Some(e);
+                }
+            },
+        );
         if let Some(e) = failure {
             return Err(e);
+        }
+        if outcome.unverified_messages > 0 {
+            // Loud on purpose. A held datagram was discarded without evidence
+            // that anything applied it, which means the book is probably short
+            // of those messages — and that is the shape of the intermittent
+            // failure recorded in RESUME.md. Counting it as an apply error
+            // makes the run NOT CLEAN, so the smoke test fails on the spot
+            // instead of hundreds of messages later.
+            eprintln!(
+                "  BUG: {} held messages were discarded without evidence that the replay \
+                 of {}..={covered_through} covered them. See the open issue in RESUME.md.",
+                outcome.unverified_messages, result.request.from
+            );
+            stats.apply_errors += outcome.unverified_messages;
         }
         recovery.reopen(from);
         return Ok(false);
@@ -1038,7 +1055,10 @@ fn handle_snapshot<B: BookSet>(
                  opened while the cycle was arriving; staying in recovery"
             );
             let mut failure: Option<io::Error> = None;
-            recovery.drain_contiguous(last_sequence + 1, |skip_below, bytes| {
+            // A snapshot is authoritative for everything up to
+            // `last_sequence`, so its covered range starts at the beginning of
+            // time rather than at a request boundary.
+            let outcome = recovery.drain_contiguous((0, last_sequence), |skip_below, bytes| {
                 if failure.is_some() {
                     return;
                 }
@@ -1057,6 +1077,10 @@ fn handle_snapshot<B: BookSet>(
             if let Some(e) = failure {
                 return Err(e);
             }
+            debug_assert_eq!(
+                outcome.unverified_messages, 0,
+                "a snapshot covers everything before it, so nothing can be unverified"
+            );
             *in_cycle = false;
             recovery.reopen(from);
             return Ok(());
