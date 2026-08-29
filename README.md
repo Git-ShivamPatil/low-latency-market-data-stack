@@ -5,7 +5,7 @@
 **Price-time-priority matching engine publishing a binary feed over redundant A/B UDP multicast, with a Rust feed handler that arbitrates the two and rebuilds MBP/MBO books without allocating.**
 
 ![status](https://img.shields.io/badge/status-in%20development-22D3EE?style=for-the-badge)
-![progress](https://img.shields.io/badge/milestones-5%20of%209-334155?style=for-the-badge)
+![progress](https://img.shields.io/badge/milestones-6%20of%209-334155?style=for-the-badge)
 ![licence](https://img.shields.io/badge/licence-MIT-3b82f6?style=for-the-badge)
 
 ![](https://img.shields.io/badge/Rust-1.98-CE422B?logo=rust&logoColor=white) ![](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white) ![](https://img.shields.io/badge/FIX-4.4-334155) 
@@ -17,11 +17,11 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 5 of 9 milestones complete, and M6's harness built.**
+> **This is a build in progress — 6 of 9 milestones complete.**
 >
-> The target figure below (`1M+ msg/s · ~100ns decode`) is a **goal, not a measurement.** Nothing here has been benchmarked yet.
-> Every number this project eventually publishes will land in [CLAIMS.md](CLAIMS.md) first, with the commit it was measured at,
-> the hardware it ran on, and the caveat that matters. If it is not in that file, it has not been measured.
+> The figures below (`1M+ msg/s · ~100ns decode`) have now been **measured**: 2.78M msg/s sustained receiver-side with zero gaps, three runs within 0.7%, and 8.2ns per message to decode.
+> They are single-host, over loopback, and **batched 32 messages to a datagram** — which is not a footnote, because at one message per datagram the kernel caps out an order of magnitude lower.
+> Every number is in [CLAIMS.md](CLAIMS.md) with the commit, the host and the caveat that matters, and in [bench/REPORT.md](bench/REPORT.md) with the methodology. If it is not in those files, it has not been measured.
 
 ## The problem
 
@@ -75,7 +75,7 @@ flowchart LR
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[█████████████▓░░░░░░░░░░] 5.5/9 milestones · 61%
+[████████████████░░░░░░░░] 6/9 milestones · 67%
 ```
 
 - [x] **M1 · Workspace, wire schema, and cross-language codegen**  
@@ -93,9 +93,9 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - [x] **M5 · MBP and MBO books on an allocation-free path**  
   Both book views are maintained with zero heap allocations per message, and that is proved by a test rather than asserted in a README.  
   <sub>Verified: `--verify-allocations` reports **0 allocations, 0 deallocations, 0 reallocations** over 32,601 steady-state receive passes across two processes — while the same run with `--books reference` reports 10,814, so the counter is measuring something. A `#[test]` asserts exactly zero across **1,000,000 messages including a forced both-arm blackout and the snapshot recovery that follows**, over 125,021 measured scopes. The fast book is differentially tested against the reference book over **5,000,000 random operations** — every return value, every aggregated level, and the exact queue order within each level — and both reconcile with the engine across a process boundary. See [docs/BOOKS.md](docs/BOOKS.md).</sub>
-- [ ] **M6 · Benchmark harness, tuning, and an honest report** — *harness built, measurement pending*  
+- [x] **M6 · Benchmark harness, tuning, and an honest report**  
   The advertised 1M+ msg/s and ~100ns decode are measured, reproducible, and published with the methodology that makes them mean something.  
-  <sub>**Half done, and recorded as half done.** The apparatus exists and is tested: an HDR-layout latency histogram with a checked error bound that records without allocating, a calibrated `rdtsc` timer that refuses to convert cycles to nanoseconds when the host masks `constant_tsc`, Criterion microbenchmarks whose work is pinned by a test that flips a payload bit and requires the answer to change, and `scripts/bench.sh` running behind a host gate. **No number has been measured, because this machine cannot honestly produce one** — the gate refuses it on four independent counts, and refusing is what it is for. The measurement needs a rented host with ≥4 physical cores. See [bench/REPORT.md](bench/REPORT.md).</sub>
+  <sub>Verified: **2,782,874 msg/s** sustained receiver-side over 60s — `(final sequence − first sequence) / elapsed` — with **zero arbitrated gaps and zero apply errors**, three runs agreeing within **0.7%** against the 10% required. Decode **8.20 ns/message**, book update **38.9 ns/message**, both far inside the `~100ns` and `~200ns` targets. Measured on four physical ARM cores, pinned, behind a host gate that reads the core topology, the invariant counter and the build profile and **refuses to write a report** when they do not hold — it refuses this laptop on two counts. Two timing methods bracket the answer deliberately: Criterion is the lower bound, an in-path `cntvct_el0` histogram the upper. The p99.9 of 1.8 µs is reported and explicitly **not** claimed, because it measures a shared hypervisor's scheduler. So is the fast book being only **1.72×** the `BTreeMap` baseline rather than the predicted order of magnitude — on a 64-level book the tree is cache-resident, and the report says so rather than quoting the flattering ratio. See [bench/REPORT.md](bench/REPORT.md) and [CLAIMS.md](CLAIMS.md).</sub>
 - [ ] **M7 · C++ FIX 4.4 gateway — the session layer**  
   A FIX session that survives a hard kill: correct sequence numbers, correct resend, correct gap fill, verified against an independent implementation.
 - [ ] **M8 · Risk service, order path into the engine, and restart reconciliation**  

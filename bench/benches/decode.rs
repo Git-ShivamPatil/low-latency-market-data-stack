@@ -58,8 +58,14 @@ fn decode(c: &mut Criterion) {
     // The book update, measured from a warm book rather than an empty one. An
     // empty book has one level and no queue, which is the fastest the structure
     // will ever be and nothing like what it does in service.
+    // Sixteen datagrams per iteration, so the element count is sixteen batches
+    // — not one. The first version of this said `BATCH`, and Criterion duly
+    // reported a throughput sixteen times too low next to a `time` that was
+    // correct. A mislabelled throughput in a harness whose whole purpose is
+    // publishing numbers is worse than no throughput at all.
+    const APPLY_DATAGRAMS: u64 = 16;
     let mut group = c.benchmark_group("decode_and_apply");
-    group.throughput(Throughput::Elements(u64::from(BATCH)));
+    group.throughput(Throughput::Elements(u64::from(BATCH) * APPLY_DATAGRAMS));
     group.bench_function("fast_book", |b| {
         b.iter_batched_ref(
             || {
@@ -69,7 +75,12 @@ fn decode(c: &mut Criterion) {
             },
             |books| {
                 let mut h = 0u64;
-                for d in corpus.datagrams().iter().skip(64).take(16) {
+                for d in corpus
+                    .datagrams()
+                    .iter()
+                    .skip(64)
+                    .take(APPLY_DATAGRAMS as usize)
+                {
                     h ^= bench::decode_and_apply(books, black_box(d));
                 }
                 black_box(h)

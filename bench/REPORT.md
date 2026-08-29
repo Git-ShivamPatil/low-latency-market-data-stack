@@ -1,55 +1,53 @@
-# Benchmark report — TEMPLATE, NOT A RESULT
-
-> **This file contains no measurements.** It is the shape a report has to take
-> before a number from this project may be quoted anywhere. Every `<...>` below
-> is a blank that a real run fills in. Until one does, the honest answer to "how
-> fast is it?" is [CLAIMS.md](../CLAIMS.md), which says nothing has been measured.
-
----
+# Benchmark report — 2026-08-30
 
 ## Read this first
 
-**Single host.** The publisher and the consumer run on the same machine, over
-loopback or a container bridge. There is no NIC, no switch, and no second host.
-A trading-systems reader seeing "consume an exchange feed" and "1M+ msg/s"
-together will reasonably hear a NIC-to-NIC claim, and that is not what this
-measures. Every figure below is a single-host figure.
+**Single host.** The publisher and the consumer ran on the same machine over
+loopback. There is no NIC, no switch, and no second host. A trading-systems
+reader seeing "consume an exchange feed" and "2.78M msg/s" together will
+reasonably hear a NIC-to-NIC claim, and that is **not** what this measures.
 
-**Batched.** Messages are carried `<BATCH>` to a datagram. This is not an
-implementation detail: the kernel UDP receive path tops out somewhere around
-300–600K packets per second per core, so a million messages a second is only
-reachable by putting many messages in each packet. Batching is standard on real
-exchange feeds — and a reader who assumes one message per packet is reading a
-much stronger claim than the one being made. **No throughput figure from this
-project may be quoted without the batch factor beside it.**
+**Batched, 32 messages to a datagram.** Not an implementation detail. The kernel
+UDP receive path tops out somewhere around 300–600K packets per second per core,
+so a million messages a second is only reachable by putting many messages in each
+packet. Batching is standard on real exchange feeds — and a reader who assumes
+one message per packet is reading a far stronger claim than the one being made.
+**The throughput figure below is meaningless without this number beside it.**
 
-**Compiled for this host.** `.cargo/config.toml` sets `-C target-cpu=native`.
-Every number here comes from a binary built for the exact machine it ran on.
+**A shared, ephemeral, virtualised CI runner.** Four physical ARM cores on a
+Microsoft hypervisor. The scheduler belongs to a host this process cannot see, so
+the tail latencies are partly a measurement of that host. What makes the figures
+usable anyway is that three independent runs agreed within 0.7%.
+
+**Compiled for this host** — `.cargo/config.toml` sets `-C target-cpu=native`.
 
 ---
 
 ## Host
 
-Filled from `cargo run --release -p bench --bin hostcheck -- --fields`.
+From `cargo run --release -p bench --bin hostcheck -- --fields`.
 
 | | |
 |---|---|
-| CPU | `<model, physical cores / logical cores>` |
-| Kernel | `<uname -a>` |
-| Bare metal or VM | `<bare metal / WSL2 / cloud VM and which>` |
-| Governor | `<performance / ondemand / ...>` |
-| Turbo | `<on / off>` |
-| `constant_tsc` / `nonstop_tsc` | `<true/false> / <true/false>` |
-| Cores pinned | `<engine core, handler core, or "not pinned">` |
-| RUSTFLAGS | `<as built; the default is -C target-cpu=native>` |
-| Toolchain | `<rustc version>` |
-| Commit | `<SHA>` |
-| Date | `<YYYY-MM-DD>` |
+| CPU | `aarch64 implementer 0x41 part 0xd49` — ARM Neoverse N2 |
+| Cores | **4 physical / 4 logical** (server ARM has no SMT, so these are real cores) |
+| Kernel | `6.17.0-1022-azure`, Ubuntu 24.04 |
+| Bare metal or VM | **VM** — a Microsoft hypervisor (GitHub Actions `ubuntu-24.04-arm`) |
+| Governor | unknown (not readable on this runner) |
+| Turbo | unknown |
+| Invariant counter | **yes** — `cntvct_el0` at 1000.0 MHz, 1ns granularity |
+| Timer overhead | 8 ticks, calibration spread 0.00007 |
+| RUSTFLAGS | `-C target-cpu=native` |
+| Cores pinned | engine → core 2, handler → core 3 |
+| Commit | `3c1bc88` |
+| Run | GitHub Actions 33281058291 |
 
-**The host gate said:** `<paste the verdict, including every caveat it listed>`
+**Host gate:** `PUBLISHABLE`, with three caveats it named itself:
 
-A report whose gate said REFUSED is not a report. It is a record of an
-experiment on unsuitable hardware, and it belongs in `results/`, not here.
+1. 4 physical cores, below the 6 this project prefers.
+2. Running under a Microsoft hypervisor.
+3. The CPU governor could not be read, so frequency scaling during the run is
+   unknown.
 
 ---
 
@@ -57,124 +55,188 @@ experiment on unsuitable hardware, and it belongs in `results/`, not here.
 
 | | |
 |---|---|
-| Batch factor | `<BATCH>` messages per datagram |
-| Message mix | `<% AddOrder / % DeleteOrder / % ModifyOrder / % Trade>` |
-| Symbols | `<n>` |
-| Book depth during measurement | `<resting orders>` |
-| Corpus seed | `<seed>` — the stream replays exactly from it |
-| Run duration | `<seconds>` |
-| Repetitions | `<n>`, agreeing within `<x>%` |
+| Batch factor | **32** messages per datagram (measured 31.62 in the in-path run) |
+| Message mix | ~55% `AddOrder`, ~25% `DeleteOrder`, ~12% `ModifyOrder`, ~8% `Trade` |
+| Symbols | 1 |
+| Price levels in the corpus | 64 |
+| Book depth during the microbenchmarks | ~1,255 resting orders |
+| Book depth at the end of the in-path run | 305 resting orders |
+| Corpus seed | `0xBE7C0DE5` — the stream replays exactly from it |
+| Throughput run duration | 60s × 3 |
+| Book | `--books fast` |
 
-The mix matters. A decode benchmark over one message type measures one branch of
-a match statement and predicts perfectly, which is not what a consumer does.
-
-The depth matters more. An empty book has one price level and no queue to walk:
-it is the fastest either structure will ever be and nothing like service.
+**The book is shallow, and that limits what these numbers mean.** 64 price levels
+and roughly a thousand orders is a small book: a `BTreeMap` over 64 keys is one
+or two levels deep and entirely cache-resident. See the book results below, where
+this matters a great deal.
 
 ---
 
 ## What "decode" means here
 
-The advertised `~100ns decode` is meaningless without this definition, because as
-pure field extraction it is 10–30ns and as a full pipeline it is genuinely tight.
-Publishing the number without the definition would be publishing nothing.
-
-**`decode_fields` — included:** parsing the packet header; walking each message
-header; extracting and validating every field of every message, including enum
+**`decode_fields` — included:** parsing the packet header, walking each message
+header, extracting and validating every field of every message including enum
 values that can fail.
 
 **`decode_fields` — excluded:** the `recvmmsg` that delivered the datagram; A/B
 arbitration; any book update; any digest.
 
-**`decode_and_apply` — included:** all of the above, plus applying each message
-to the book. This is the per-message consumer cost, and it is the number the
-throughput claim rests on.
+**`decode_and_apply` — included:** all of the above plus applying each message to
+the book. This is the per-message consumer cost.
 
 The syscall is in neither. It is amortised across the batch and belongs in the
 throughput figure — which is exactly why the batch factor has to be published
 next to both.
 
+Nothing here was optimised away: every workload returns a checksum folded from
+every field it touched, and `bench::tests::decoding_actually_reads_every_field`
+flips one bit of a payload and requires the answer to change.
+
 ---
 
 ## Results
 
+### Throughput — the headline
+
+Measured **receiver-side**, as `(final sequence − first sequence) / elapsed`.
+
+| Run | msg/s | Messages | Gaps | Apply errors | State at exit |
+|---|---|---|---|---|---|
+| 1 | **2,766,932** | 207,508,426 | 0 | 0 | `LIVE` |
+| 2 | **2,785,966** | 208,933,709 | 0 | 0 | `LIVE` |
+| 3 | **2,782,874** | 208,700,386 | 0 | 0 | `LIVE` |
+
+**Spread 0.7%**, against the 10% this project requires. Zero arbitrated gaps and
+zero apply errors in all three.
+
+Against the advertised `1M+ msg/s`: **met, at 2.78×**.
+
 ### Decode
 
-| Measurement | Median | p99 | p99.9 | Max |
-|---|---|---|---|---|
-| `decode_fields`, per message, Criterion | `<ns>` | `<ns>` | `<ns>` | `<ns>` |
-| `decode_and_apply`, per message, Criterion | `<ns>` | `<ns>` | `<ns>` | `<ns>` |
-| `decode_and_apply`, per message, in-path rdtsc | `<ns>` | `<ns>` | `<ns>` | `<ns>` |
+Criterion, 32 messages per datagram.
 
-**Two methods, and they bound the answer from opposite sides.** Criterion
-amortises the clock across many iterations and does not serialise the work, so it
-gives the **lower** bound. The in-path histogram puts an `lfence; rdtsc` pair
-around each datagram, which costs tens of cycles and — more importantly —
-serialises an out-of-order window the untimed path exploits, so it gives the
-**upper** bound. The timer's own overhead is subtracted; the serialisation cannot
-be. Quote both, say which is which, and never quote one alone.
+| Measurement | Per datagram | **Per message** |
+|---|---|---|
+| `decode_fields`, streaming over 256 datagrams | 262.45 ns | **8.20 ns** |
+| `decode_fields`, one datagram hot in L1 | 157.77 ns | **4.93 ns** |
+
+Against the advertised `~100ns decode`: **met, with a wide margin** — but read the
+definition above before quoting it. This is field extraction, not a pipeline. The
+streaming figure is the honest one; the hot-L1 figure is the optimistic one and is
+labelled as such because a consumer taking datagrams off a socket never sees the
+same bytes twice.
 
 ### Book update
 
-| Book | Median | p99 | p99.9 |
-|---|---|---|---|
-| Fast (tick-indexed array + slab + open-addressed map) | `<ns>` | `<ns>` | `<ns>` |
-| Reference (`BTreeMap` of `VecDeque`) | `<ns>` | `<ns>` | `<ns>` |
+Criterion, 16 datagrams × 32 messages = 512 messages per iteration, on a book
+warmed to ~1,255 resting orders. These include decode.
 
-The baseline is the point. "200ns" is a number; "200ns, where the obvious
-implementation of the same operations on the same corpus takes N" is a result.
-The reference book is kept for exactly this — and for being the oracle the fast
-book is differentially tested against.
+| Book | Per iteration | **Per message** |
+|---|---|---|
+| Fast — tick-indexed array, slab, open-addressed map | 19.94 µs | **38.9 ns** |
+| Reference — `BTreeMap` of `VecDeque` | 34.23 µs | **66.9 ns** |
 
-### Throughput
+Against the advertised `~200ns book update`: **met**.
 
-Measured **receiver-side**, as `(final sequence − first sequence) / elapsed`.
-Not messages-delivered over elapsed: a gap the handler failed to recover then
-makes the number *worse* rather than invisible, which is the honest direction.
+**But the interesting result here is the one that contradicts this project's own
+prediction.** The README says a `HashMap<OrderId>` over a `BTreeMap<Price>` lands
+at 400ns–1µs. It measured at 66.9 ns/message — six to fifteen times better than
+predicted, and comfortably inside the 200ns target on its own.
 
-| Run | msg/s | Gaps | State at exit |
-|---|---|---|---|
-| 1 | `<n>` | `<n>` | `<LIVE/GAPPED>` |
-| 2 | `<n>` | `<n>` | `<LIVE/GAPPED>` |
-| 3 | `<n>` | `<n>` | `<LIVE/GAPPED>` |
+The reason is the workload, not the prediction being silly: **64 price levels is
+not a book that stresses a `BTreeMap`.** The tree is one or two levels deep and
+fits in L1, so the pointer-chasing descent the prediction is about barely
+happens. The fast book is **1.72× faster** here, not the order of magnitude the
+design argument anticipated.
 
-Spread: `<x>%`. The milestone requires three runs within 10%, and a run ending
-`GAPPED` does not count regardless of its rate — a fast handler with a wrong
-book has not done the job.
+That does not make the fast book unjustified — it makes this workload the wrong
+one to justify it with. A book with hundreds of levels and tens of thousands of
+orders is where the two diverge, and this corpus does not build one. **Anyone
+quoting the 1.72× should quote the book depth with it.**
+
+Single operations, for attributing a regression rather than for quoting:
+
+| Operation | Time |
+|---|---|
+| `add` on the fast book | 83.6 ns |
+| `delete` on the fast book | 77.7 ns |
+
+These are higher than the 38.9 ns/message above because each Criterion iteration
+carries its own setup and a symbol lookup that the batched path amortises.
+
+### In-path latency — the upper bound
+
+2,000,000 messages through the real receive loop, timed with `cntvct_el0`.
+
+| | Per message | Per datagram |
+|---|---|---|
+| min | 24 ns | 40 ns |
+| **median** | **93 ns** | 2,977 ns |
+| p90 | 116 ns | 3,697 ns |
+| **p99** | **1,532 ns** | 48,767 ns |
+| **p99.9** | **1,827 ns** | 55,071 ns |
+| max | 14,893 ns | 65,730 ns |
+| mean | 138.9 ns | 4,348.6 ns |
+
+63,245 datagrams, 0 overflow, 0 gaps, ended `LIVE`.
+
+**The two methods bracket the answer, as designed.** Criterion says 39.9 ns per
+message for decode-and-apply; the in-path histogram says 93 ns. Criterion
+amortises the clock and does not serialise, so it is the **lower** bound. The
+in-path measurement puts an `isb; mrs` pair around every datagram, which
+serialises an out-of-order window the untimed path exploits, so it is the
+**upper** bound. The timer's own 8-tick overhead is subtracted; the serialisation
+cannot be. Neither number alone is the answer; the answer is between them.
+
+**The p99 and p99.9 are not hidden and are not good.** 1.5–1.8 µs per message at
+the tail, against a 93 ns median, is sixteen times the median. That is the shared
+hypervisor showing through — it is the caveat the host gate named, and it is why
+this report cannot claim a tail-latency result. A p99.9 from a runner whose
+scheduler belongs to someone else measures that scheduler.
 
 ### Allocation
 
 | | |
 |---|---|
-| Heap operations per message, steady state | `<n>` — must be 0 |
+| Heap operations per message, steady state | **0** allocations, 0 deallocations, 0 reallocations |
 
-Already substantiated and already in [CLAIMS.md](../CLAIMS.md); repeated here
-because a performance report that omits it invites the reader to wonder.
+Over the 2,000,000-message in-path run, on aarch64. The claim already
+substantiated on x86 in milestone 5 holds on ARM.
 
 ---
 
 ## What this does not show
 
-- **No NIC.** See the first paragraph.
-- **Synthetic order flow.** A seeded generator, not a market data replay. The
-  mix is chosen to resemble one; it is not one.
-- **One consumer.** Nothing here measures what happens with several handlers on
-  the same group.
-- **No cross-checking against another implementation.** The numbers describe this
-  code measured by its own harness.
+- **No NIC.** Loopback only. See the first paragraph.
+- **A shallow book.** 64 price levels. The reference-book comparison above is
+  much narrower than it would be on a realistic book, and this report says so
+  rather than quoting the flattering ratio.
+- **No tail-latency claim.** The p99.9 is dominated by hypervisor scheduling.
+- **Synthetic order flow.** A seeded generator, not a market data replay.
+- **One consumer.** Nothing here measures several handlers on one group.
+- **One architecture.** These are ARM Neoverse N2 numbers. The x86 figures from
+  the development laptop are not comparable and are not published.
+- **No independent cross-check.** The numbers describe this code measured by its
+  own harness.
 
 ---
 
 ## Reproducing it
 
 ```bash
-cargo run --release -p bench --bin hostcheck   # do this first, on the real host
-scripts/bench.sh all
+gh workflow run Benchmark --ref main
 ```
 
-The gate runs first. On a host it refuses, the benchmarks still run — exercising
-them is how the harness gets debugged — but the output lands in
+`workflow_dispatch` only, on `ubuntu-24.04-arm`. The host gate runs first; on a
+host it refuses, the benchmarks still run but the output lands in
 `results/bench/NOT-PUBLISHABLE.md` and this file is not touched.
+
+Locally:
+
+```bash
+cargo run --release -p bench --bin hostcheck
+scripts/bench.sh all
+```
 
 ---
 
