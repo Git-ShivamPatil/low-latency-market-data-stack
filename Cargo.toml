@@ -6,6 +6,10 @@ members = [
     "crates/wire",
     "crates/book",
     "crates/alloc-guard",
+    "crates/transport",
+    "crates/mdconfig",
+    "crates/matching-engine",
+    "crates/feed-handler",
 ]
 
 [workspace.package]

@@ -1,0 +1,358 @@
+//! The matching engine binary.
+//!
+//! ```text
+//! cargo run --release --bin matching-engine -- --config configs/local.toml
+//! ```
+//!
+//! That command is published on the project's case-study page, so the binary
+//! name and the config path are part of the public surface and are not free to
+//! drift.
+
+mod engine;
+mod feed;
+mod generator;
+mod rng;
+
+use std::io::{self, Write};
+use std::net::SocketAddrV4;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+use clap::Parser;
+use mdconfig::Config;
+use transport::{Publisher, TransportMode};
+
+use crate::engine::Engine;
+use crate::feed::FeedPublisher;
+use crate::generator::{Generator, Intent, Shape};
+use book::DigestLog;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "matching-engine",
+    about = "Price-time-priority matching engine publishing a batched binary feed over A/B channels",
+    long_about = None,
+)]
+struct Args {
+    /// Path to the configuration file.
+    #[arg(long, default_value = "configs/local.toml")]
+    config: PathBuf,
+
+    /// Override `transport.mode`: `multicast` or `unicast-fanout`.
+    ///
+    /// The fallback exists because multicast over a Docker bridge under WSL2 is
+    /// the likeliest infrastructure blocker in this project. Same binary, same
+    /// framing, same everything else.
+    #[arg(long)]
+    transport: Option<String>,
+
+    /// Override the A channel address.
+    #[arg(long, value_name = "ADDR")]
+    feed_a: Option<SocketAddrV4>,
+
+    /// Override the B channel address.
+    #[arg(long, value_name = "ADDR")]
+    feed_b: Option<SocketAddrV4>,
+
+    /// Messages per datagram. This is the number a throughput figure has to be
+    /// published next to; see docs/WIRE.md.
+    #[arg(long)]
+    batch_size: Option<u16>,
+
+    /// Stop after this many messages. 0 runs until interrupted.
+    #[arg(long)]
+    messages: Option<u64>,
+
+    /// Stop after this many seconds. 0 runs until interrupted.
+    #[arg(long)]
+    duration: Option<u64>,
+
+    /// Throttle to roughly this many messages per second. 0 runs flat out.
+    #[arg(long)]
+    rate: Option<u64>,
+
+    /// Seed for the order-flow generator. The same seed replays the same run.
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Write `sequence digest` checkpoints here for the smoke test to compare.
+    #[arg(long, value_name = "PATH")]
+    digest_path: Option<PathBuf>,
+
+    /// Checkpoint every N sequences. Must match the handler's interval.
+    #[arg(long)]
+    digest_interval: Option<u64>,
+
+    /// Decode every datagram before sending it and rebuild a shadow book from
+    /// the result, then compare it against the engine's own book at shutdown.
+    /// Catches an encoding bug here rather than as a mystery digest mismatch in
+    /// another process.
+    #[arg(long)]
+    self_check: bool,
+
+    /// Print the resolved configuration and exit without sending anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("matching-engine: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    let mut cfg = Config::load(&args.config)?;
+    apply_overrides(&mut cfg, &args);
+
+    let mode: TransportMode = match &args.transport {
+        Some(s) => s
+            .parse()
+            .map_err(|e: String| -> Box<dyn std::error::Error> { e.into() })?,
+        None => cfg.transport.mode()?,
+    };
+    let opts = cfg.socket_options();
+
+    let (a_targets, b_targets) = match mode {
+        TransportMode::Multicast => (vec![cfg.feed.a.group], vec![cfg.feed.b.group]),
+        TransportMode::UnicastFanout => (
+            cfg.feed.a.unicast_targets.clone(),
+            cfg.feed.b.unicast_targets.clone(),
+        ),
+    };
+
+    if args.dry_run {
+        println!("transport      {mode}");
+        println!("channel A      {a_targets:?}");
+        println!("channel B      {b_targets:?}");
+        println!("batch size     {}", cfg.feed.batch_size);
+        println!("datagram cap   {} bytes", cfg.feed.max_datagram_bytes);
+        println!("symbols        {}", cfg.market.symbols.len());
+        println!("seed           {}", cfg.engine.seed);
+        println!("digest every   {} sequences", cfg.engine.digest_interval);
+        return Ok(());
+    }
+
+    let a = Publisher::bind(mode, &a_targets, opts).map_err(|e| bind_hint(e, mode, "A"))?;
+    let b = Publisher::bind(mode, &b_targets, opts).map_err(|e| bind_hint(e, mode, "B"))?;
+
+    let mut feed = FeedPublisher::new(a, b, cfg.feed.batch_size, cfg.feed.max_datagram_bytes);
+    let mut engine = Engine::new(&cfg.market.symbols);
+    let mut generator = Generator::new(cfg.engine.seed, Shape::from(&cfg.engine));
+
+    let mut digest_log = DigestLog::open(cfg.engine.digest_path.as_deref())?;
+    let digest_interval = cfg.engine.digest_interval;
+
+    let self_check = args.self_check || cfg.engine.self_check;
+    if self_check {
+        feed.enable_self_check();
+    }
+
+    eprintln!("matching-engine");
+    eprintln!("  {}", feed.describe());
+    eprintln!(
+        "  {} symbols, seed {}, digest every {} sequences{}",
+        cfg.market.symbols.len(),
+        cfg.engine.seed,
+        digest_interval,
+        if self_check { ", self-check on" } else { "" }
+    );
+    if let Some(p) = cfg.engine.digest_path.as_deref() {
+        eprintln!("  checkpoints -> {}", p.display());
+    }
+
+    let started = Instant::now();
+    let deadline = (cfg.engine.duration_seconds > 0)
+        .then(|| started + Duration::from_secs(cfg.engine.duration_seconds));
+    let message_limit = cfg.engine.messages;
+    let rate = cfg.engine.rate_per_second;
+    let flush_interval = Duration::from_micros(cfg.feed.flush_interval_micros.max(1));
+    let heartbeat_interval = Duration::from_millis(cfg.feed.heartbeat_millis.max(1));
+
+    let mut last_flush = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    let mut last_report = Instant::now();
+
+    // Bounded by --messages or --duration. There is deliberately no signal
+    // handler: installing one needs a crate or `unsafe`, and this workspace
+    // denies `unsafe_code`. Ctrl-C therefore kills the process outright, which
+    // is why DigestLog flushes every line as it is written rather than relying
+    // on a clean exit — an interrupted demo still leaves usable evidence.
+    loop {
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                break;
+            }
+        }
+        if message_limit > 0 && feed.stats().messages >= message_limit {
+            break;
+        }
+
+        let idx = generator.pick_symbol(engine.symbols.len());
+        generator.drift_mid(&mut engine.symbols[idx]);
+        let intent = generator.next(&engine.symbols[idx]);
+
+        // Checkpoints are taken inside the engine, immediately after each
+        // message is given its sequence — that is the only point where the
+        // engine's book is exactly "messages 1..=seq".
+        let mut checkpoint = |eng: &Engine, seq: u64| -> io::Result<()> {
+            if digest_interval > 0 && seq.is_multiple_of(digest_interval) {
+                digest_log.write(seq, eng.digest())?;
+            }
+            Ok(())
+        };
+
+        match intent {
+            Intent::Submit {
+                symbol_id,
+                side,
+                price,
+                quantity,
+            } => engine.submit(&mut feed, symbol_id, side, price, quantity, &mut checkpoint)?,
+            Intent::Cancel {
+                symbol_id,
+                order_id,
+            } => engine.cancel(&mut feed, symbol_id, order_id, &mut checkpoint)?,
+            Intent::Amend {
+                symbol_id,
+                order_id,
+                new_price,
+                new_quantity,
+            } => engine.amend(
+                &mut feed,
+                symbol_id,
+                order_id,
+                new_price,
+                new_quantity,
+                &mut checkpoint,
+            )?,
+        }
+
+        let now = Instant::now();
+        if now.duration_since(last_flush) >= flush_interval {
+            feed.flush_on_timer()?;
+            last_flush = now;
+        }
+        if now.duration_since(last_heartbeat) >= heartbeat_interval {
+            feed.heartbeat(feed.last_sequence())?;
+            last_heartbeat = now;
+        }
+        if now.duration_since(last_report) >= Duration::from_secs(5) {
+            report(&feed, &engine, started);
+            last_report = now;
+        }
+
+        if rate > 0 {
+            throttle(rate, feed.stats().messages, started);
+        }
+    }
+
+    feed.flush()?;
+    if let Some(shadow) = feed.shadow() {
+        // Everything has been flushed, so the shadow covers exactly the same
+        // sequence range as the engine's own book. This is the only point where
+        // the two are guaranteed comparable.
+        let engine_digest = engine.digest();
+        let shadow_digest = book::BookDigest::of(shadow);
+        if engine_digest != shadow_digest {
+            return Err(format!(
+                "self-check failed: the feed does not rebuild the engine's own book\n  \
+                 engine {engine_digest}\n  replay {shadow_digest}"
+            )
+            .into());
+        }
+        eprintln!("  self-check ok: the feed rebuilds the engine's book exactly");
+    }
+    digest_log.flush()?;
+
+    report(&feed, &engine, started);
+    let s = engine.stats();
+    eprintln!(
+        "  {} orders, {} trades ({} shares), {} cancels, {} amends",
+        s.orders_submitted, s.trades, s.shares_traded, s.cancels, s.modifies
+    );
+    eprintln!("  final book {}", engine.digest());
+    engine
+        .books()
+        .check_invariants()
+        .map_err(|e| format!("the engine's own book is inconsistent: {e}"))?;
+    Ok(())
+}
+
+fn apply_overrides(cfg: &mut Config, args: &Args) {
+    if let Some(a) = args.feed_a {
+        cfg.feed.a.group = a;
+        cfg.feed.a.unicast_targets = vec![a];
+    }
+    if let Some(b) = args.feed_b {
+        cfg.feed.b.group = b;
+        cfg.feed.b.unicast_targets = vec![b];
+    }
+    if let Some(v) = args.batch_size {
+        cfg.feed.batch_size = v.max(1);
+    }
+    if let Some(v) = args.messages {
+        cfg.engine.messages = v;
+    }
+    if let Some(v) = args.duration {
+        cfg.engine.duration_seconds = v;
+    }
+    if let Some(v) = args.rate {
+        cfg.engine.rate_per_second = v;
+    }
+    if let Some(v) = args.seed {
+        cfg.engine.seed = v;
+    }
+    if let Some(v) = args.digest_interval {
+        cfg.engine.digest_interval = v;
+    }
+    if args.digest_path.is_some() {
+        cfg.engine.digest_path = args.digest_path.clone();
+    }
+}
+
+/// Turns a bind failure into something actionable rather than an errno.
+fn bind_hint(e: io::Error, mode: TransportMode, arm: &str) -> String {
+    let mut msg = format!("cannot open channel {arm}: {e}");
+    if mode == TransportMode::Multicast {
+        msg.push_str(
+            "\n  Multicast setup is the most common thing to fail here. Try \
+             `--transport unicast-fanout`, which uses the same framing over \
+             plain UDP and is a supported mode rather than a workaround.",
+        );
+    }
+    msg
+}
+
+fn report(feed: &FeedPublisher, engine: &Engine, started: Instant) {
+    let s = feed.stats();
+    let elapsed = started.elapsed().as_secs_f64().max(1e-9);
+    eprintln!(
+        "  {:>10} msgs  {:>8} datagrams  {:.1} msg/datagram  {:.0} msg/s  {} orders resting",
+        s.messages,
+        s.datagrams,
+        s.messages_per_datagram(),
+        s.messages as f64 / elapsed,
+        engine.books().total_orders(),
+    );
+    let _ = io::stderr().flush();
+}
+
+/// Coarse pacing: sleep when the run is ahead of the requested rate.
+///
+/// Deliberately not a precise scheduler. Rate limiting here exists so a demo
+/// does not saturate a laptop, and any real throughput number comes from an
+/// unthrottled run measured receiver-side on a quiet host — not from this.
+fn throttle(rate: u64, messages: u64, started: Instant) {
+    let target = Duration::from_secs_f64(messages as f64 / rate as f64);
+    let elapsed = started.elapsed();
+    if target > elapsed {
+        std::thread::sleep(target - elapsed);
+    }
+}

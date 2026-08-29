@@ -1,0 +1,69 @@
+# The configuration used inside containers, on the user-defined bridge network
+# defined by docker-compose.yml.
+#
+# It differs from configs/local.toml in exactly one way that matters: the
+# multicast interface is pinned rather than left to the routing table. Inside a
+# container the default route can send the group join out the wrong interface,
+# and the symptom is a handler that joins successfully and then receives
+# nothing — which looks like a code bug and is not. Pinning it is the single
+# most useful line in this file.
+
+[transport]
+mode = "multicast"
+# 0.0.0.0 lets the kernel choose. Inside a container with a single eth0 that is
+# unambiguous, which is one of the few things containers make easier here. On the
+# host it is the line to change first when a join succeeds but nothing arrives.
+interface = "0.0.0.0"
+ttl = 1
+# Costs nothing across separate network namespaces and removes one way for this
+# to fail silently.
+loopback = true
+buffer_bytes = 4194304
+
+[feed]
+batch_size = 32
+max_datagram_bytes = 1400
+flush_interval_micros = 500
+heartbeat_millis = 1000
+
+[feed.a]
+group = "239.1.1.1:30001"
+# A literal address, not a service name: these are parsed as SocketAddrV4 and
+# Docker's DNS names do not resolve at config-parse time. Kept in step with the
+# static addresses in docker-compose.yml.
+unicast_targets = ["172.28.0.11:31001"]
+unicast_bind = "0.0.0.0:31001"
+
+[feed.b]
+group = "239.1.1.2:30001"
+unicast_targets = ["172.28.0.11:31002"]
+unicast_bind = "0.0.0.0:31002"
+
+[market]
+symbols = [
+    { id = 1, name = "ACME", reference_price = 1000000, tick_size = 100 },
+    { id = 2, name = "BOLT", reference_price =  250000, tick_size =  25 },
+    { id = 3, name = "CRUX", reference_price = 4500000, tick_size = 500 },
+    { id = 4, name = "DYNE", reference_price =   80000, tick_size =  10 },
+]
+
+[engine]
+seed = 6811297534891234561
+messages = 0
+duration_seconds = 0
+rate_per_second = 50000
+digest_interval = 1000
+self_check = false
+target_depth = 40
+price_spread_ticks = 8
+aggressive_chance = 0.18
+cancel_chance = 0.25
+modify_chance = 0.15
+min_quantity = 1
+max_quantity = 500
+
+[handler]
+digest_interval = 1000
+stats_interval_millis = 5000
+messages = 0
+idle_timeout_seconds = 0

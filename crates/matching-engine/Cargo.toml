@@ -1,0 +1,27 @@
+[package]
+name = "matching-engine"
+description = "Price-time-priority matching engine publishing a batched binary feed over A/B channels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# The portfolio's copyable command is `cargo run --release --bin matching-engine`,
+# so this name is load-bearing and must not drift.
+[[bin]]
+name = "matching-engine"
+path = "src/main.rs"
+
+[dependencies]
+wire = { path = "../wire" }
+book = { path = "../book" }
+transport = { path = "../transport" }
+mdconfig = { path = "../mdconfig" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"

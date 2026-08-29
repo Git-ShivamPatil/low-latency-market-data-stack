@@ -1,0 +1,18 @@
+[package]
+name = "transport"
+description = "UDP multicast and unicast-fanout backends for the market-data feed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The "all" feature is where SO_REUSEPORT and the other platform socket
+# options live. Milestone 3 needs SO_BINDTODEVICE from the same set to pin a
+# group join to a named interface.
+socket2 = { version = "0.6", features = ["all"] }

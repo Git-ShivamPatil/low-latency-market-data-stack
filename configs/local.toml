@@ -1,0 +1,120 @@
+# The configuration the case study tells visitors to run with:
+#
+#   cargo run --release --bin matching-engine -- --config configs/local.toml
+#
+# Every value here has a default in crates/mdconfig; this file exists to make
+# the defaults visible and to be the thing you edit. An unknown key is an error
+# rather than a silent no-op, so a typo cannot quietly leave you on a default.
+
+[transport]
+# "multicast" is the real thing. "unicast-fanout" is the same framing over plain
+# UDP, and it exists because multicast over a Docker bridge under WSL2 is the
+# likeliest infrastructure blocker in this project. Both binaries take
+# --transport to override this without editing the file.
+mode = "multicast"
+
+# Which local interface carries multicast. 0.0.0.0 lets the routing table
+# choose, which is usually right and occasionally the whole problem: under WSL2
+# the group can land on lo instead of eth0. If the handler joins successfully
+# but never receives, set this to the address of the interface the engine sends
+# from before suspecting anything else.
+interface = "0.0.0.0"
+
+# TTL 1 keeps traffic on the local segment. Raise it only if the engine and the
+# handler are genuinely on different segments, which is not a setup this project
+# currently has.
+ttl = 1
+
+# The sending host also receives its own multicast. Required whenever the engine
+# and the handler share a host.
+loopback = true
+
+# Requested SO_RCVBUF/SO_SNDBUF. The kernel clamps this to net.core.rmem_max
+# without telling you; the handler prints what it was actually granted, because
+# a full receive buffer looks exactly like network loss and is not.
+buffer_bytes = 4194304
+
+[feed]
+# Messages per datagram.
+#
+# This is the number the throughput target depends on, and the number that has
+# to be published beside any throughput figure. At one message per datagram the
+# ceiling is the kernel UDP path (~300-600K packets/sec/core), not anything this
+# code does. At 32, a million messages a second is ~31K packets/sec. Batching is
+# standard on real exchange feeds; quoting a rate without the batch factor is
+# what turns an honest number into a misleading one. See docs/WIRE.md.
+batch_size = 32
+
+# Stays under a 1500-byte MTU with room for IP and UDP headers.
+max_datagram_bytes = 1400
+
+# A partial batch goes out after this long rather than waiting to fill.
+flush_interval_micros = 500
+
+# How often an idle channel emits a Heartbeat, so a consumer can tell quiet
+# from dead.
+heartbeat_millis = 1000
+
+[feed.a]
+group = "239.1.1.1:30001"
+unicast_targets = ["127.0.0.1:31001"]
+unicast_bind = "127.0.0.1:31001"
+
+[feed.b]
+# A different group on the same port. The receiver binds the group address
+# itself, so the two arms stay independent rather than both seeing both.
+group = "239.1.1.2:30001"
+unicast_targets = ["127.0.0.1:31002"]
+unicast_bind = "127.0.0.1:31002"
+
+[market]
+# symbolId on the wire is a dense integer, not a ticker string: the tick-indexed
+# book in milestone 5 indexes on it directly. Prices are fixed-point with an
+# exponent of -4, so 1000000 is 100.0000 and a tick_size of 100 is 0.01.
+symbols = [
+    { id = 1, name = "ACME", reference_price = 1000000, tick_size = 100 },
+    { id = 2, name = "BOLT", reference_price =  250000, tick_size =  25 },
+    { id = 3, name = "CRUX", reference_price = 4500000, tick_size = 500 },
+    { id = 4, name = "DYNE", reference_price =   80000, tick_size =  10 },
+]
+
+[engine]
+# The same seed replays the same run. The smoke test depends on this: a
+# reconciliation failure that cannot be reproduced is not a bug report.
+seed = 6811297534891234561
+
+# 0 means run until stopped.
+messages = 0
+duration_seconds = 0
+
+# 0 runs flat out. Throttling exists so a demo does not saturate a laptop; any
+# real throughput number comes from an unthrottled run measured receiver-side on
+# a quiet host, which is milestone 6 and not this machine.
+rate_per_second = 0
+
+# Book checkpoints. Both ends must use the same interval or their checkpoints
+# will not line up.
+digest_interval = 1000
+# digest_path = "results/engine-digests.txt"
+
+# Decode every datagram before sending it and rebuild a book from the result,
+# then compare against the engine's own book at shutdown. Roughly doubles the
+# per-message cost, so it is off by default and on in the smoke test.
+self_check = false
+
+# Order-flow shape. Not a market simulator — the goal is to exercise every path
+# through the engine and every message on the wire while keeping depth stable.
+target_depth = 40
+price_spread_ticks = 8
+aggressive_chance = 0.18
+cancel_chance = 0.25
+modify_chance = 0.15
+min_quantity = 1
+max_quantity = 500
+
+[handler]
+digest_interval = 1000
+# digest_path = "results/handler-digests.txt"
+stats_interval_millis = 2000
+messages = 0
+idle_timeout_seconds = 0

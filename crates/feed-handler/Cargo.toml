@@ -1,0 +1,26 @@
+[package]
+name = "feed-handler"
+description = "Consumes the A/B binary feed and rebuilds the order books"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# Load-bearing: the case study tells visitors to run `--bin feed-handler`.
+[[bin]]
+name = "feed-handler"
+path = "src/main.rs"
+
+[dependencies]
+wire = { path = "../wire" }
+book = { path = "../book" }
+transport = { path = "../transport" }
+mdconfig = { path = "../mdconfig" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"

@@ -1,0 +1,17 @@
+[package]
+name = "mdconfig"
+description = "The configuration file shared by the engine, the handler and the replay service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+transport = { path = "../transport" }
+serde = { version = "1", features = ["derive"] }
+toml = "1"

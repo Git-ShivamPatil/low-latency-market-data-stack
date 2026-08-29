@@ -53,7 +53,7 @@ $(CPP_BUILD)/CMakeCache.txt:
 # --- test ------------------------------------------------------------------
 
 .PHONY: test
-test: test-rust test-cpp test-corruption ## Run every correctness suite
+test: test-rust test-cpp test-corruption smoke ## Run every correctness suite
 
 .PHONY: test-rust
 test-rust: ## cargo test the workspace
@@ -66,6 +66,18 @@ test-cpp: build-cpp ## ctest the C++ tree
 .PHONY: test-corruption
 test-corruption: ## Prove a one-byte edit to a golden vector fails both suites
 	CPP_BUILD=$(CPP_BUILD) scripts/verify-golden-corruption.sh
+
+.PHONY: smoke
+smoke: ## End-to-end: engine and handler as separate processes, books reconciled
+	scripts/smoke.sh
+
+.PHONY: run-engine
+run-engine: ## The engine, exactly as the case study runs it
+	cargo run --release --bin matching-engine -- --config configs/local.toml
+
+.PHONY: run-handler
+run-handler: ## The handler, exactly as the case study runs it
+	cargo run --release --bin feed-handler -- --feed-a 239.1.1.1:30001 --feed-b 239.1.1.2:30001
 
 # --- quality ---------------------------------------------------------------
 

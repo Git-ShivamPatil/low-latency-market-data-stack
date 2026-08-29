@@ -1,0 +1,63 @@
+# The containerised stack: an engine and a handler on a user-defined bridge,
+# with the feed crossing that bridge as real multicast.
+#
+#   docker compose up -d
+#   docker compose logs -f handler
+#   docker compose down
+#
+# Why this exists as its own thing rather than as the way to run the project:
+# multicast over a Docker bridge is the single most likely piece of
+# infrastructure to misbehave here, so it gets exercised deliberately instead of
+# being assumed. The host-local path in the README needs none of this — the two
+# binaries talk over loopback and are the faster way to work.
+#
+# If the handler joins its groups and then receives nothing, that is the known
+# failure: the group join went out an interface the engine is not sending on.
+# Pin transport.interface in configs/docker.toml, or fall back with
+#
+#   MDSTACK_TRANSPORT=unicast-fanout docker compose up -d
+#
+# which uses the same binaries and the same framing over plain UDP.
+
+name: mdstack
+
+x-build: &build
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+
+services:
+  engine:
+    <<: *build
+    container_name: mdstack-engine
+    networks:
+      feed:
+        ipv4_address: 172.28.0.10
+    command:
+      - --config=/app/configs/docker.toml
+      - --transport=${MDSTACK_TRANSPORT:-multicast}
+    restart: unless-stopped
+
+  handler:
+    <<: *build
+    container_name: mdstack-handler
+    entrypoint: ["feed-handler"]
+    networks:
+      feed:
+        ipv4_address: 172.28.0.11
+    command:
+      - --config=/app/configs/docker.toml
+      - --transport=${MDSTACK_TRANSPORT:-multicast}
+      - --show-book
+    depends_on:
+      - engine
+    restart: unless-stopped
+
+networks:
+  # A user-defined bridge rather than the default one, so the subnet is fixed
+  # and the addresses above stay meaningful across restarts.
+  feed:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

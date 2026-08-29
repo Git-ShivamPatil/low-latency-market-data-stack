@@ -223,6 +223,35 @@ a silent arm and a healthy-but-empty arm look identical.
 
 ---
 
+## A consequence of aggregating the snapshot
+
+`Snapshot` carries **aggregated price levels** — price, total quantity, order
+count — not individual orders. That is enough to rebuild a market-by-price view
+and not enough to rebuild a market-by-order one: the aggregate says three orders
+total 250 at this price, but not which orders, in what queue order, or with what
+ids. Queue position is unrecoverable from it, and queue position is the whole
+point of price-time priority.
+
+This is deliberate and it is what real feeds do — but it means **the snapshot
+cycle alone cannot recover an MBO book.** So milestone 4 needs both mechanisms
+it is scheduled to build, for different reasons:
+
+| Mechanism | Recovers | Cost |
+|---|---|---|
+| 2-second snapshot cycle | MBP, immediately, from the next cycle | Bounded wait, no request |
+| TCP replay service | MBO exactly, by replaying the missed range | A round trip and the publisher's history |
+
+A handler that has lost messages and needs its order book back must replay. One
+that only trades off aggregated depth can wait for the next snapshot. The
+recovery state machine in milestone 4 has to choose between them rather than
+assume one is always available.
+
+`book::apply_message` refuses a `Snapshot` outright today rather than half-applying
+one, because a book that is silently missing its queue order is worse than one
+that is honestly absent.
+
+---
+
 ## Reserved bytes
 
 Every block is a whole number of bytes with no implicit padding: the schema

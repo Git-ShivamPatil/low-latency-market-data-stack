@@ -74,6 +74,27 @@ jobs:
       - name: Test
         run: ctest --test-dir cpp/build --output-on-failure
 
+  smoke:
+    name: Engine and handler reconcile over real sockets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Two processes, real UDP sockets, both transports. The assertion is that
+      # the handler's book matches the engine's own at the same sequence number.
+      # Shorter than the local default because a CI runner is not where anything
+      # gets measured — this is a correctness check, not a benchmark.
+      - name: Smoke test
+        run: scripts/smoke.sh --messages 50000
+      - name: Keep the artifacts when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: results/smoke/
+          retention-days: 7
+
   cross-language:
     name: Both codecs agree, and a corrupt vector fails both
     runs-on: ubuntu-24.04

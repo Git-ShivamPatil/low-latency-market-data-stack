@@ -15,6 +15,11 @@ build/
 .vscode/
 .idea/
 
-# bench output
+# run output: digests, summaries and logs from scripts/smoke.sh and the
+# benchmark harness. Reports that get published live in bench/ and docs/, not
+# here — anything in results/ is regenerable and machine-specific.
 /results/*.json
+/results/*.txt
+/results/*.log
+/results/smoke/
 !/results/.gitkeep

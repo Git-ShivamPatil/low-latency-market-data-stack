@@ -5,7 +5,7 @@
 **Price-time-priority matching engine publishing a binary feed over redundant A/B UDP multicast, with a Rust feed handler that arbitrates the two and rebuilds MBP/MBO books without allocating.**
 
 ![status](https://img.shields.io/badge/status-in%20development-22D3EE?style=for-the-badge)
-![progress](https://img.shields.io/badge/milestones-1%20of%209-334155?style=for-the-badge)
+![progress](https://img.shields.io/badge/milestones-2%20of%209-334155?style=for-the-badge)
 ![licence](https://img.shields.io/badge/licence-MIT-3b82f6?style=for-the-badge)
 
 ![](https://img.shields.io/badge/Rust-1.98-CE422B?logo=rust&logoColor=white) ![](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white) ![](https://img.shields.io/badge/FIX-4.4-334155) 
@@ -17,7 +17,7 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 1 of 9 milestones complete.**
+> **This is a build in progress — 2 of 9 milestones complete.**
 >
 > The target figure below (`1M+ msg/s · ~100ns decode`) is a **goal, not a measurement.** Nothing here has been benchmarked yet.
 > Every number this project eventually publishes will land in [CLAIMS.md](CLAIMS.md) first, with the commit it was measured at,
@@ -75,14 +75,15 @@ flowchart LR
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[███░░░░░░░░░░░░░░░░░░░░░] 1/9 milestones · 11%
+[█████░░░░░░░░░░░░░░░░░░░] 2/9 milestones · 22%
 ```
 
 - [x] **M1 · Workspace, wire schema, and cross-language codegen**  
   One schema file is the single source of truth for the binary message layout, and the Rust codec and the C++ header agree on it byte for byte.  
   <sub>Verified: `cargo test --workspace` (20 tests) and `ctest --test-dir cpp/build` (2 suites) decode the same 11 `schema/golden/*.bin` files, assert the same field values, and re-encode them byte for byte. `scripts/verify-golden-corruption.sh` proves a one-byte edit fails both. See [docs/WIRE.md](docs/WIRE.md).</sub>
-- [ ] **M2 · Matching engine publishing a live binary feed, end to end**  
-  The two advertised commands run and a handler prints a book built from real UDP datagrams — the whole pipeline exists, badly, before anything is made fast.
+- [x] **M2 · Matching engine publishing a live binary feed, end to end**  
+  The two advertised commands run and a handler prints a book built from real UDP datagrams — the whole pipeline exists, badly, before anything is made fast.  
+  <sub>Verified: `scripts/smoke.sh` runs the engine and the handler as separate processes over real UDP and requires the handler's book to match the engine's own at the same sequence number — 100 shared checkpoints, every one identical, sequence 1..100000, zero gaps, on **both** multicast and the unicast fallback. See [docs/RUNNING.md](docs/RUNNING.md).</sub>
 - [ ] **M3 · A/B redundancy, loss injection, arbitration and gap detection**  
   Two independent channels carry the same stream, the handler takes whichever datagram lands first, and it knows the difference between 'late' and 'lost'.
 - [ ] **M4 · Snapshot cycle and TCP replay recovery**  
@@ -144,23 +145,32 @@ THE CAVEATS THAT MUST BE STATED PLAINLY: single host; multicast over Docker brid
 
 ### What runs today
 
-Milestone 1 built the wire format, not the stack. There are no binaries yet — the
-four commands below arrive in milestones 2 and 4. What exists now is the encoding
-everything else will be built on, and it is fully tested:
+The engine matches orders and publishes a batched binary feed on two redundant
+channels; the handler consumes both, discards duplicates and rebuilds the books.
+Steps 2 and 3 below work now. Steps 1 and 4 arrive in milestones 4 and 5.
+
+Run inside WSL2 or any Linux — multicast socket options, `SO_REUSEADDR` and the
+core pinning later milestones need only behave correctly there, and the C++ tree
+is not wired for Windows.
 
 ```bash
-make generate    # regenerate the Rust codec and C++ header from schema/market-data.xml
-make test        # both toolchains against the same golden vectors, plus the corruption check
+make smoke       # engine and handler as separate processes, books reconciled
+make test        # every correctness suite, both toolchains
 make lint        # rustfmt and clippy, both as errors
 ```
 
-Run these inside WSL2 or any Linux. The C++ tree is not wired for Windows, and
-later milestones need `recvmmsg`, `SO_REUSEPORT` and core pinning, which only
-behave correctly there.
+**Start the handler before the engine.** A handler that joins mid-stream cannot
+rebuild the orders that rested before it arrived, and it says so rather than
+pretending otherwise — recovering from a late join is what the snapshot cycle in
+milestone 4 is for. [docs/RUNNING.md](docs/RUNNING.md) has the detail, including
+what to try when a multicast group join succeeds but nothing arrives.
 
 ### What it will run
 
-Not runnable yet. This is the shape it is aiming for — the same commands the [case study](https://www.shivamsfolio.com/projects/low-latency-market-data-order-entry) publishes:
+Steps 2 and 3 work today. Step 1 brings up the containerised stack rather than
+infrastructure the host binaries attach to — see the note in
+[docs/RUNNING.md](docs/RUNNING.md#containerised) — and step 4 needs the recovery
+path from milestones 4 and 5. These are the commands the [case study](https://www.shivamsfolio.com/projects/low-latency-market-data-order-entry) publishes:
 
 **1. Bring up the transport.** Start the containerised multicast network and the replay service before either side of the stack connects to it.
 
@@ -195,13 +205,15 @@ LICENSE
 Makefile — build, test, smoke, bench, fmt targets across both toolchains
 Cargo.toml — virtual workspace manifest
 rust-toolchain.toml, .cargo/config.toml — pinned toolchain and RUSTFLAGS
-crates/wire/ — schema-generated SBE-style codec, frame header, golden-vector tests
-crates/book/ — MBP (tick-indexed array) and MBO (slab + open-addressed map + intrusive lists)
-crates/alloc-guard/ — counting #[global_allocator] and the zero-allocation assertions
+crates/wire/ — schema-generated SBE-style codec, frame header, golden-vector tests          [M1]
+crates/book/ — reference book, digest, and the shared apply path                            [M2]
+             — MBP (tick-indexed array) and MBO (slab + open-addressed map + intrusive lists) land in M5
+crates/alloc-guard/ — counting #[global_allocator] and the zero-allocation assertions        [M5]
+crates/transport/ — multicast and unicast-fanout backends, one send path                     [M2]
+crates/mdconfig/ — the configuration file both binaries read                                 [M2]
 crates/matching-engine/ — bin name MUST be `matching-engine`; price-time priority, A/B publisher, loss injection, snapshot cycle
 crates/feed-handler/ — bin name MUST be `feed-handler`; arbitration, gap detection, recovery, --verify-allocations
-crates/replay-service/ — TCP range replay
-crates/transport/ — multicast and unicast-fanout backends behind one trait
+crates/replay-service/ — TCP range replay                                                    [M4]
 cpp/CMakeLists.txt
 cpp/wire/ — generated headers, shared with the Rust codec via the same schema
 cpp/gateway/ — FIX 4.4 session and application layer, sequence persistence
@@ -213,8 +225,8 @@ configs/local.toml — the config the advertised command names; channels, symbol
 docker-compose.yml
 docker/ — Dockerfiles and the user-defined bridge network definition
 bench/ — Criterion benches, load profiles, REPORT.md
-docs/ — ARCHITECTURE.md, PROTOCOL.md, BENCHMARK.md, RECOVERY.md, CLAIMS.md (each public claim mapped to the test that proves it)
-scripts/ — smoke.sh, bench.sh, kill-restart-test.sh, calibrate-tsc.sh
+docs/ — WIRE.md and RUNNING.md exist; ARCHITECTURE.md, PROTOCOL.md, BENCHMARK.md, RECOVERY.md follow their milestones
+scripts/ — smoke.sh and verify-golden-corruption.sh exist; bench.sh, kill-restart-test.sh, calibrate-tsc.sh follow
 tests/ — cross-process integration and FIX session conformance suites
 .github/workflows/ci.yml — both toolchains, correctness and allocation suites only, never latency
 ```
