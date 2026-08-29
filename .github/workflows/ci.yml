@@ -1,0 +1,91 @@
+name: CI
+
+# Correctness only. Latency and throughput benchmarks are deliberately absent
+# and will stay absent: a shared GitHub runner is a noisy, oversubscribed,
+# virtualised host, and numbers measured there would be wrong rather than merely
+# imprecise. Publishing them would discredit the honest ones. See CLAIMS.md.
+
+on:
+  push:
+    branches: [main]
+    tags: ["m*", "v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The committed build config sets target-cpu=native, which is right for a
+  # measured run on a known host and wrong for a CI runner whose CPU varies.
+  RUSTFLAGS: ""
+
+jobs:
+  generated-is-current:
+    name: Generated files match the schema
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # rustfmt formats the generated Rust, so the check needs it present.
+          components: rustfmt
+      - name: Regenerate and diff
+        run: make check-generated
+      - name: Show what drifted
+        if: failure()
+        run: |
+          echo "::error::A generated file does not match schema/market-data.xml."
+          echo "Run 'make generate' locally and commit the result."
+          make generate
+          git --no-pager diff --stat
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  cpp:
+    name: C++
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both compilers, because struct layout and integer-promotion warnings
+        # are exactly where the two toolchains quietly disagree.
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake -S cpp -B cpp/build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build cpp/build
+      - name: Test
+        run: ctest --test-dir cpp/build --output-on-failure
+
+  cross-language:
+    name: Both codecs agree, and a corrupt vector fails both
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build the C++ golden test
+        run: |
+          cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build cpp/build
+      - name: A one-byte edit must fail both suites
+        run: make test-corruption

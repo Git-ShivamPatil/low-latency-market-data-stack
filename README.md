@@ -5,7 +5,7 @@
 **Price-time-priority matching engine publishing a binary feed over redundant A/B UDP multicast, with a Rust feed handler that arbitrates the two and rebuilds MBP/MBO books without allocating.**
 
 ![status](https://img.shields.io/badge/status-in%20development-22D3EE?style=for-the-badge)
-![progress](https://img.shields.io/badge/milestones-0%20of%209-334155?style=for-the-badge)
+![progress](https://img.shields.io/badge/milestones-1%20of%209-334155?style=for-the-badge)
 ![licence](https://img.shields.io/badge/licence-MIT-3b82f6?style=for-the-badge)
 
 ![](https://img.shields.io/badge/Rust-1.98-CE422B?logo=rust&logoColor=white) ![](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white) ![](https://img.shields.io/badge/FIX-4.4-334155) 
@@ -17,7 +17,7 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 0 of 9 milestones complete.**
+> **This is a build in progress — 1 of 9 milestones complete.**
 >
 > The target figure below (`1M+ msg/s · ~100ns decode`) is a **goal, not a measurement.** Nothing here has been benchmarked yet.
 > Every number this project eventually publishes will land in [CLAIMS.md](CLAIMS.md) first, with the commit it was measured at,
@@ -75,11 +75,12 @@ flowchart LR
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[░░░░░░░░░░░░░░░░░░░░░░░░] 0/9 milestones · 0%
+[███░░░░░░░░░░░░░░░░░░░░░] 1/9 milestones · 11%
 ```
 
-- [ ] **M1 · Workspace, wire schema, and cross-language codegen**  
-  One schema file is the single source of truth for the binary message layout, and the Rust codec and the C++ header agree on it byte for byte.
+- [x] **M1 · Workspace, wire schema, and cross-language codegen**  
+  One schema file is the single source of truth for the binary message layout, and the Rust codec and the C++ header agree on it byte for byte.  
+  <sub>Verified: `cargo test --workspace` (20 tests) and `ctest --test-dir cpp/build` (2 suites) decode the same 11 `schema/golden/*.bin` files, assert the same field values, and re-encode them byte for byte. `scripts/verify-golden-corruption.sh` proves a one-byte edit fails both. See [docs/WIRE.md](docs/WIRE.md).</sub>
 - [ ] **M2 · Matching engine publishing a live binary feed, end to end**  
   The two advertised commands run and a handler prints a book built from real UDP datagrams — the whole pipeline exists, badly, before anything is made fast.
 - [ ] **M3 · A/B redundancy, loss injection, arbitration and gap detection**  
@@ -140,6 +141,24 @@ THE CAVEATS THAT MUST BE STATED PLAINLY: single host; multicast over Docker brid
 - GitHub Actions (Linux runners, both toolchains)
 
 ## How it will be run
+
+### What runs today
+
+Milestone 1 built the wire format, not the stack. There are no binaries yet — the
+four commands below arrive in milestones 2 and 4. What exists now is the encoding
+everything else will be built on, and it is fully tested:
+
+```bash
+make generate    # regenerate the Rust codec and C++ header from schema/market-data.xml
+make test        # both toolchains against the same golden vectors, plus the corruption check
+make lint        # rustfmt and clippy, both as errors
+```
+
+Run these inside WSL2 or any Linux. The C++ tree is not wired for Windows, and
+later milestones need `recvmmsg`, `SO_REUSEPORT` and core pinning, which only
+behave correctly there.
+
+### What it will run
 
 Not runnable yet. This is the shape it is aiming for — the same commands the [case study](https://www.shivamsfolio.com/projects/low-latency-market-data-order-entry) publishes:
 

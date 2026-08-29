@@ -1,0 +1,6 @@
+# target-cpu=native is deliberate and it is a caveat, not a default: every
+# number this project publishes is measured on a binary compiled for the host
+# it ran on. Any report that omits that is misleading. Override with
+# RUSTFLAGS= for a portable build.
+[build]
+rustflags = ["-C", "target-cpu=native"]

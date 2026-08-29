@@ -1,0 +1,5 @@
+# LF everywhere. Scripts run inside WSL2 and CMake/CI are Linux-only; a CRLF
+# shell script fails with an unreadable "bad interpreter" error.
+* text=auto eol=lf
+*.bin binary
+*.png binary

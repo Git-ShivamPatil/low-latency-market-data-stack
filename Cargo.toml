@@ -1,0 +1,41 @@
+# Virtual workspace. Binaries land in later milestones; M1 is the wire format
+# and the two placeholder crates the books and the allocation proof will fill.
+[workspace]
+resolver = "2"
+members = [
+    "crates/wire",
+    "crates/book",
+    "crates/alloc-guard",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/Git-ShivamPatil/low-latency-market-data-stack"
+authors = ["Shivam Patil"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# The hot path is the point of this project, so the lints that catch silent
+# allocation and silent copying are errors rather than suggestions.
+all = { level = "deny", priority = -1 }
+
+# Benchmarks are meaningless without optimisation, and so is the release
+# profile that the advertised commands use.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+# `cargo bench` and profiling want symbols with the same codegen as release.
+# Cargo ignores `panic` for bench and test profiles, so it is not repeated here.
+[profile.bench]
+inherits = "release"
+debug = true

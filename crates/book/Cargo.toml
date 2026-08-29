@@ -1,0 +1,15 @@
+[package]
+name = "book"
+description = "MBP and MBO order-book views (milestone 5)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+wire = { path = "../wire" }

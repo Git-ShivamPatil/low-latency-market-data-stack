@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The single source of truth for the wire layout of this stack.
+
+  Everything on the wire is generated from this file: the Rust codec
+  (crates/wire/src/generated.rs), the C++ header (cpp/wire/include/wire/generated.hpp)
+  and the golden byte vectors (schema/golden/*.bin). Nothing hand-writes a field
+  offset anywhere else in the repo. Run `make codegen` after editing this file;
+  CI fails if the committed generated files do not match what this schema produces.
+
+  Encoding is SBE-flavoured rather than SBE-conformant: fixed little-endian blocks,
+  an 8-byte message header, and one repeating group. See docs/WIRE.md for the exact
+  byte layouts and for what is deliberately not implemented.
+
+  Two framing layers:
+
+    datagram := packetHeader , message*
+    message  := messageHeader , rootBlock , group?
+
+  A message carries no sequence number of its own. The sequence of message i in a
+  datagram is packetHeader.firstSequence + i. That is what makes batching cheap:
+  at 16-32 messages per datagram the per-message framing cost is 8 bytes and the
+  clock is read once per datagram rather than once per message.
+-->
+<messageSchema package="mdstack.wire"
+               id="1"
+               version="1"
+               semanticVersion="1.0.0"
+               byteOrder="littleEndian"
+               description="Market data feed for the low-latency market data and order entry stack">
+
+  <types>
+    <!-- Prices are fixed-point integers. A price field holds the value scaled by
+         10^-priceExponent, so 101.2500 is encoded as 1012500. There is no
+         floating point anywhere on the wire. -->
+    <constant name="priceExponent" value="-4"/>
+
+    <!-- Per-datagram header. Written once per datagram, ahead of the messages. -->
+    <composite name="packetHeader" description="Per-datagram framing">
+      <field name="schemaId"        type="uint16" offset="0"  description="Must equal the schema id; a mismatch is a hard reject"/>
+      <field name="version"         type="uint16" offset="2"  description="Schema version the publisher encoded with"/>
+      <field name="messageCount"    type="uint16" offset="4"  description="Number of messages packed into this datagram"/>
+      <field name="channel"         type="uint8"  offset="6"  description="0 = feed A, 1 = feed B; diagnostic only, arbitration keys on sequence"/>
+      <field name="flags"           type="uint8"  offset="7"  description="bit0 = this datagram is part of a snapshot cycle"/>
+      <field name="firstSequence"   type="uint64" offset="8"  description="Sequence of the first message; message i is firstSequence + i"/>
+      <field name="sendTimestampNs" type="uint64" offset="16" description="Publisher clock at send, nanoseconds since the Unix epoch"/>
+    </composite>
+
+    <!-- Per-message header. Standard SBE shape: blockLength, templateId, schemaId, version. -->
+    <composite name="messageHeader" description="Per-message framing">
+      <field name="blockLength" type="uint16" offset="0" description="Bytes of root block following this header, excluding any group"/>
+      <field name="templateId"  type="uint16" offset="2" description="Which message this is"/>
+      <field name="schemaId"    type="uint16" offset="4"/>
+      <field name="version"     type="uint16" offset="6"/>
+    </composite>
+
+    <!-- Repeating-group header. -->
+    <composite name="groupSizeEncoding" description="Repeating-group framing">
+      <field name="blockLength" type="uint16" offset="0" description="Bytes per group entry"/>
+      <field name="numInGroup"  type="uint16" offset="2" description="Number of entries"/>
+    </composite>
+
+    <enum name="Side" encodingType="uint8">
+      <validValue name="Bid">0</validValue>
+      <validValue name="Ask">1</validValue>
+    </enum>
+
+    <enum name="ModifyReason" encodingType="uint8">
+      <!-- Reduce keeps the place in the price-time queue; Replace loses it.
+           The book code depends on this distinction, so it is on the wire rather
+           than inferred from whether the quantity went down. -->
+      <validValue name="Reduce">0</validValue>
+      <validValue name="Replace">1</validValue>
+    </enum>
+  </types>
+
+  <message name="AddOrder" id="1" blockLength="24"
+           description="A new order rests on the book">
+    <field name="orderId"  id="1" type="uint64" offset="0"/>
+    <field name="price"    id="2" type="int64"  offset="8"  semanticType="Price"/>
+    <field name="quantity" id="3" type="uint32" offset="16"/>
+    <field name="symbolId" id="4" type="uint16" offset="20"/>
+    <field name="side"     id="5" type="Side"   offset="22"/>
+    <field name="reserved" id="6" type="uint8"  offset="23"/>
+  </message>
+
+  <message name="ModifyOrder" id="2" blockLength="24"
+           description="A resting order changes price or quantity">
+    <field name="orderId"     id="1" type="uint64"       offset="0"/>
+    <field name="newPrice"    id="2" type="int64"        offset="8"  semanticType="Price"/>
+    <field name="newQuantity" id="3" type="uint32"       offset="16"/>
+    <field name="symbolId"    id="4" type="uint16"       offset="20"/>
+    <field name="side"        id="5" type="Side"         offset="22"/>
+    <field name="reason"      id="6" type="ModifyReason" offset="23"/>
+  </message>
+
+  <message name="DeleteOrder" id="3" blockLength="12"
+           description="A resting order leaves the book">
+    <field name="orderId"  id="1" type="uint64" offset="0"/>
+    <field name="symbolId" id="2" type="uint16" offset="8"/>
+    <field name="side"     id="3" type="Side"   offset="10"/>
+    <field name="reserved" id="4" type="uint8"  offset="11"/>
+  </message>
+
+  <message name="Trade" id="4" blockLength="40"
+           description="An aggressing order crossed with a resting order">
+    <field name="tradeId"          id="1" type="uint64" offset="0"/>
+    <field name="aggressorOrderId" id="2" type="uint64" offset="8"/>
+    <field name="restingOrderId"   id="3" type="uint64" offset="16"/>
+    <field name="price"            id="4" type="int64"  offset="24" semanticType="Price"/>
+    <field name="quantity"         id="5" type="uint32" offset="32"/>
+    <field name="symbolId"         id="6" type="uint16" offset="36"/>
+    <field name="aggressorSide"    id="7" type="Side"   offset="38"/>
+    <field name="reserved"         id="8" type="uint8"  offset="39"/>
+  </message>
+
+  <message name="Snapshot" id="5" blockLength="12"
+           description="Full book state for one symbol, consistent as of lastSequence">
+    <field name="lastSequence" id="1" type="uint64" offset="0" description="The snapshot reflects every message up to and including this sequence"/>
+    <field name="symbolId"     id="2" type="uint16" offset="8"/>
+    <field name="flags"        id="3" type="uint8"  offset="10" description="bit0 = last fragment for this symbol in this cycle"/>
+    <field name="reserved"     id="4" type="uint8"  offset="11"/>
+    <group name="levels" id="10" blockLength="16" description="Aggregated price levels, best first within each side">
+      <field name="price"      id="1" type="int64"  offset="0" semanticType="Price"/>
+      <field name="quantity"   id="2" type="uint32" offset="8"/>
+      <field name="orderCount" id="3" type="uint16" offset="12"/>
+      <field name="side"       id="4" type="Side"   offset="14"/>
+      <field name="reserved"   id="5" type="uint8"  offset="15"/>
+    </group>
+  </message>
+
+  <message name="Heartbeat" id="6" blockLength="8"
+           description="Published on an idle channel so a handler can tell quiet from dead">
+    <field name="lastSequence" id="1" type="uint64" offset="0" description="Highest sequence published so far on this channel"/>
+  </message>
+
+  <message name="SequenceReset" id="7" blockLength="8"
+           description="The publisher restarts its sequence; the handler must resynchronise">
+    <field name="newSequence" id="1" type="uint64" offset="0" description="The sequence the next message will carry"/>
+  </message>
+
+</messageSchema>

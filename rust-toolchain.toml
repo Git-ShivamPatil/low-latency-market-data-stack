@@ -1,0 +1,6 @@
+# Pinned so that generated code, rustfmt output and CI all agree. The codegen
+# check in CI diffs rustfmt output, which drifts between toolchain versions.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
