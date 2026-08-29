@@ -35,6 +35,41 @@ is dead and the feed is running unprotected; the handler says so explicitly.
 
 Add `--show-book` to print the top of each book on exit.
 
+### Choosing a book
+
+`--books fast` (the default) rebuilds into the tick-indexed, slab-allocated book.
+`--books reference` uses the obviously-correct `BTreeMap` one instead. Both are
+tested and both reconcile with the engine; the reference book is kept as the
+oracle the fast one is differentially tested against, and it is the thing to
+switch to first if a book ever looks wrong. If a failure reproduces with
+`--books reference`, it is not the fast book.
+
+`scripts/smoke.sh --books reference` does the same for the whole scenario set.
+
+### Counting allocations
+
+```
+--verify-allocations
+```
+
+Counts heap operations in the receive loop after a 50,000-message warm-up and
+prints the total on exit; with `--summary-path` it also writes
+`allocations=`, `deallocations=`, `reallocations=` and `alloc_passes=`.
+
+It **reports**; it does not fail the run. The assertion is
+`crates/feed-handler/tests/allocation.rs`, which runs in CI — a claim that
+depends on somebody remembering to pass a flag is not a claim. The flag is for
+looking at a specific run, and for the smoke test to assert against.
+
+Expect `0` with `--books fast` and a large number with `--books reference`. Both
+are correct: the reference book is a `BTreeMap` of `VecDeque` and allocates per
+level. If it ever reports zero, the counter is broken. See
+[BOOKS.md](BOOKS.md#the-allocation-claim) for exactly what the count covers.
+
+The warm-up is not a fudge. The first datagrams through a fresh process
+legitimately allocate — a book for a symbol it has not seen, the digest log's
+buffer — and that is startup, which the claim explicitly excludes.
+
 ### If the handler joins but receives nothing
 
 That is the known multicast failure, and it is an infrastructure problem rather
@@ -193,5 +228,10 @@ network. The advertised figure has to be measured receiver-side as
 reported with p99 and p99.9 alongside the median, and reproduced three times
 within 10%. That is milestone 6, on rented hardware.
 
-See [CLAIMS.md](../CLAIMS.md) for what has actually been measured. As of
-milestone 4: nothing.
+The one number this project does publish is a **count**, not a rate: zero heap
+operations per message in steady state. A count does not depend on the host, so
+it can be asserted honestly from this laptop. See
+[BOOKS.md](BOOKS.md#the-allocation-claim).
+
+See [CLAIMS.md](../CLAIMS.md) for the ledger. As of milestone 5, no *performance*
+figure has been measured.

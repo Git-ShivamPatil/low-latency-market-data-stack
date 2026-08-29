@@ -24,6 +24,21 @@ pub enum BookError {
     ReduceWouldIncrease { order_id: u64, from: u32, to: u32 },
     /// A resting order was left with zero quantity. Removal is a `DeleteOrder`.
     ZeroQuantity(u64),
+
+    // The three below are capacity limits. The reference book cannot produce
+    // them — it grows — but they live here rather than in a second error type so
+    // that the two books remain substitutable: one `apply_message`, one handler,
+    // one error path to log, and a differential test that compares like with
+    // like. A fast book that reported failures through a channel the reference
+    // book does not have would need its own everything.
+    /// More simultaneously resting orders than the slab was sized for.
+    SlabFull { order_id: u64, capacity: usize },
+    /// A price outside the window that could not be rebased onto without
+    /// pushing an occupied level out of range.
+    PriceOutOfRange { order_id: u64, price: i64 },
+    /// A price that is not a multiple of the tick size. Rounding it would rest
+    /// the order at a price nobody quoted.
+    PriceOffGrid { order_id: u64, price: i64 },
 }
 
 impl std::fmt::Display for BookError {
@@ -36,6 +51,18 @@ impl std::fmt::Display for BookError {
                 "order {order_id}: reduce from {from} to {to} would increase quantity"
             ),
             Self::ZeroQuantity(id) => write!(f, "order {id} would be left with zero quantity"),
+            Self::SlabFull { order_id, capacity } => write!(
+                f,
+                "order {order_id}: the order slab is full at {capacity} orders"
+            ),
+            Self::PriceOutOfRange { order_id, price } => write!(
+                f,
+                "order {order_id}: price {price} is outside the book window and rebasing \
+                 onto it would lose a live level"
+            ),
+            Self::PriceOffGrid { order_id, price } => {
+                write!(f, "order {order_id}: price {price} is not on the tick grid")
+            }
         }
     }
 }
@@ -381,6 +408,168 @@ impl Books {
                 .map_err(|e| format!("symbol {symbol}: {e}"))?;
         }
         Ok(())
+    }
+}
+
+impl ReferenceBook {
+    fn emit_level(&self, price: i64, queue: &VecDeque<u64>, f: &mut dyn FnMut(Level)) {
+        let quantity: u64 = queue
+            .iter()
+            .filter_map(|id| self.orders.get(id))
+            .map(|o| u64::from(o.quantity))
+            .sum();
+        f(Level {
+            price,
+            quantity,
+            order_count: u32::try_from(queue.len()).unwrap_or(u32::MAX),
+        });
+    }
+}
+
+impl crate::view::OrderBook for ReferenceBook {
+    fn add(
+        &mut self,
+        order_id: u64,
+        side: Side,
+        price: i64,
+        quantity: u32,
+    ) -> Result<(), BookError> {
+        ReferenceBook::add(self, order_id, side, price, quantity)
+    }
+
+    fn delete(&mut self, order_id: u64) -> Result<RestingOrder, BookError> {
+        ReferenceBook::delete(self, order_id)
+    }
+
+    fn reduce(&mut self, order_id: u64, new_quantity: u32) -> Result<(), BookError> {
+        ReferenceBook::reduce(self, order_id, new_quantity)
+    }
+
+    fn replace(
+        &mut self,
+        order_id: u64,
+        new_price: i64,
+        new_quantity: u32,
+    ) -> Result<(), BookError> {
+        ReferenceBook::replace(self, order_id, new_price, new_quantity)
+    }
+
+    fn get(&self, order_id: u64) -> Option<RestingOrder> {
+        ReferenceBook::get(self, order_id).copied()
+    }
+
+    fn len(&self) -> usize {
+        ReferenceBook::len(self)
+    }
+
+    fn level_count(&self, side: Side, depth: usize) -> usize {
+        let n = self.side(side).len();
+        if depth == 0 {
+            n
+        } else {
+            n.min(depth)
+        }
+    }
+
+    fn for_each_level(&self, side: Side, depth: usize, f: &mut dyn FnMut(Level)) {
+        // The two directions have different iterator types, so this is written
+        // out twice rather than boxed. The reference book is not on the
+        // allocation-free path, but the digest that calls this is shared with
+        // the book that is, and a `Box<dyn Iterator>` here would be a trap
+        // waiting for whoever moves the call.
+        let levels = self.side(side);
+        let mut seen = 0usize;
+        match side {
+            Side::Bid => {
+                for (price, queue) in levels.iter().rev() {
+                    if depth != 0 && seen == depth {
+                        return;
+                    }
+                    seen += 1;
+                    self.emit_level(*price, queue, f);
+                }
+            }
+            Side::Ask => {
+                for (price, queue) in levels.iter() {
+                    if depth != 0 && seen == depth {
+                        return;
+                    }
+                    seen += 1;
+                    self.emit_level(*price, queue, f);
+                }
+            }
+        }
+    }
+
+    fn for_each_order(&self, side: Side, f: &mut dyn FnMut(RestingOrder) -> bool) {
+        let levels = self.side(side);
+        match side {
+            Side::Bid => {
+                for (_price, queue) in levels.iter().rev() {
+                    for id in queue {
+                        if let Some(order) = self.orders.get(id) {
+                            if !f(*order) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Side::Ask => {
+                for queue in levels.values() {
+                    for id in queue {
+                        if let Some(order) = self.orders.get(id) {
+                            if !f(*order) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        ReferenceBook::clear(self);
+    }
+
+    fn check_invariants(&self) -> Result<(), String> {
+        ReferenceBook::check_invariants(self)
+    }
+}
+
+impl crate::view::BookSet for Books {
+    type Book = ReferenceBook;
+
+    fn get_or_create(&mut self, symbol_id: u16) -> &mut ReferenceBook {
+        Books::get_or_create(self, symbol_id)
+    }
+
+    fn get(&self, symbol_id: u16) -> Option<&ReferenceBook> {
+        Books::get(self, symbol_id)
+    }
+
+    fn for_each_symbol(&self, f: &mut dyn FnMut(u16, &ReferenceBook)) {
+        // `BTreeMap`, so this is symbol-id order for free.
+        for (symbol_id, book) in &self.books {
+            f(*symbol_id, book);
+        }
+    }
+
+    fn clear_all(&mut self) {
+        Books::clear_all(self);
+    }
+
+    fn clear_symbol(&mut self, symbol_id: u16) {
+        Books::clear_symbol(self, symbol_id);
+    }
+
+    fn total_orders(&self) -> usize {
+        Books::total_orders(self)
+    }
+
+    fn check_invariants(&self) -> Result<(), String> {
+        Books::check_invariants(self)
     }
 }
 

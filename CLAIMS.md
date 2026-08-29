@@ -14,7 +14,7 @@ Every number published about this project — in [its README](README.md), on the
 
 | Metric | Value | Report | Commit | Date | Host | Caveat |
 |--------|-------|--------|--------|------|------|--------|
-| _none yet_ | | | | | | |
+| Heap operations per message, steady state | **0** allocations, 0 deallocations, 0 reallocations | `crates/feed-handler/tests/allocation.rs`; `scripts/smoke.sh` books scenario | _this commit_ | 2026-08-30 | any — it is a count, not a rate | A **count**, not a performance figure, and the only kind of number this project can honestly publish before it has a benchmark host. Scope is per-message steady state after a 50,000-message warm-up: startup sizing and the publisher are outside it, deliberately. See [docs/BOOKS.md](docs/BOOKS.md#the-allocation-claim). |
 
 ## Caveats already locked in
 
@@ -26,6 +26,8 @@ reconstructing them at benchmark time, is the point of this file.
 |-------|----------|------------------------------|
 | M1 · 2026-08-29 | **Messages are batched behind one packet header, and a message carries no sequence number of its own** — sequence is `firstSequence + i`. See [docs/WIRE.md](docs/WIRE.md#framing). | `1M+ msg/s` is only reachable with many messages per datagram: a kernel UDP receive path tops out around 300–600K pps per core, so one message per packet would need kernel bypass. Batching is standard on real exchange feeds, but **the batch factor has to be published with any throughput figure** — a reader who assumes one message per packet is reading a much stronger claim than the one this project makes. |
 | M1 · 2026-08-29 | `.cargo/config.toml` sets `-C target-cpu=native`. | Every number this project produces will come from a binary compiled for the exact host it ran on. That must be stated, not implied. |
+| M5 · 2026-08-30 | **The fast book refuses an order rather than growing**: a price outside its window that cannot be rebased onto, or more resting orders than its slab holds, is an error, not a resize. Sizing comes from `handler.book_levels` and `handler.book_orders`. | Any throughput or latency figure is only valid for a run that stayed inside those bounds. A benchmark that quietly widened the window to finish would be measuring a different program, so the sizing has to be published with the number. |
+| M5 · 2026-08-30 | **The counting allocator is compiled into the handler unconditionally**, not switched on by `--verify-allocations`. | Every future measurement includes one thread-local increment per allocation. In steady state there are none, so the cost is zero where it matters — but it is in the binary being measured, and that is the point: a flag that swapped the allocator would benchmark a different program. |
 | M1 · 2026-08-29 | CI runs correctness suites only; benchmarks are excluded by design. | Shared GitHub runners are noisy, oversubscribed and virtualised. Numbers from there would be wrong rather than imprecise, and would discredit the honest ones. |
 
 **Where the numbers will have to be measured.** The development host is a 2-core

@@ -54,7 +54,15 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Release, because the redundancy tests push 10M messages through the
       # arbitrator twice and a debug build turns seconds into minutes.
+      #
+      # BOOK_DIFF_OPS raises the differential test from its `cargo test` default
+      # of 300k. Five million operations through both books takes about fifteen
+      # seconds optimised, and it is the strongest evidence in this repo that the
+      # fast book is correct: the bug it has already caught took 118,000
+      # operations to appear.
       - run: cargo test --workspace --release
+        env:
+          BOOK_DIFF_OPS: 5000000
       - run: cargo test --workspace
 
   cpp:

@@ -16,7 +16,8 @@
 
 use wire::{Message, ModifyReason, WireError};
 
-use crate::reference::{BookError, Books};
+use crate::reference::BookError;
+use crate::view::{BookSet, OrderBook};
 
 /// Why a message could not be applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +66,7 @@ impl From<WireError> for ApplyError {
 /// (partial fill, reason `Reduce`) or `DeleteOrder` (full fill). Applying both
 /// would double-count the fill, which is the single easiest way to build a book
 /// that is subtly wrong and still looks plausible.
-pub fn apply_message(books: &mut Books, msg: &Message<'_>) -> Result<(), ApplyError> {
+pub fn apply_message<B: BookSet>(books: &mut B, msg: &Message<'_>) -> Result<(), ApplyError> {
     match msg {
         Message::AddOrder(d) => {
             let symbol_id = d.symbol_id();
@@ -115,13 +116,16 @@ pub fn apply_message(books: &mut Books, msg: &Message<'_>) -> Result<(), ApplyEr
 /// price-time priority exactly — the thing an aggregated snapshot fundamentally
 /// cannot do, because "three orders totalling 250" does not say which of them is
 /// at the front of the queue.
-pub fn apply_snapshot(books: &mut Books, d: &wire::SnapshotDecoder<'_>) -> Result<(), ApplyError> {
+pub fn apply_snapshot<B: BookSet>(
+    books: &mut B,
+    d: &wire::SnapshotDecoder<'_>,
+) -> Result<(), ApplyError> {
     books.clear_symbol(d.symbol_id());
     apply_snapshot_orders(books, d)
 }
 
-fn apply_snapshot_orders(
-    books: &mut Books,
+fn apply_snapshot_orders<B: BookSet>(
+    books: &mut B,
     d: &wire::SnapshotDecoder<'_>,
 ) -> Result<(), ApplyError> {
     let symbol_id = d.symbol_id();
@@ -143,6 +147,7 @@ fn apply_snapshot_orders(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reference::Books;
     use wire::{PacketReader, PacketWriter, Side};
 
     /// Builds a datagram, decodes it, and applies every message — the same path

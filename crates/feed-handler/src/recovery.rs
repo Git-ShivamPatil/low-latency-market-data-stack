@@ -354,6 +354,39 @@ impl RecoveryBuffer {
             .min()
     }
 
+    /// The first hole in the held traffic, scanning from `from`.
+    ///
+    /// # Why the held buffer can have a hole in it at all
+    ///
+    /// Held datagrams are contiguous only if nothing was lost while the recovery
+    /// was in flight. If a gap is declared *during* a recovery, the arbitrator
+    /// advances its frontier past the missing range and the next datagram it
+    /// hands over simply starts later. Nothing in the buffer marks the jump: it
+    /// is a sequence of whole datagrams, and one that begins five hundred
+    /// sequences after the last one looks exactly like one that begins at the
+    /// next.
+    ///
+    /// Replaying that buffer fills the original hole, leaves the new one, and
+    /// reports success. The book is then permanently wrong, and the first
+    /// evidence is "order N is not on the book" a few hundred messages later —
+    /// far enough from the cause to be blamed on almost anything.
+    ///
+    /// Checking [`first_held_sequence`](Self::first_held_sequence) against the
+    /// recovered range catches this only when the jump is at the very front of
+    /// the buffer. This catches it anywhere.
+    pub fn held_discontinuity(&self, from: u64) -> Option<(u64, u64)> {
+        // Insertion order is sequence order: the arbitrator only ever releases
+        // datagrams in order, and `hold` appends.
+        let mut expected = from;
+        for slot in self.held.iter().take(self.occupied) {
+            if slot.first_sequence > expected {
+                return Some((expected, slot.first_sequence - 1));
+            }
+            expected = expected.max(slot.first_sequence + u64::from(slot.count));
+        }
+        None
+    }
+
     /// Keeps the recovery open with a new starting point.
     ///
     /// A replay covers the range that was asked for, which was fixed when the
@@ -363,6 +396,50 @@ impl RecoveryBuffer {
     /// remaining hole named, so the next request or the next snapshot closes it.
     pub fn reopen(&mut self, gap_from: u64) {
         self.state = Recovery::AwaitingSnapshot { gap_from };
+    }
+
+    /// Applies the held traffic that is contiguous from `from`, discards it, and
+    /// returns the sequence the book is now complete through, exclusive.
+    ///
+    /// Called when a recovery answer comes back and the traffic held behind it
+    /// turns out to have a hole of its own. The part *before* that hole is
+    /// perfectly good and has to be applied and dropped here, because leaving it
+    /// in the buffer loses it: the next adoption sets the reconcile point to the
+    /// far side of the new hole, and [`replay`](Self::replay) then skips every
+    /// slot ending below it as "already covered by the snapshot". That is how
+    /// one hole silently becomes two.
+    ///
+    /// The callback takes the same `(skip_below, bytes)` pair as `replay`, so a
+    /// datagram straddling `from` is applied without double-applying its head.
+    pub fn drain_contiguous(&mut self, from: u64, mut f: impl FnMut(u64, &[u8])) -> u64 {
+        let mut expected = from;
+        let mut drained = 0usize;
+        for i in 0..self.occupied {
+            let (first, count, len) = {
+                let slot = &self.held[i];
+                (slot.first_sequence, u64::from(slot.count), slot.len)
+            };
+            if first > expected {
+                // The hole starts here. Everything from this slot on stays.
+                break;
+            }
+            if first + count > expected {
+                f(expected, &self.held[i].buf[..len]);
+                self.stats.messages_replayed += first + count - expected;
+                expected = first + count;
+            } else {
+                // Wholly below the frontier: already in the book.
+                self.stats.messages_skipped += count;
+            }
+            drained = i + 1;
+        }
+        if drained > 0 {
+            // Rotating moves the slot structs, which own their buffers by
+            // pointer. Nothing is copied.
+            self.held[..self.occupied].rotate_left(drained);
+            self.occupied -= drained;
+        }
+        expected
     }
 
     pub fn capacity(&self) -> usize {
@@ -376,6 +453,119 @@ mod tests {
 
     fn buffer() -> RecoveryBuffer {
         RecoveryBuffer::new(8, 256, Duration::from_millis(500))
+    }
+
+    #[test]
+    fn contiguous_held_traffic_has_no_discontinuity() {
+        let mut b = buffer();
+        b.begin(100, Instant::now());
+        b.hold(110, 4, &[0u8; 32]).unwrap();
+        b.hold(114, 4, &[0u8; 32]).unwrap();
+        b.hold(118, 4, &[0u8; 32]).unwrap();
+        assert_eq!(b.held_discontinuity(110), None);
+        // Nor when the caller resumes from inside the first datagram.
+        assert_eq!(b.held_discontinuity(112), None);
+    }
+
+    #[test]
+    fn a_hole_in_the_middle_of_the_held_traffic_is_found() {
+        // The case that mattered. Checking only the first held sequence sees
+        // 110 == 110 and reports everything fine, while 118..=121 is missing.
+        let mut b = buffer();
+        b.begin(100, Instant::now());
+        b.hold(110, 4, &[0u8; 32]).unwrap();
+        b.hold(114, 4, &[0u8; 32]).unwrap();
+        b.hold(122, 4, &[0u8; 32]).unwrap();
+        assert_eq!(b.first_held_sequence(), Some(110));
+        assert_eq!(
+            b.held_discontinuity(110),
+            Some((118, 121)),
+            "a gap declared mid-recovery leaves a hole nothing else reports"
+        );
+    }
+
+    #[test]
+    fn a_hole_at_the_front_of_the_held_traffic_is_found() {
+        let mut b = buffer();
+        b.begin(100, Instant::now());
+        b.hold(120, 4, &[0u8; 32]).unwrap();
+        assert_eq!(b.held_discontinuity(110), Some((110, 119)));
+    }
+
+    #[test]
+    fn draining_applies_everything_up_to_the_hole_and_keeps_the_rest() {
+        // What stops one hole becoming two: the held traffic before the hole is
+        // applied and dropped, because the next adoption would otherwise skip it
+        // as already covered.
+        let mut b = buffer();
+        b.begin(100, Instant::now());
+        b.hold(110, 4, &[1u8; 32]).unwrap();
+        b.hold(114, 4, &[2u8; 32]).unwrap();
+        b.hold(122, 4, &[3u8; 32]).unwrap();
+
+        let mut applied = Vec::new();
+        let through = b.drain_contiguous(110, |skip_below, bytes| {
+            applied.push((skip_below, bytes[0]));
+        });
+
+        assert_eq!(through, 118, "the book is complete through 117");
+        assert_eq!(
+            applied,
+            vec![(110, 1u8), (114, 2u8)],
+            "both datagrams before the hole, and neither after it"
+        );
+        assert_eq!(
+            b.first_held_sequence(),
+            Some(122),
+            "the drained slots are gone and the buffer now starts at the hole"
+        );
+        assert_eq!(b.held_discontinuity(122), None);
+    }
+
+    #[test]
+    fn draining_skips_what_the_recovery_already_covered() {
+        // A datagram wholly below the resume point is in the book already;
+        // applying it again is the double-apply that milestone 4 chased down.
+        let mut b = buffer();
+        b.begin(100, Instant::now());
+        b.hold(110, 4, &[1u8; 32]).unwrap();
+        b.hold(114, 4, &[2u8; 32]).unwrap();
+
+        let mut applied = Vec::new();
+        let through = b.drain_contiguous(114, |skip_below, bytes| {
+            applied.push((skip_below, bytes[0]));
+        });
+
+        assert_eq!(through, 118);
+        assert_eq!(
+            applied,
+            vec![(114, 2u8)],
+            "110..=113 was already in the book"
+        );
+        assert_eq!(b.first_held_sequence(), None, "both slots were consumed");
+    }
+
+    #[test]
+    fn draining_a_buffer_with_no_hole_empties_it() {
+        let mut b = buffer();
+        b.begin(100, Instant::now());
+        b.hold(110, 4, &[0u8; 32]).unwrap();
+        b.hold(114, 4, &[0u8; 32]).unwrap();
+        let through = b.drain_contiguous(110, |_, _| {});
+        assert_eq!(through, 118);
+        assert_eq!(b.first_held_sequence(), None);
+    }
+
+    #[test]
+    fn draining_when_the_hole_is_first_applies_nothing_and_keeps_everything() {
+        let mut b = buffer();
+        b.begin(100, Instant::now());
+        b.hold(120, 4, &[0u8; 32]).unwrap();
+        let mut applied = 0;
+        let through = b.drain_contiguous(110, |_, _| applied += 1);
+        assert_eq!(through, 110, "nothing was applied, so nothing advanced");
+        assert_eq!(applied, 0);
+        assert_eq!(b.first_held_sequence(), Some(120), "the slot is still held");
     }
 
     #[test]

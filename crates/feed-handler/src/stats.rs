@@ -60,7 +60,7 @@ impl HandlerStats {
             b.datagrams,
             self.first_sequence,
             self.last_sequence,
-            arb.gaps().len(),
+            arb.gap_count(),
             arb.max_window_used(),
             arb.window_capacity(),
         );
@@ -113,11 +113,12 @@ impl HandlerStats {
         writeln!(f, "last_sequence={}", self.last_sequence)?;
         writeln!(f, "joined_mid_stream={}", self.joined_mid_stream)?;
 
-        writeln!(f, "gaps={}", arb.gaps().len())?;
+        writeln!(f, "gaps={}", arb.gap_count())?;
         writeln!(f, "messages_missed={}", arb.messages_missed())?;
-        // Every gap, so a test can assert on the exact ranges rather than a
-        // count. A gap at the wrong place is not the same bug as a gap of the
-        // wrong size.
+        // Every gap the log kept, so a test can assert on the exact ranges
+        // rather than a count: a gap at the wrong place is not the same bug as
+        // a gap of the wrong size. `gaps=` above is the true total, which can
+        // exceed this list.
         for (i, gap) in arb.gaps().iter().enumerate() {
             writeln!(f, "gap_{i}_from={}", gap.from)?;
             writeln!(f, "gap_{i}_through={}", gap.through)?;

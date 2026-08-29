@@ -35,11 +35,24 @@ impl DigestLog {
         })
     }
 
+    /// Writes one checkpoint line.
+    ///
+    /// The fields go straight to the sink rather than through
+    /// [`BookDigest::to_fields`], which builds a `String`. Checkpoints are taken
+    /// on the receive path, so that `String` was one allocation and two
+    /// reallocations per checkpoint — the only heap traffic left in the
+    /// handler's steady state once the fast book landed, and invisible until the
+    /// counting allocator was pointed at the whole binary rather than at the
+    /// book alone.
     pub fn write(&mut self, sequence: u64, digest: BookDigest) -> io::Result<()> {
         let Some(sink) = self.sink.as_mut() else {
             return Ok(());
         };
-        writeln!(sink, "{sequence} {}", digest.to_fields())?;
+        writeln!(
+            sink,
+            "{sequence} {:016x} {:016x} {}",
+            digest.top, digest.full, digest.orders
+        )?;
         sink.flush()?;
         Ok(())
     }

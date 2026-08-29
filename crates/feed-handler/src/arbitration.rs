@@ -170,6 +170,13 @@ struct Slot {
 }
 
 /// Bounded reorder buffer plus the state machine around it.
+/// How many individual gap ranges the end-of-run report keeps.
+///
+/// The gap *count* is exact and unbounded; this caps only the detail, so that
+/// recording one cannot allocate. A run with more gaps than this has bigger
+/// problems than a truncated list.
+pub const GAP_LOG: usize = 256;
+
 #[derive(Debug)]
 pub struct Arbitrator {
     state: FeedState,
@@ -184,7 +191,19 @@ pub struct Arbitrator {
     first_sequence: u64,
     last_delivered: u64,
     messages_delivered: u64,
-    gaps: Vec<Gap>,
+    /// The first [`GAP_LOG`] gaps, for the end-of-run report.
+    ///
+    /// Fixed size, not a `Vec`. Recording a gap happens on the receive path, and
+    /// a growing `Vec` there reallocates — which breaks the zero-allocation
+    /// claim, and in a process that runs for a session is a slow leak besides.
+    /// The *count* is unbounded and exact; only the detail is capped.
+    ///
+    /// The first N are kept rather than the last N: when a feed starts going
+    /// wrong, what it did first is the diagnostic, and keeping the head means
+    /// the indices in the report never renumber.
+    gaps: Box<[Gap]>,
+    gaps_stored: usize,
+    gaps_recorded: u64,
     messages_missed: u64,
     /// Highest `first_sequence + count` seen on any arm, delivered or not.
     highest_seen: u64,
@@ -226,7 +245,16 @@ impl Arbitrator {
             first_sequence: 0,
             last_delivered: 0,
             messages_delivered: 0,
-            gaps: Vec::new(),
+            gaps: vec![
+                Gap {
+                    from: 0,
+                    through: 0
+                };
+                GAP_LOG
+            ]
+            .into_boxed_slice(),
+            gaps_stored: 0,
+            gaps_recorded: 0,
             messages_missed: 0,
             highest_seen: 0,
             max_window_used: 0,
@@ -247,8 +275,16 @@ impl Arbitrator {
         self.arms[usize::from(arm & 1)]
     }
 
+    /// The first [`GAP_LOG`] gaps. See [`gap_count`](Self::gap_count) for how
+    /// many there really were.
     pub fn gaps(&self) -> &[Gap] {
-        &self.gaps
+        &self.gaps[..self.gaps_stored]
+    }
+
+    /// Every gap that has been declared, including any past [`GAP_LOG`] that
+    /// [`gaps`](Self::gaps) did not keep.
+    pub fn gap_count(&self) -> u64 {
+        self.gaps_recorded
     }
 
     pub fn messages_delivered(&self) -> u64 {
@@ -493,7 +529,11 @@ impl Arbitrator {
             through: target.saturating_sub(1).max(self.next_expected),
         };
         self.messages_missed += gap.messages();
-        self.gaps.push(gap);
+        self.gaps_recorded += 1;
+        if self.gaps_stored < self.gaps.len() {
+            self.gaps[self.gaps_stored] = gap;
+            self.gaps_stored += 1;
+        }
         self.state = FeedState::Gapped;
         self.next_expected = target;
         gap

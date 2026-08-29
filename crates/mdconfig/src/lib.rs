@@ -113,7 +113,9 @@ impl Config {
             && self.handler.recovery_timeout_millis <= self.feed.snapshot_interval_millis * 2
         {
             return Err(ConfigError::Invalid(format!(
-                "handler.recovery_timeout_millis is {} but the snapshot cycle is every {}ms;                  recovery must outlive two cycles or it can time out before the first                  snapshot that could close the gap was ever due",
+                "handler.recovery_timeout_millis is {} but the snapshot cycle is every {}ms; \
+                    recovery must outlive two cycles or it can time out before the first \
+                    snapshot that could close the gap was ever due",
                 self.handler.recovery_timeout_millis, self.feed.snapshot_interval_millis
             )));
         }
@@ -397,6 +399,23 @@ pub struct Handler {
     /// Must comfortably exceed `feed.snapshot_interval_millis`, or a recovery
     /// will time out before the snapshot it is waiting for was ever due.
     pub recovery_timeout_millis: u64,
+
+    /// Price levels per side in the fast book's window, in ticks.
+    ///
+    /// The window is anchored on each symbol's `reference_price` and covers
+    /// `book_levels / 2` ticks either side. Too small and the book rebases on
+    /// ordinary price movement; too large and it wastes cache. 4096 ticks is a
+    /// wide day's range for the instruments this generates.
+    ///
+    /// Ignored under `--books reference`, which grows instead.
+    pub book_levels: usize,
+
+    /// Simultaneously resting orders per symbol in the fast book's slab.
+    ///
+    /// A hard ceiling, not a hint: the slab is allocated once and an order
+    /// beyond it is refused rather than making the book allocate. Sized well
+    /// above the generator's target depth.
+    pub book_orders: usize,
 }
 
 impl Default for Handler {
@@ -411,6 +430,8 @@ impl Default for Handler {
             gap_timeout_millis: 250,
             recovery_buffer_datagrams: 4096,
             recovery_timeout_millis: 10_000,
+            book_levels: 4096,
+            book_orders: 1 << 16,
         }
     }
 }

@@ -17,7 +17,7 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 4 of 9 milestones complete.**
+> **This is a build in progress — 5 of 9 milestones complete.**
 >
 > The target figure below (`1M+ msg/s · ~100ns decode`) is a **goal, not a measurement.** Nothing here has been benchmarked yet.
 > Every number this project eventually publishes will land in [CLAIMS.md](CLAIMS.md) first, with the commit it was measured at,
@@ -75,7 +75,7 @@ flowchart LR
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[███████████░░░░░░░░░░░░░] 4/9 milestones · 44%
+[█████████████░░░░░░░░░░░] 5/9 milestones · 56%
 ```
 
 - [x] **M1 · Workspace, wire schema, and cross-language codegen**  
@@ -90,8 +90,9 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - [x] **M4 · Snapshot cycle and TCP replay recovery**  
   A handler that has fallen behind rejoins the live stream with a correct book instead of being restarted.  
   <sub>Verified: a range lost on both arms, and a 1,600-message blackout, both recover to a book **identical to the publisher's** — including queue position, not just quantity. `scripts/smoke.sh` runs both recovery paths across three processes: snapshot-only (4 gaps, 2 recoveries, worst 48ms) and with the replay service (5 gaps, 4 filled by replay, 1 by snapshot, 2,783 messages recovered), each ending `LIVE` with every shared checkpoint matching. `Snapshot` carries **orders in queue order** rather than aggregated levels, because an aggregate cannot restore price-time priority. See [docs/RECOVERY.md](docs/RECOVERY.md).</sub>
-- [ ] **M5 · MBP and MBO books on an allocation-free path**  
-  Both book views are maintained with zero heap allocations per message, and that is proved by a test rather than asserted in a README.
+- [x] **M5 · MBP and MBO books on an allocation-free path**  
+  Both book views are maintained with zero heap allocations per message, and that is proved by a test rather than asserted in a README.  
+  <sub>Verified: `--verify-allocations` reports **0 allocations, 0 deallocations, 0 reallocations** over 32,601 steady-state receive passes across two processes — while the same run with `--books reference` reports 10,814, so the counter is measuring something. A `#[test]` asserts exactly zero across **1,000,000 messages including a forced both-arm blackout and the snapshot recovery that follows**, over 125,021 measured scopes. The fast book is differentially tested against the reference book over **5,000,000 random operations** — every return value, every aggregated level, and the exact queue order within each level — and both reconcile with the engine across a process boundary. See [docs/BOOKS.md](docs/BOOKS.md).</sub>
 - [ ] **M6 · Benchmark harness, tuning, and an honest report**  
   The advertised 1M+ msg/s and ~100ns decode are measured, reproducible, and published with the methodology that makes them mean something.
 - [ ] **M7 · C++ FIX 4.4 gateway — the session layer**  
@@ -209,7 +210,8 @@ Cargo.toml — virtual workspace manifest
 rust-toolchain.toml, .cargo/config.toml — pinned toolchain and RUSTFLAGS
 crates/wire/ — schema-generated SBE-style codec, frame header, golden-vector tests          [M1]
 crates/book/ — reference book, digest, and the shared apply path                            [M2]
-             — MBP (tick-indexed array) and MBO (slab + open-addressed map + intrusive lists) land in M5
+             — MBO: slab + open-addressed order-id map + intrusive per-level FIFO lists      [M5]
+             — MBP: a dense tick-indexed level array maintained over the same store          [M5]
 crates/alloc-guard/ — counting #[global_allocator] and the zero-allocation assertions        [M5]
 crates/transport/ — multicast and unicast-fanout backends, one send path                     [M2]
 crates/mdconfig/ — the configuration file both binaries read                                 [M2]

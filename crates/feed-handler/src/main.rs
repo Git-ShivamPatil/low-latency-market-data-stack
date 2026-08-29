@@ -27,7 +27,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use book::{apply_message, BookDigest, Books, DigestLog};
+use alloc_guard::{AllocCounts, AllocGuard, CountingAllocator};
+use book::{
+    apply_message, BookDigest, BookSet, Books, DigestLog, FastBooks, MboCapacity, OrderBook,
+};
+
+/// Installed unconditionally, not only under `--verify-allocations`.
+///
+/// A flag that changed the allocator would measure a different binary from the
+/// one that ships, which is the same mistake as benchmarking a debug build. The
+/// cost is one thread-local increment per allocation — and in steady state the
+/// whole point is that there are none, so it costs nothing where it matters.
+#[global_allocator]
+static ALLOC: CountingAllocator<std::alloc::System> = CountingAllocator::new(std::alloc::System);
 use clap::Parser;
 use mdconfig::Config;
 use transport::{is_timeout, Receiver, TransportMode};
@@ -104,7 +116,22 @@ struct Args {
     #[arg(long, default_value_t = 0x0D_1A_0F_5E_ED_00_00_01)]
     drop_seed: u64,
 
-    /// Prove the steady-state loop allocates nothing (milestone 5).
+    /// Which book implementation to rebuild into.
+    ///
+    /// Both are kept and both are tested. `reference` is the obviously-correct
+    /// one the fast book is differentially tested against; the smoke test runs
+    /// the reconciliation against each in turn, so a divergence between them
+    /// shows up as a cross-process digest mismatch rather than only in a unit
+    /// test.
+    #[arg(long, value_enum, default_value_t = BookKind::Fast)]
+    books: BookKind,
+
+    /// Count heap operations in the steady-state receive loop and report the
+    /// total.
+    ///
+    /// Reports; it does not assert. The assertion lives in
+    /// `tests/allocation.rs`, where CI runs it — a claim that depends on
+    /// somebody remembering to pass a flag is not a claim.
     #[arg(long)]
     verify_allocations: bool,
 
@@ -161,7 +188,47 @@ fn main() -> ExitCode {
 
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let mut cfg = Config::load(&args.config)?;
+    let cfg = Config::load(&args.config)?;
+    match args.books {
+        BookKind::Reference => run_with(args, cfg, Books::new()),
+        BookKind::Fast => {
+            // Sized from the config, per symbol: each has its own reference
+            // price and tick, and a single shared window would be wrong for
+            // every symbol but one. This is the allocation the milestone puts
+            // outside the claim, and it happens here, once, before a byte is
+            // received.
+            let specs: Vec<(u16, MboCapacity)> = cfg
+                .market
+                .symbols
+                .iter()
+                .map(|sym| {
+                    (
+                        sym.id,
+                        MboCapacity {
+                            levels: cfg.handler.book_levels,
+                            orders: cfg.handler.book_orders,
+                            reference_price: sym.reference_price,
+                            tick: sym.tick_size,
+                        },
+                    )
+                })
+                .collect();
+            let fallback = specs
+                .first()
+                .map(|(_, c)| *c)
+                .unwrap_or_else(book::default_capacity);
+            let books = FastBooks::with_symbols(&specs, fallback);
+            run_with(args, cfg, books)
+        }
+    }
+}
+
+fn run_with<B: BookSet>(
+    args: Args,
+    cfg: Config,
+    mut books: B,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut cfg = cfg;
 
     let mode: TransportMode = match &args.transport {
         Some(s) => s
@@ -216,7 +283,6 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         );
     }
 
-    let mut books = Books::new();
     let mut stats = HandlerStats::default();
     let mut digest_log = DigestLog::open(cfg.handler.digest_path.as_deref())?;
     let digest_interval = cfg.handler.digest_interval;
@@ -256,9 +322,11 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             args.drop_seed
         );
     }
+    let mut allocs = AllocProbe::new(args.verify_allocations);
     if args.verify_allocations {
         eprintln!(
-            "  note: --verify-allocations is accepted but does nothing yet. The counting              allocator and the zero-allocation assertions are milestone 5; claiming the              proof before it exists would be exactly the kind of thing CLAIMS.md is for."
+            "  counting heap operations in the receive loop after {ALLOC_WARMUP_MESSAGES} \
+                messages of warm-up"
         );
     }
 
@@ -306,6 +374,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let gap_timeout = Duration::from_millis(cfg.handler.gap_timeout_millis.max(1));
 
     'outer: loop {
+        let alloc_scope = allocs.begin(arbitrator.messages_delivered());
         let mut got_any = false;
         poll_b_first = !poll_b_first;
         let arms: [(u8, &Receiver); 2] = if poll_b_first {
@@ -468,7 +537,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                         digest_interval,
                     )? {
                         eprintln!(
-                            "  a replay of {}..={} arrived after the gap was already closed;                              discarded",
+                            "  a replay of {}..={} arrived after the gap was already closed; \
+                                discarded",
                             r.request.from, r.request.through
                         );
                     }
@@ -544,7 +614,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             if now.duration_since(last_data) >= gap_timeout {
                 if let Some(gap) = arbitrator.declare_gap_if_stalled() {
                     eprintln!(
-                        "  GAP: sequence {gap} did not arrive within {}ms of the feed going                          quiet. Buffering live traffic and waiting for a snapshot.",
+                        "  GAP: sequence {gap} did not arrive within {}ms of the feed going \
+                            quiet. Buffering live traffic and waiting for a snapshot.",
                         gap_timeout.as_millis()
                     );
                     // A gap found this way is exactly as real as one found by a
@@ -572,6 +643,10 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_micros(200));
         }
 
+        // Ended before the periodic report, which writes to stderr and is
+        // diagnostic output rather than part of the consume path.
+        allocs.end(alloc_scope, arbitrator.messages_delivered());
+
         if now.duration_since(last_report) >= stats_interval {
             stats.report(&arbitrator, started);
             last_report = now;
@@ -591,6 +666,12 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     for gap in arbitrator.gaps() {
         eprintln!("  gap: sequence {gap}");
     }
+    if arbitrator.gap_count() > arbitrator.gaps().len() as u64 {
+        eprintln!(
+            "  ... and {} more not listed",
+            arbitrator.gap_count() - arbitrator.gaps().len() as u64
+        );
+    }
     if let Some(path) = args.summary_path.as_deref() {
         stats.write_summary(
             path,
@@ -599,7 +680,9 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             started.elapsed().as_secs_f64(),
         )?;
         stats.write_recovery(path, recovery.stats(), arbitrator.resyncs())?;
+        allocs.write_summary(std::path::Path::new(path), args.books)?;
     }
+    allocs.report(args.books);
 
     if args.show_book {
         print_books(&books, &cfg, args.depth);
@@ -615,9 +698,10 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let clean = stats.is_clean(&arbitrator, recovery.is_recovering());
     if !clean {
         eprintln!(
-            "  NOT CLEAN: state {}, {} gaps ({} recovered, {} failed), still recovering: {},              {} bad datagrams, {} messages that did not apply",
+            "  NOT CLEAN: state {}, {} gaps ({} recovered, {} failed), still recovering: {}, \
+                {} bad datagrams, {} messages that did not apply",
             arbitrator.state(),
-            arbitrator.gaps().len(),
+            arbitrator.gap_count(),
             stats.recoveries,
             stats.recovery_failures,
             recovery.is_recovering(),
@@ -647,11 +731,11 @@ fn reached_limit(arbitrator: &Arbitrator, recovery: &RecoveryBuffer, limit: u64)
 /// Unlike a snapshot this does **not** discard the book. The hole is filled where
 /// it is, so everything before it stays, and everything held after it is replayed
 /// in full because none of it was covered by anything.
-fn apply_replay(
+fn apply_replay<B: BookSet>(
     result: &ReplayResult,
     recovery: &mut RecoveryBuffer,
     arbitrator: &mut Arbitrator,
-    books: &mut Books,
+    books: &mut B,
     stats: &mut HandlerStats,
     digest_log: &mut DigestLog,
     digest_interval: u64,
@@ -697,17 +781,44 @@ fn apply_replay(
     // here would leave that hole in the book while reporting success. This is
     // the bug that produced "order N is not on the book" two hundred messages
     // after a recovery that looked clean.
-    if let Some(held_start) = recovery.first_held_sequence() {
-        if held_start > covered_through + 1 {
-            eprintln!(
-                "  replay closed {}..={covered_through} but {}..={} opened while it was in                  flight; staying in recovery",
-                result.request.from,
-                covered_through + 1,
-                held_start - 1
-            );
-            recovery.reopen(covered_through + 1);
-            return Ok(false);
+    //
+    // The check is for a hole *anywhere* in the held traffic, not just at its
+    // front. An earlier version compared only the first held sequence, which
+    // catches the case where the new gap opens immediately and misses the one
+    // where it opens a few datagrams later — and the second is the common one,
+    // because a replay that is slow enough for another gap to open is usually
+    // slow enough for some traffic to arrive first.
+    if let Some((from, through)) = recovery.held_discontinuity(covered_through + 1) {
+        eprintln!(
+            "  replay closed {}..={covered_through} but {from}..={through} opened while it \
+             was in flight; staying in recovery",
+            result.request.from
+        );
+        // The held traffic before the new hole is applied and discarded now.
+        // Leaving it buffered loses it: the next adoption reconciles from the
+        // far side of the hole and skips every slot below that as covered.
+        let mut failure: Option<io::Error> = None;
+        recovery.drain_contiguous(covered_through + 1, |skip_below, bytes| {
+            if failure.is_some() {
+                return;
+            }
+            if let Err(e) = consume(
+                bytes,
+                books,
+                stats,
+                digest_log,
+                digest_interval,
+                false,
+                skip_below,
+            ) {
+                failure = Some(e);
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
         }
+        recovery.reopen(from);
+        return Ok(false);
     }
 
     if !recovery.adopt_replay(covered_through, messages) {
@@ -762,10 +873,10 @@ fn is_snapshot_datagram(datagram: &[u8]) -> bool {
 /// Adopts a snapshot if it can close the outstanding gap, then replays the live
 /// traffic held during recovery.
 #[allow(clippy::too_many_arguments)]
-fn handle_snapshot(
+fn handle_snapshot<B: BookSet>(
     datagram: &[u8],
     recovery: &mut RecoveryBuffer,
-    books: &mut Books,
+    books: &mut B,
     arbitrator: &mut Arbitrator,
     stats: &mut HandlerStats,
     digest_log: &mut DigestLog,
@@ -835,6 +946,43 @@ fn handle_snapshot(
         }
 
         let last_sequence = d.last_sequence();
+
+        // The same trap as on the replay path: a gap declared while the snapshot
+        // cycle was arriving leaves a hole *inside* the held traffic, and
+        // replaying it would fill the original hole, leave the new one, and
+        // report success. The snapshot is good as of `last_sequence`, so the
+        // held traffic up to the hole is applied and discarded, and the recovery
+        // stays open for the rest.
+        if let Some((from, through)) = recovery.held_discontinuity(last_sequence + 1) {
+            eprintln!(
+                "  the snapshot is consistent as of {last_sequence} but {from}..={through} \
+                 opened while the cycle was arriving; staying in recovery"
+            );
+            let mut failure: Option<io::Error> = None;
+            recovery.drain_contiguous(last_sequence + 1, |skip_below, bytes| {
+                if failure.is_some() {
+                    return;
+                }
+                if let Err(e) = consume(
+                    bytes,
+                    books,
+                    stats,
+                    digest_log,
+                    digest_interval,
+                    false,
+                    skip_below,
+                ) {
+                    failure = Some(e);
+                }
+            });
+            if let Some(e) = failure {
+                return Err(e);
+            }
+            *in_cycle = false;
+            recovery.reopen(from);
+            return Ok(());
+        }
+
         recovery.adopt_snapshot(last_sequence);
         arbitrator.resync_to(last_sequence + 1);
 
@@ -878,9 +1026,9 @@ fn handle_snapshot(
 /// Returns whether anything was consumed, so the caller can check its message
 /// limit without re-deriving the count.
 #[allow(clippy::too_many_arguments)]
-fn consume(
+fn consume<B: BookSet>(
     datagram: &[u8],
-    books: &mut Books,
+    books: &mut B,
     stats: &mut HandlerStats,
     digest_log: &mut DigestLog,
     digest_interval: u64,
@@ -940,9 +1088,9 @@ fn consume(
 }
 
 /// Releases everything the arbitrator can now deliver, in sequence order.
-fn drain_into_books(
+fn drain_into_books<B: BookSet>(
     arbitrator: &mut Arbitrator,
-    books: &mut Books,
+    books: &mut B,
     stats: &mut HandlerStats,
     digest_log: &mut DigestLog,
     digest_interval: u64,
@@ -966,16 +1114,23 @@ fn drain_into_books(
     }
 }
 
-fn print_books(books: &Books, cfg: &Config, depth: usize) {
-    for (symbol_id, b) in books.iter() {
-        let name = cfg.symbol_name(*symbol_id).unwrap_or("?");
+fn print_books<B: BookSet>(books: &B, cfg: &Config, depth: usize) {
+    // Built through the callback interface rather than `levels()`, so this works
+    // for either book. The `Vec`s here are fine: printing is a one-off at the
+    // end of a run, not the steady-state path.
+    let mut bids: Vec<book::Level> = Vec::new();
+    let mut asks: Vec<book::Level> = Vec::new();
+    books.for_each_symbol(&mut |symbol_id, b| {
+        let name = cfg.symbol_name(symbol_id).unwrap_or("?");
         println!("\n{name} (symbol {symbol_id}) — {} orders resting", b.len());
         println!(
             "{:>14}  {:>10}  {:>6}     {:>6}  {:>10}  {:>14}",
             "bid", "qty", "n", "n", "qty", "ask"
         );
-        let bids = b.levels(wire::Side::Bid, depth);
-        let asks = b.levels(wire::Side::Ask, depth);
+        bids.clear();
+        asks.clear();
+        b.for_each_level(wire::Side::Bid, depth, &mut |l| bids.push(l));
+        b.for_each_level(wire::Side::Ask, depth, &mut |l| asks.push(l));
         for i in 0..depth.min(bids.len().max(asks.len())) {
             let bid = bids.get(i).map_or_else(
                 || " ".repeat(34),
@@ -998,8 +1153,131 @@ fn print_books(books: &Books, cfg: &Config, depth: usize) {
             });
             println!("{bid}     {ask}");
         }
-    }
+    });
     let _ = io::stdout().flush();
+}
+
+/// Which book implementation the handler rebuilds into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum BookKind {
+    /// `BTreeMap` of `VecDeque`. Obviously correct, allocates freely, and stays
+    /// in the tree as the oracle the fast book is tested against.
+    Reference,
+    /// Dense tick-indexed levels, a slab of order nodes, an open-addressed
+    /// order-id map. Allocation-free per message.
+    Fast,
+}
+
+impl std::fmt::Display for BookKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reference => write!(f, "reference"),
+            Self::Fast => write!(f, "fast"),
+        }
+    }
+}
+
+/// Measures the steady-state receive loop when `--verify-allocations` is on.
+///
+/// Per outer pass rather than per run: a single delta across a whole session
+/// cannot tell "allocated once during setup" from "allocates on every message",
+/// and the first of those is fine while the second is the bug. Recording where
+/// the first dirty pass happened turns a number into something diagnosable.
+///
+/// Measuring starts only after [`ALLOC_WARMUP_MESSAGES`], because the first
+/// datagrams through a fresh process legitimately allocate: a book for a symbol
+/// it has not seen, the digest log's buffer, whatever `std` initialises lazily.
+/// Counting those would make the claim unachievable rather than meaningful — see
+/// the module docs of `alloc-guard` for where that boundary sits and why.
+///
+/// This reports; `crates/feed-handler/tests/allocation.rs` asserts. A flag a
+/// human has to run and read is a demonstration, not a proof.
+struct AllocProbe {
+    enabled: bool,
+    armed: bool,
+    total: AllocCounts,
+    passes: u64,
+    first_dirty: Option<(u64, AllocCounts)>,
+}
+
+/// Messages that must be delivered before allocation counting starts.
+const ALLOC_WARMUP_MESSAGES: u64 = 50_000;
+
+impl AllocProbe {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            armed: false,
+            total: AllocCounts::default(),
+            passes: 0,
+            first_dirty: None,
+        }
+    }
+
+    fn begin(&mut self, delivered: u64) -> Option<AllocGuard> {
+        if !self.enabled {
+            return None;
+        }
+        if !self.armed {
+            if delivered < ALLOC_WARMUP_MESSAGES {
+                return None;
+            }
+            self.armed = true;
+        }
+        Some(AllocGuard::start())
+    }
+
+    fn end(&mut self, guard: Option<AllocGuard>, delivered: u64) {
+        let Some(guard) = guard else { return };
+        let d = guard.finish();
+        self.passes += 1;
+        self.total.allocations += d.allocations;
+        self.total.deallocations += d.deallocations;
+        self.total.reallocations += d.reallocations;
+        self.total.bytes += d.bytes;
+        if !d.is_clean() && self.first_dirty.is_none() {
+            self.first_dirty = Some((delivered, d));
+        }
+    }
+
+    fn report(&self, kind: BookKind) {
+        if !self.enabled {
+            return;
+        }
+        if !self.armed {
+            eprintln!(
+                "  allocations: not measured — the run ended before \
+                 {ALLOC_WARMUP_MESSAGES} messages, which is the warm-up"
+            );
+            return;
+        }
+        eprintln!(
+            "  allocations over {} steady-state passes with --books {kind}: {}",
+            self.passes, self.total
+        );
+        if let Some((at, d)) = self.first_dirty {
+            eprintln!("  first allocated after {at} messages: {d}");
+            if kind == BookKind::Reference {
+                eprintln!(
+                    "  that is expected here: the reference book is a BTreeMap of VecDeque \
+                     and allocates per level. --books fast is what the claim is about."
+                );
+            }
+        }
+    }
+
+    fn write_summary(&self, path: &std::path::Path, kind: BookKind) -> io::Result<()> {
+        use std::fs::OpenOptions;
+        let mut f = OpenOptions::new().append(true).open(path)?;
+        writeln!(f, "books={kind}")?;
+        writeln!(f, "alloc_measured={}", self.armed)?;
+        writeln!(f, "alloc_passes={}", self.passes)?;
+        writeln!(f, "allocations={}", self.total.allocations)?;
+        writeln!(f, "deallocations={}", self.total.deallocations)?;
+        writeln!(f, "reallocations={}", self.total.reallocations)?;
+        writeln!(f, "alloc_bytes={}", self.total.bytes)?;
+        f.flush()
+    }
 }
 
 fn bind_hint(e: io::Error, mode: TransportMode, arm: &str, addr: SocketAddrV4) -> String {

@@ -24,7 +24,7 @@ use std::fmt;
 
 use wire::Side;
 
-use crate::reference::Books;
+use crate::view::{BookSet, OrderBook};
 
 /// Levels per side covered by the `top` digest.
 pub const DIGEST_DEPTH: usize = 10;
@@ -65,7 +65,14 @@ pub struct BookDigest {
 }
 
 impl BookDigest {
-    pub fn of(books: &Books) -> Self {
+    /// Generic over the book implementation, and allocation-free for both.
+    ///
+    /// It has to be allocation-free: the handler takes a digest at checkpoints
+    /// *during* the steady-state window that the zero-allocation claim covers,
+    /// so a digest that built a `Vec` of levels would break the claim at every
+    /// hundredth message. That is why [`OrderBook::for_each_level`] takes a
+    /// callback and why [`OrderBook::level_count`] exists separately.
+    pub fn of<B: BookSet + ?Sized>(books: &B) -> Self {
         Self {
             top: hash_books(books, DIGEST_DEPTH),
             full: hash_books(books, 0),
@@ -102,29 +109,38 @@ impl fmt::Display for BookDigest {
     }
 }
 
-fn hash_books(books: &Books, depth: usize) -> u64 {
+fn hash_books<B: BookSet + ?Sized>(books: &B, depth: usize) -> u64 {
     let mut h = Fnv1a::new();
-    // Books iterates in symbol-id order, so no sorting is needed to make this
-    // deterministic across processes.
-    for (symbol_id, book) in books.iter() {
+    // `BookSet` promises symbol-id order, so no sorting is needed to make this
+    // deterministic across processes — or across the two implementations.
+    books.for_each_symbol(&mut |symbol_id, book| {
+        // A symbol that is present but empty hashes as if it were absent.
+        // The two implementations differ on when a book springs into existence
+        // — the reference set creates one on first touch, the fast set can
+        // pre-allocate every symbol up front — and that is a memory-management
+        // decision, not book state. A digest that could tell them apart would
+        // report the engine and the handler as diverged when both hold nothing.
+        if book.is_empty() {
+            return;
+        }
         h.write(&symbol_id.to_le_bytes());
         for side in [Side::Bid, Side::Ask] {
             h.write(&[side as u8]);
-            let levels = book.levels(side, depth);
-            h.write(&(levels.len() as u32).to_le_bytes());
-            for level in &levels {
+            h.write(&(book.level_count(side, depth) as u32).to_le_bytes());
+            book.for_each_level(side, depth, &mut |level| {
                 h.write(&level.price.to_le_bytes());
                 h.write(&level.quantity.to_le_bytes());
                 h.write(&level.order_count.to_le_bytes());
-            }
+            });
         }
-    }
+    });
     h.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reference::Books;
 
     fn books_with(entries: &[(u16, u64, Side, i64, u32)]) -> Books {
         let mut books = Books::new();

@@ -23,6 +23,7 @@ path = "src/main.rs"
 [dependencies]
 wire = { path = "../wire" }
 book = { path = "../book" }
+alloc-guard = { path = "../alloc-guard" }
 transport = { path = "../transport" }
 mdconfig = { path = "../mdconfig" }
 replay-service = { path = "../replay-service" }
@@ -33,3 +34,4 @@ toml = "1"
 [dev-dependencies]
 # The redundancy tests build datagrams directly to inject an exact loss pattern.
 wire = { path = "../wire" }
+

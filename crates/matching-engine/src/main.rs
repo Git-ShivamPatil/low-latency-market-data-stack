@@ -332,7 +332,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 snapshot_cycles += 1;
                 if snapshot_cycles == 1 {
                     eprintln!(
-                        "  snapshot cycle every {}ms; first cycle at snapshot sequence {}                          covered {} symbols and {} orders in {} datagrams, consistent as of                          incremental sequence {}",
+                        "  snapshot cycle every {}ms; first cycle at snapshot sequence {} \
+                            covered {} symbols and {} orders in {} datagrams, consistent as of \
+                            incremental sequence {}",
                         interval.as_millis(),
                         cycle.sequence,
                         cycle.symbols,
@@ -410,7 +412,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         if uplink.dropped() > 0 {
             eprintln!(
-                "  note: dropped uplink datagrams shorten the replay horizon. The store                  discards its history at the discontinuity rather than serving around it,                  so nothing is served wrongly - but a consumer that needed that range will                  be told it is too old."
+                "  note: dropped uplink datagrams shorten the replay horizon. The store \
+                    discards its history at the discontinuity rather than serving around it, \
+                    so nothing is served wrongly - but a consumer that needed that range will \
+                    be told it is too old."
             );
         }
     }

@@ -47,6 +47,24 @@ RECOVERY_SNAPSHOT_MS=200
 # snapshot cycle is due, and the run would test nothing.
 RECOVERY_RATE=20000
 RECOVERY_MESSAGES=20000
+# Which book the redundancy, recovery and replay scenarios rebuild into. The
+# books scenario below sets its own and ignores this. Overridable so a failure
+# in one of those can be attributed: if it reproduces with `--books reference`
+# it is not the fast book.
+HANDLER_BOOKS=fast
+# The books scenario: reference and fast, side by side, with the allocation
+# counter armed. Long enough to clear the handler's 50,000-message allocation
+# warm-up with room to spare, or the counter never arms and the run asserts
+# nothing.
+BOOKS_SCENARIO=1
+BOOKS_MESSAGES=200000
+# Throttled, and not for politeness. Unthrottled, the engine outruns the
+# handler's socket on a 2-core box and both arms overflow the same receive
+# buffer at the same instant — which is real loss, indistinguishable from
+# network loss, and opens a gap on a run that has none injected. That is a fact
+# about the machine, not about the books, and it has no place in the scenario
+# that compares them.
+BOOKS_RATE=20000
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,6 +75,8 @@ while [[ $# -gt 0 ]]; do
         --drop-mode) DROP_MODE="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
         --no-recovery) RECOVERY=0; shift ;;
+        --no-books) BOOKS_SCENARIO=0; shift ;;
+        --books) HANDLER_BOOKS="$2"; shift 2 ;;
         -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -114,7 +134,7 @@ for MODE in "${MODES[@]}"; do
         --digest-path "$HANDLER_DIGESTS" \
         --digest-interval "$DIGEST_INTERVAL" \
         --idle-timeout "$IDLE_TIMEOUT" \
-        --summary-path "$SUMMARY" \
+        --books "$HANDLER_BOOKS" --summary-path "$SUMMARY" \
         >"$HANDLER_LOG" 2>&1 &
     HANDLER_PID=$!
 
@@ -350,7 +370,7 @@ if [[ $RECOVERY -eq 1 ]]; then
     H_LOG="$OUT/recovery-handler.log"
     rm -f "$E_DIG" "$H_DIG" "$H_SUM" "$E_LOG" "$H_LOG"
 
-    "$HANDLER"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --messages "$RECOVERY_MESSAGES"         --digest-path "$H_DIG"         --digest-interval "$DIGEST_INTERVAL"         --idle-timeout "$IDLE_TIMEOUT"         --summary-path "$H_SUM"         >"$H_LOG" 2>&1 &
+    "$HANDLER"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --messages "$RECOVERY_MESSAGES"         --digest-path "$H_DIG"         --digest-interval "$DIGEST_INTERVAL"         --idle-timeout "$IDLE_TIMEOUT"         --books "$HANDLER_BOOKS" --summary-path "$H_SUM"         >"$H_LOG" 2>&1 &
     RPID=$!
     sleep 1
 
@@ -464,7 +484,7 @@ PY
     RSPID=$!
     sleep 1
 
-    "$HANDLER"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --replay 127.0.0.1:32002         --messages "$RECOVERY_MESSAGES"         --digest-path "$RH_DIG"         --digest-interval "$DIGEST_INTERVAL"         --idle-timeout "$IDLE_TIMEOUT"         --summary-path "$RH_SUM"         >"$RH_LOG" 2>&1 &
+    "$HANDLER"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --replay 127.0.0.1:32002         --messages "$RECOVERY_MESSAGES"         --digest-path "$RH_DIG"         --digest-interval "$DIGEST_INTERVAL"         --idle-timeout "$IDLE_TIMEOUT"         --books "$HANDLER_BOOKS" --summary-path "$RH_SUM"         >"$RH_LOG" 2>&1 &
     RHPID=$!
     sleep 1
 
@@ -553,6 +573,169 @@ PY
         echo "  PASS (replay)"
     else
         echo "  FAIL (replay)"
+        overall=1
+    fi
+    echo
+fi
+
+# --------------------------------------------------------------------------
+# Books: both implementations reconcile, and the fast one allocates nothing.
+# --------------------------------------------------------------------------
+#
+# Two claims in one scenario, and they check each other.
+#
+# The first is that `--books fast` and `--books reference` are interchangeable:
+# each rebuilds a book that matches the engine's, checkpoint for checkpoint,
+# across a process boundary. `crates/book/tests/differential.rs` compares them
+# in one process over millions of operations; this compares each of them against
+# something neither of them is — an engine that arrived at its book by matching
+# orders rather than by replaying a feed.
+#
+# The second is that the fast one does no heap work per message. That number is
+# only worth reading because the reference run is measured the same way and
+# reports a large one: if the counter said zero for both, it would be broken.
+if [[ $BOOKS_SCENARIO -eq 1 ]]; then
+    echo "=============================================================="
+    echo " books: reference vs fast, and the allocation claim"
+    echo "=============================================================="
+
+    books_status=0
+    for KIND in reference fast; do
+        B_DIG_E="$OUT/books-$KIND-engine.txt"
+        B_DIG_H="$OUT/books-$KIND-handler.txt"
+        B_SUM="$OUT/books-$KIND.summary"
+        B_LOG_E="$OUT/books-$KIND-engine.log"
+        B_LOG_H="$OUT/books-$KIND-handler.log"
+        rm -f "$B_DIG_E" "$B_DIG_H" "$B_SUM" "$B_LOG_E" "$B_LOG_H"
+
+        "$HANDLER" \
+            --config configs/local.toml \
+            --transport unicast-fanout \
+            --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002 \
+            --messages "$BOOKS_MESSAGES" \
+            --books "$KIND" \
+            --verify-allocations \
+            --digest-path "$B_DIG_H" \
+            --digest-interval "$DIGEST_INTERVAL" \
+            --idle-timeout "$IDLE_TIMEOUT" \
+            --summary-path "$B_SUM" \
+            >"$B_LOG_H" 2>&1 &
+        BPID=$!
+        sleep 1
+
+        # No loss. This scenario is about the books and the allocator, and loss
+        # would drag recovery into it — which the recovery and replay scenarios
+        # already cover, on the same fast book, since it is now the default.
+        "$ENGINE" \
+            --config configs/local.toml \
+            --transport unicast-fanout \
+            --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002 \
+            --messages "$BOOKS_MESSAGES" \
+            --rate "$BOOKS_RATE" \
+            --digest-path "$B_DIG_E" \
+            --digest-interval "$DIGEST_INTERVAL" \
+            --self-check \
+            >"$B_LOG_E" 2>&1
+        b_engine=$?
+        wait $BPID && b_handler=0 || b_handler=$?
+
+        echo "--- $KIND ---"
+        grep -E "allocations" "$B_LOG_H" | sed 's/^/  /' || true
+
+        if [[ $b_engine -ne 0 ]]; then
+            echo "FAIL: the engine exited $b_engine in the $KIND run" >&2
+            books_status=1
+        fi
+        if [[ $b_handler -ne 0 ]]; then
+            echo "FAIL: the handler exited $b_handler with --books $KIND. See $B_LOG_H" >&2
+            books_status=1
+        fi
+
+        python3 - "$B_SUM" "$B_DIG_E" "$B_DIG_H" "$KIND" <<'PY' || books_status=1
+import sys
+
+summary_path, engine_path, handler_path, kind = sys.argv[1:5]
+fails = []
+
+s = {}
+for line in open(summary_path):
+    line = line.strip()
+    if "=" in line:
+        k, v = line.split("=", 1)
+        s[k] = v
+
+if s.get("books") != kind:
+    fails.append(f"summary says books={s.get('books')}, expected {kind}")
+if s.get("state") != "LIVE":
+    fails.append(f"the handler ended {s.get('state')}, not LIVE")
+if s.get("gaps") != "0":
+    fails.append(f"{s.get('gaps')} gaps on a lossless run")
+if s.get("alloc_measured") != "true":
+    fails.append(
+        "allocation counting never armed: the run ended inside the warm-up, "
+        "so raise BOOKS_MESSAGES"
+    )
+
+allocs = int(s.get("allocations", -1))
+deallocs = int(s.get("deallocations", -1))
+reallocs = int(s.get("reallocations", -1))
+
+if kind == "fast":
+    # The claim.
+    if (allocs, deallocs, reallocs) != (0, 0, 0):
+        fails.append(
+            f"the fast book allocated in steady state: {allocs} allocations, "
+            f"{deallocs} deallocations, {reallocs} reallocations over "
+            f"{s.get('alloc_passes')} passes"
+        )
+else:
+    # The control. A measurement that reports zero for a BTreeMap of VecDeque
+    # is not measuring anything, and would make the line above meaningless.
+    if allocs == 0:
+        fails.append(
+            "the reference book reported zero allocations, which cannot be true "
+            "for a BTreeMap of VecDeque — the counter is not working, so the "
+            "fast book's zero proves nothing"
+        )
+
+
+def load(path):
+    rows = {}
+    for line in open(path):
+        parts = line.split()
+        if len(parts) == 4:
+            rows[int(parts[0])] = tuple(parts[1:])
+    return rows
+
+
+engine, handler = load(engine_path), load(handler_path)
+shared = sorted(set(engine) & set(handler))
+if len(shared) < 10:
+    fails.append(f"only {len(shared)} shared checkpoints; the books barely got compared")
+bad = [x for x in shared if engine[x] != handler[x]]
+if bad:
+    x = bad[0]
+    fails.append(
+        f"the {kind} book disagrees with the engine at {len(bad)} of {len(shared)} "
+        f"checkpoints; first at sequence {x}: engine {engine[x]} vs handler {handler[x]}"
+    )
+
+if fails:
+    for f in fails:
+        print(f"FAIL: {f}", file=sys.stderr)
+    sys.exit(1)
+
+print(
+    f"  {len(shared)} shared checkpoints, every one identical; "
+    f"{allocs} allocations over {s.get('alloc_passes')} steady-state passes"
+)
+PY
+    done
+
+    if [[ $books_status -eq 0 ]]; then
+        echo "  PASS (books)"
+    else
+        echo "  FAIL (books)"
         overall=1
     fi
     echo
