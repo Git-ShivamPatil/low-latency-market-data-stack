@@ -595,9 +595,16 @@ if fails:
         print(f"FAIL: {f}", file=sys.stderr)
     sys.exit(1)
 
+# "gaps" and "recoveries" are different counts and the difference is not a
+# discrepancy: a recovery that reopens after a partial replay closes several
+# gaps and completes once. Saying "N gaps filled by M replays" invites the
+# reader to subtract and find messages missing that are not missing -- which is
+# exactly the misreading this line produced the first time it was read
+# carefully. The proof that nothing was lost is the digest comparison below.
 print(
-    f"  {s['gaps']} gaps: {by_replay} filled by replay, {by_snapshot} by snapshot, "
-    f"{s.get('replay_refused')} refused"
+    f"  {s['gaps']} gaps closed by {by_replay} replay and {by_snapshot} snapshot "
+    f"recoveries ({s.get('replay_refused')} refused); one recovery can close "
+    f"several gaps"
 )
 print(f"  {s['replay_messages']} messages recovered from the replay service")
 print(f"  {len(shared)} shared checkpoints, every one identical")
