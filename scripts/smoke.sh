@@ -47,6 +47,20 @@ RECOVERY_SNAPSHOT_MS=200
 # snapshot cycle is due, and the run would test nothing.
 RECOVERY_RATE=20000
 RECOVERY_MESSAGES=20000
+# The replay scenario runs the snapshot cycle far enough apart that it cannot
+# fire during the run.
+#
+# It used to share the recovery scenario's 200ms, which meant both recovery
+# mechanisms were live and racing while the test asserted that replay won. Under
+# load the snapshot wins that race -- legitimately, the handler is supposed to
+# fall back -- and the scenario failed with a correct book and matching digests.
+# Racing two mechanisms and asserting which one gets there first is not a test.
+#
+# Now each scenario exercises exactly one path: `recovery` has no replay service
+# and must use snapshots; `replay` has no usable snapshot and must use replay. If
+# replay does not work, recovery times out and the run fails loudly, which is the
+# assertion this scenario was always trying to make.
+REPLAY_SNAPSHOT_MS=3000
 # Which book the redundancy, recovery and replay scenarios rebuild into. The
 # books scenario below sets its own and ignores this. Overridable so a failure
 # in one of those can be attributed: if it reproduces with `--books reference`
@@ -508,7 +522,7 @@ PY
     RHPID=$!
     sleep 1
 
-    "$ENGINE"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --replay-uplink 127.0.0.1:32001         --messages "$RECOVERY_MESSAGES"         --rate "$RECOVERY_RATE"         --snapshot-interval "$RECOVERY_SNAPSHOT_MS"         --drop-rate "$RECOVERY_DROP_RATE"         --drop-mode correlated         --digest-path "$RE_DIG"         >"$RE_LOG" 2>&1
+    "$ENGINE"         --config configs/local.toml         --transport unicast-fanout         --feed-a 127.0.0.1:31001 --feed-b 127.0.0.1:31002         --replay-uplink 127.0.0.1:32001         --messages "$RECOVERY_MESSAGES"         --rate "$RECOVERY_RATE"         --snapshot-interval "$REPLAY_SNAPSHOT_MS"         --drop-rate "$RECOVERY_DROP_RATE"         --drop-mode correlated         --digest-path "$RE_DIG"         >"$RE_LOG" 2>&1
     wait $RHPID && rpstatus=0 || rpstatus=$?
     kill $RSPID 2>/dev/null || true
     wait $RSPID 2>/dev/null || true
