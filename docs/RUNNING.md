@@ -273,5 +273,7 @@ labelled.
 and excludes, why the batch factor has to appear next to every throughput figure,
 and what the numbers do not show.
 
-See [CLAIMS.md](../CLAIMS.md) for the ledger. As of milestone 5, no *performance*
-figure has been measured.
+See [CLAIMS.md](../CLAIMS.md) for the ledger. As of milestone 6 the throughput
+and decode figures **have** been measured — on a free arm64 CI runner, single
+host, batched 32 messages to a datagram. Read [bench/REPORT.md](../bench/REPORT.md)
+before quoting any of them; the caveats are not optional.
