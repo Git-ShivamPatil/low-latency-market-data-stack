@@ -232,7 +232,7 @@ configs/local.toml — the config the advertised command names; channels, symbol
 docker-compose.yml
 docker/ — Dockerfiles and the user-defined bridge network definition
 bench/ — Criterion benches, load profiles, REPORT.md
-docs/ — WIRE.md, RUNNING.md, RECOVERY.md and BOOKS.md exist; PROTOCOL.md follows M7
+docs/ — WIRE.md, RUNNING.md, RECOVERY.md, BOOKS.md and PROTOCOL.md (M7 scope, written first)
 bench/REPORT.md — the benchmark methodology; a template until a rented host fills it in
 scripts/ — smoke.sh and verify-golden-corruption.sh exist; bench.sh, kill-restart-test.sh, calibrate-tsc.sh follow
 tests/ — cross-process integration and FIX session conformance suites
