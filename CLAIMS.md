@@ -8,7 +8,6 @@ Every number published about this project — in [its README](README.md), on the
 |---|---|
 | **Advertised on the portfolio** | `1M+ msg/s · ~100ns decode` |
 | **Substantiated** | **Both, on 2026-08-30.** 2.78M msg/s sustained receiver-side with zero gaps, three runs within 0.7%; decode 8.20 ns/message. Single host, loopback, batch factor 32 — see the caveats, they are not optional. |
-| **Feasibility assessment** | `met-with-caveats` |
 
 ## Measurements
 
