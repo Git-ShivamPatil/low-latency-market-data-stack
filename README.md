@@ -5,7 +5,7 @@
 **Price-time-priority matching engine publishing a binary feed over redundant A/B UDP multicast, with a Rust feed handler that arbitrates the two and rebuilds MBP/MBO books without allocating.**
 
 ![status](https://img.shields.io/badge/status-in_development-111111?style=flat-square)
-![progress](https://img.shields.io/badge/milestones-6_of_9-4a4a4a?style=flat-square)
+![progress](https://img.shields.io/badge/milestones-7_of_9-4a4a4a?style=flat-square)
 ![licence](https://img.shields.io/badge/licence-MIT-767676?style=flat-square)
 
 ![Rust](https://img.shields.io/badge/Rust-1.98-000000?style=flat-square&logo=rust&logoColor=white)
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 6 of 9 milestones complete.**
+> **This is a build in progress — 7 of 9 milestones complete.**
 >
 > The figures below (`1M+ msg/s · ~100ns decode`) have now been **measured**: 2.78M msg/s sustained receiver-side with zero gaps, three runs within 0.7%, and 8.2ns per message to decode.
 > They are single-host, over loopback, and **batched 32 messages to a datagram** — which is not a footnote, because at one message per datagram the kernel caps out an order of magnitude lower.
@@ -67,7 +67,7 @@ flowchart LR
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[████████████████░░░░░░░░] 6/9 milestones · 67%
+[██████████████████░░░░░░] 7/9 milestones · 78%
 ```
 
 - [x] **M1 · Workspace, wire schema, and cross-language codegen**  
@@ -88,8 +88,9 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - [x] **M6 · Benchmark harness, tuning, and an honest report**  
   The advertised 1M+ msg/s and ~100ns decode are measured, reproducible, and published with the methodology that makes them mean something.  
   <sub>Verified: **2,782,874 msg/s** sustained receiver-side over 60s — `(final sequence − first sequence) / elapsed` — with **zero arbitrated gaps and zero apply errors**, three runs agreeing within **0.7%** against the 10% required. Decode **8.20 ns/message**, book update **38.9 ns/message**, both far inside the `~100ns` and `~200ns` targets. Measured on four physical ARM cores, pinned, behind a host gate that reads the core topology, the invariant counter and the build profile and **refuses to write a report** when they do not hold — it refuses this laptop on two counts. Two timing methods bracket the answer deliberately: Criterion is the lower bound, an in-path `cntvct_el0` histogram the upper. The p99.9 of 1.8 µs is reported and explicitly **not** claimed, because it measures a shared hypervisor's scheduler. So is the fast book being only **1.72×** the `BTreeMap` baseline rather than the predicted order of magnitude — on a 64-level book the tree is cache-resident, and the report says so rather than quoting the flattering ratio. See [bench/REPORT.md](bench/REPORT.md) and [CLAIMS.md](CLAIMS.md).</sub>
-- [ ] **M7 · C++ FIX 4.4 gateway — the session layer** — *scope written, implementation next*  
-  A FIX session that survives a hard kill: correct sequence numbers, correct resend, correct gap fill, verified against an independent implementation.
+- [x] **M7 · C++ FIX 4.4 gateway — the session layer**  
+  A FIX session that survives a hard kill: correct sequence numbers, correct resend, correct gap fill, verified against an implementation this project did not write.  
+  <sub>Verified two ways, because one would not have been enough. **51 session checks** drive the state machine directly — a resend request for a range half of which is administrative, a `SequenceReset` that moves backwards, `PossDupFlag` on a number above the expected one — inputs a real engine will not produce on demand. Then **QuickFIX 1.15.1** judges the same session as an independent acceptor: a clean logon-orders-logout, a five-message gap manufactured with `fix-seqtool`, and a `ResetSeqNumFlag=Y` reset. **Zero rejects across all three.** `scripts/kill-restart-test.sh` `SIGKILL`s both ends mid-session and both resume from the durable numbers with no reversal — sequence numbers are `fsync`'d before the message they describe reaches the socket, and two slots on separate sectors survive a torn write. **QuickFIX found a bug the in-process checks could not:** an echoed `ResetSeqNumFlag` was read as a second instruction and reissued the sequence number the logon had already spent. That is what an independent counterparty is for, and the trace is in [docs/PROTOCOL.md](docs/PROTOCOL.md). The cross-check runs without a FIX dictionary, so it covers the session layer and **not** application message content — stated here rather than left for a reader to find.</sub>
 - [ ] **M8 · Risk service, order path into the engine, and restart reconciliation**  
   An order crosses the whole stack — gateway to risk to engine to fill to execution report — and open order state is reconstructed correctly after a hard crash.
 - [ ] **M9 · Hardening, documentation, and a tagged release**  
@@ -197,16 +198,17 @@ cpp/CMakeLists.txt
 cpp/wire/ — generated headers, shared with the Rust codec via the same schema
 cpp/gateway/ — FIX 4.4 session and application layer, sequence persistence
 cpp/risk/ — pre-trade limits on an allocation-free path, counting operator new override
-cpp/fix-sim/ — scripted counterparty for session conformance tests
+cpp/gateway/interop/ — a QuickFIX acceptor that judges the session layer          [M7]
+cpp/gateway/tests/ — 51 session checks driving the state machine directly         [M7]
 schema/market-data.xml — the single source of truth for wire layout
 schema/golden/ — hand-checked byte vectors consumed by both language test suites
 configs/local.toml — the config the advertised command names; channels, symbols, tick size, rates, batch factor
 docker-compose.yml
 docker/ — Dockerfiles and the user-defined bridge network definition
 bench/ — Criterion benches, load profiles, REPORT.md
-docs/ — WIRE.md, RUNNING.md, RECOVERY.md, BOOKS.md and PROTOCOL.md (M7 scope, written first)
+docs/ — WIRE.md, RUNNING.md, RECOVERY.md, BOOKS.md and PROTOCOL.md (FIX scope, written first)
 bench/REPORT.md — the benchmark methodology; a template until a rented host fills it in
-scripts/ — smoke.sh and verify-golden-corruption.sh exist; bench.sh, kill-restart-test.sh, calibrate-tsc.sh follow
+scripts/ — smoke.sh, verify-golden-corruption.sh, bench.sh, kill-restart-test.sh, quickfix-interop-test.sh
 tests/ — cross-process integration and FIX session conformance suites
 .github/workflows/ci.yml — both toolchains, correctness and allocation suites only, never latency
 ```
