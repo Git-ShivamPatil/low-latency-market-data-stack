@@ -107,6 +107,7 @@ enum class RejectReason : std::uint8_t {
     kDuplicateClientOrderId = 7,
     kUnknownOrder = 8,
     kQueueFull = 9,
+    kInvalidQuantity = 10,
 };
 
 [[nodiscard]] inline std::optional<RejectReason> RejectReason_from_raw(std::uint8_t v) noexcept {
@@ -121,6 +122,7 @@ enum class RejectReason : std::uint8_t {
         case 7: return RejectReason::kDuplicateClientOrderId;
         case 8: return RejectReason::kUnknownOrder;
         case 9: return RejectReason::kQueueFull;
+        case 10: return RejectReason::kInvalidQuantity;
         default: return std::nullopt;
     }
 }

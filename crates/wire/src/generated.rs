@@ -270,6 +270,7 @@ pub enum RejectReason {
     DuplicateClientOrderId = 7,
     UnknownOrder = 8,
     QueueFull = 9,
+    InvalidQuantity = 10,
 }
 
 impl RejectReason {
@@ -288,6 +289,7 @@ impl RejectReason {
             7 => Ok(Self::DuplicateClientOrderId),
             8 => Ok(Self::UnknownOrder),
             9 => Ok(Self::QueueFull),
+            10 => Ok(Self::InvalidQuantity),
             other => Err(WireError::InvalidEnum {
                 name: "RejectReason",
                 value: other as u64,

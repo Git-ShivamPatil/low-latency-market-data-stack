@@ -19,4 +19,5 @@ enable_testing()
 
 add_subdirectory(wire)
 add_subdirectory(ring)
+add_subdirectory(risk)
 add_subdirectory(gateway)

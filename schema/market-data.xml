@@ -162,6 +162,9 @@
       <!-- The ring was full. Rejecting is the only honest answer: blocking
            stalls the FIX session and dropping loses an order silently. -->
       <validValue name="QueueFull">9</validValue>
+      <!-- Zero quantity. Not "over the maximum": reporting it as that would put
+           a wrong sentence in an operator's log. -->
+      <validValue name="InvalidQuantity">10</validValue>
     </enum>
   </types>
 
