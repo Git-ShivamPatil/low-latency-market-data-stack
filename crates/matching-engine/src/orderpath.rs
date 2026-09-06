@@ -29,7 +29,7 @@ use wire::{
     OrderPathMessage, ReconcileRequestDecoder, RejectReason, Side,
 };
 
-use crate::engine::Engine;
+use crate::engine::{Engine, PassiveFill};
 use crate::feed::FeedPublisher;
 
 /// How many order-path messages to take in one pass.
@@ -39,6 +39,14 @@ use crate::feed::FeedPublisher;
 /// heartbeat timers, and a feed that stops heartbeating looks dead to every
 /// consumer.
 const ORDERS_PER_PASS: usize = 64;
+
+/// Order-path orders the engine will track at once.
+///
+/// Sized once at startup, like everything else on this path. Reaching it means
+/// the risk service's own open-order limit is looser than this one, which is a
+/// configuration mistake rather than a runtime condition -- and it is reported
+/// as a reject, not swallowed.
+const MAX_OWNED: usize = 4096;
 
 /// What the engine did with the order path, for the run summary.
 #[derive(Debug, Default, Clone, Copy)]
@@ -61,6 +69,19 @@ pub struct OrderPathStats {
     pub reports_dropped: u64,
 }
 
+/// One order that arrived over the order path and is still working.
+///
+/// The engine does not otherwise know who an order belongs to -- the generator's
+/// flow and a client's order are the same thing to a matching engine, which is
+/// correct. Reconciliation is the one place the difference matters: a gateway
+/// asking "what of mine are you holding" does not want the generator's book back,
+/// and 300 lines of somebody else's orders would drown the one that diverged.
+#[derive(Debug, Clone, Copy, Default)]
+struct Owned {
+    exchange_order_id: u64,
+    client_order_id: u64,
+}
+
 /// The engine's two rings.
 #[derive(Debug)]
 pub struct OrderPath {
@@ -68,6 +89,20 @@ pub struct OrderPath {
     reports: Producer,
     stats: OrderPathStats,
     scratch: [u8; 256],
+    /// Orders that came in over the ring and have not reached a terminal state.
+    ///
+    /// Bounded, and a full table refuses the order rather than forgetting an
+    /// older one: an order the engine holds but cannot name in a reconciliation
+    /// is invisible to the gateway, which is the one failure this whole
+    /// mechanism exists to prevent.
+    owned: Vec<Owned>,
+    /// Registrations and deregistrations for the engine's passive-fill watch,
+    /// applied at the top of the next `pump`.
+    ///
+    /// Deferred because both would need `&mut engine` in the middle of a call
+    /// that already holds it.
+    to_watch: Vec<u64>,
+    finished: Vec<u64>,
 }
 
 impl OrderPath {
@@ -84,6 +119,9 @@ impl OrderPath {
             reports,
             stats: OrderPathStats::default(),
             scratch: [0u8; 256],
+            owned: Vec::with_capacity(MAX_OWNED),
+            to_watch: Vec::with_capacity(64),
+            finished: Vec::with_capacity(64),
         })
     }
 
@@ -96,6 +134,47 @@ impl OrderPath {
     /// Returns how many it handled, so the caller can tell a quiet pass from a
     /// busy one without asking twice.
     pub fn pump(&mut self, engine: &mut Engine, feed: &mut FeedPublisher) -> io::Result<usize> {
+        // Watch registrations from the previous pass. Deferred, because both
+        // would otherwise need `&mut engine` in the middle of a call that
+        // already holds it.
+        for id in self.to_watch.drain(..) {
+            engine.watch_order(id);
+        }
+        for id in self.finished.drain(..) {
+            engine.unwatch_order(id);
+        }
+
+        // Fills against orders of ours that were already resting. Collected
+        // first, because reporting them needs `&mut self` and the engine's
+        // borrow has to be given back before that.
+        let mut passive = [PassiveFill {
+            resting_order_id: 0,
+            trade_id: 0,
+            price: 0,
+            quantity: 0,
+            leaves: 0,
+            symbol_id: 0,
+            side: Side::Bid,
+        }; 32];
+        let mut passive_count = 0usize;
+        let mut overflow = 0u64;
+        engine.take_passive_fills(|f| {
+            if passive_count < passive.len() {
+                passive[passive_count] = f;
+                passive_count += 1;
+            } else {
+                overflow += 1;
+            }
+        });
+        for f in passive.into_iter().take(passive_count) {
+            self.report_passive_fill(f);
+        }
+        if overflow > 0 {
+            // A fill a client was never told about. There is no louder failure
+            // on this path.
+            self.stats.reports_dropped += overflow;
+        }
+
         let mut handled = 0;
         while handled < ORDERS_PER_PASS {
             // The message is copied out of the slot before anything is done
@@ -150,7 +229,12 @@ impl OrderPath {
         let client_order_id = d.client_order_id();
         let symbol_id = d.symbol_id();
         let Ok(side) = d.side() else {
-            self.emit_reject(client_order_id, symbol_id, Side::Bid, RejectReason::UnknownSymbol);
+            self.emit_reject(
+                client_order_id,
+                symbol_id,
+                Side::Bid,
+                RejectReason::UnknownSymbol,
+            );
             return Ok(());
         };
         let price = d.price();
@@ -170,6 +254,8 @@ impl OrderPath {
             side,
             price,
             quantity,
+            // A client's order. The generator must not cancel or amend it.
+            false,
             |_, _| Ok(()),
             |f| {
                 if fill_count < fills.len() {
@@ -185,8 +271,7 @@ impl OrderPath {
             },
         )?;
 
-        for i in 0..fill_count {
-            let (trade_id, px, qty, leaves) = fills[i];
+        for (i, &(trade_id, px, qty, leaves)) in fills.iter().take(fill_count).enumerate() {
             let last = i + 1 == fill_count && leaves == 0 && overflowed == 0;
             self.emit(
                 client_order_id,
@@ -197,7 +282,11 @@ impl OrderPath {
                 leaves,
                 symbol_id,
                 side,
-                if last { ExecType::Fill } else { ExecType::PartialFill },
+                if last {
+                    ExecType::Fill
+                } else {
+                    ExecType::PartialFill
+                },
                 RejectReason::NotRejected,
             );
             self.stats.fills_reported += 1;
@@ -207,6 +296,25 @@ impl OrderPath {
         }
 
         if outcome.resting > 0 {
+            // Remembered only once it rests. An order that filled completely is
+            // already fully reported and the book does not hold it, so there is
+            // nothing left to reconcile against or to be told about.
+            if self.owned.len() < MAX_OWNED {
+                self.owned.push(Owned {
+                    exchange_order_id: outcome.order_id,
+                    client_order_id,
+                });
+                // And ask to be told if somebody hits it while it rests.
+                // Without this a client only ever hears about the fills it
+                // caused itself, and finds out about the rest from a
+                // reconciliation days later.
+                self.to_watch.push(outcome.order_id);
+            } else {
+                // The engine could no longer name this order in a
+                // reconciliation, so the gateway would have no way to find out
+                // about it. Counted loudly rather than left as a blind spot.
+                self.stats.reports_dropped += 1;
+            }
             // Acknowledged and resting. Sent after the fills so the gateway sees
             // the partial fills before the acknowledgement of what is left,
             // which is the order FIX expects.
@@ -227,6 +335,46 @@ impl OrderPath {
         Ok(())
     }
 
+    /// Turns a fill against one of our resting orders into an execution report.
+    fn report_passive_fill(&mut self, f: PassiveFill) {
+        let Some(owned) = self
+            .owned
+            .iter()
+            .copied()
+            .find(|o| o.exchange_order_id == f.resting_order_id)
+        else {
+            // Watched but not owned. The two lists are maintained together, so
+            // this should not happen -- which is exactly why it is counted
+            // rather than assumed away.
+            self.stats.reports_dropped += 1;
+            return;
+        };
+        self.emit(
+            owned.client_order_id,
+            f.resting_order_id,
+            f.trade_id,
+            f.price,
+            f.quantity,
+            f.leaves,
+            f.symbol_id,
+            f.side,
+            if f.leaves == 0 {
+                ExecType::Fill
+            } else {
+                ExecType::PartialFill
+            },
+            RejectReason::NotRejected,
+        );
+        self.stats.fills_reported += 1;
+        if f.leaves == 0 {
+            // Gone from the book: nothing left to reconcile against, and
+            // nothing left to be told about.
+            self.owned
+                .retain(|o| o.exchange_order_id != f.resting_order_id);
+            self.finished.push(f.resting_order_id);
+        }
+    }
+
     fn on_cancel(
         &mut self,
         d: CancelOrderDecoder<'_>,
@@ -242,6 +390,8 @@ impl OrderPath {
         // The cancel names the order by the exchange id the gateway was told.
         match engine.cancel_reported(feed, symbol_id, orig, |_, _| Ok(()))? {
             Some(remaining) => {
+                self.owned.retain(|o| o.exchange_order_id != orig);
+                self.finished.push(orig);
                 self.emit(
                     client_order_id,
                     orig,
@@ -286,48 +436,65 @@ impl OrderPath {
         let request_id = d.request_id();
         let mut named = 0u64;
 
-        // Every order the book is holding, whoever put it there. The engine does
-        // not distinguish orders that arrived over the order path from the flow
-        // generator's, and neither should the answer: what the gateway needs to
-        // know is what is actually resting.
+        // Only orders that arrived over the order path, and each one carries
+        // the client's own id back.
         //
-        // Emitted from inside the walk rather than collected first. A collected
-        // list would allocate, and this is the one place where the size of the
-        // allocation is proportional to the size of the book.
+        // The engine does not otherwise distinguish a client's order from the
+        // generator's, and it is right not to. But a gateway asking "what of
+        // mine are you holding" does not want the generator's book in the
+        // answer: a few hundred lines about orders it never placed would bury
+        // the one that diverged, and a report nobody can read is not a report.
+        //
+        // Each remembered order is looked up in the book, so one the engine has
+        // finished with simply does not appear -- which *is* the answer, and is
+        // what tells the gateway its own record is stale.
         let reports = &mut self.reports;
         let scratch = &mut self.scratch;
         let mut dropped = 0u64;
-        engine.books().for_each_symbol(&mut |symbol_id, book| {
-            for side in [Side::Bid, Side::Ask] {
-                book.for_each_order(side, &mut |o| {
-                    // A resting order has not been filled at all as far as the
-                    // book is concerned; quantity and leaves are the same number
-                    // and both are sent, because a gateway comparing against its
-                    // own log needs to see them agree.
-                    let Ok(n) = encode_exec_report(
-                        scratch,
-                        0,
-                        o.order_id,
-                        0,
-                        o.price,
-                        o.quantity,
-                        o.quantity,
-                        symbol_id,
-                        o.side,
-                        ExecType::OrderStatus,
-                        RejectReason::NotRejected,
-                    ) else {
-                        dropped += 1;
-                        return true;
-                    };
-                    if reports.push(&scratch[..n]).is_err() {
-                        dropped += 1;
-                    } else {
-                        named += 1;
+        let books = engine.books();
+        self.owned.retain(|owned| {
+            let mut found = None;
+            books.for_each_symbol(&mut |symbol_id, book| {
+                if found.is_none() {
+                    // The trait's `get`, explicitly. The inherent one on the
+                    // reference book returns a borrow into the book, which
+                    // cannot outlive this closure; the trait's returns a copy.
+                    if let Some(o) = OrderBook::get(book, owned.exchange_order_id) {
+                        found = Some((symbol_id, o));
                     }
-                    true
-                });
+                }
+            });
+            let Some((symbol_id, o)) = found else {
+                // Gone from the book since it was remembered. Forgetting it here
+                // is what keeps the table from filling with finished orders.
+                return false;
+            };
+            // A resting order has not been filled as far as the book is
+            // concerned, so quantity and leaves are the same number. Both are
+            // sent, because a gateway comparing against its own log needs to see
+            // them agree rather than infer it.
+            let Ok(n) = encode_exec_report(
+                scratch,
+                owned.client_order_id,
+                owned.exchange_order_id,
+                0,
+                o.price,
+                o.quantity,
+                o.quantity,
+                symbol_id,
+                o.side,
+                ExecType::OrderStatus,
+                RejectReason::NotRejected,
+            ) else {
+                dropped += 1;
+                return true;
+            };
+            if reports.push(&scratch[..n]).is_err() {
+                dropped += 1;
+            } else {
+                named += 1;
             }
+            true
         });
         self.stats.orders_named_in_reconciliation += named;
         self.stats.reports_dropped += dropped;

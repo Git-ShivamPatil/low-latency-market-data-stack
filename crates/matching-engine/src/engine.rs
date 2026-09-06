@@ -38,6 +38,25 @@ pub struct Fill {
     pub leaves: u32,
 }
 
+/// A fill against an order that was already resting on the book.
+///
+/// The aggressor learns about its fills from [`Engine::submit_reported`], which
+/// is the call it made. The *passive* side made its call minutes ago and has
+/// been waiting ever since -- so without this, a client whose order rests and is
+/// then hit is never told, and finds out only when a reconciliation says the
+/// engine no longer holds an order the client still believes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassiveFill {
+    pub resting_order_id: u64,
+    pub trade_id: u64,
+    pub price: i64,
+    pub quantity: u32,
+    /// Still resting after this fill. Zero means the order is gone.
+    pub leaves: u32,
+    pub symbol_id: u16,
+    pub side: Side,
+}
+
 /// What became of a submitted order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubmitOutcome {
@@ -95,12 +114,21 @@ pub struct SymbolState {
     pub tick_size: i64,
     /// Random-walks; new orders are placed relative to it.
     pub mid: i64,
-    /// Ids currently resting, in insertion order.
+    /// Ids resting **that the flow generator is allowed to act on again**, in
+    /// insertion order.
     ///
     /// A `Vec` rather than iterating the book's `HashMap`, because `HashMap`
     /// iteration order is randomised per process — picking a victim that way
     /// would make the whole run unreproducible, and reproducibility is what lets
     /// the smoke test tell a bug from a coin flip.
+    ///
+    /// **A client's order never goes in here.** The generator stands in for
+    /// other market participants, and other participants do not get to cancel
+    /// your order. When the order path landed, client orders joined this list
+    /// and the generator started cancelling them seconds later — which looks
+    /// exactly like the exchange losing an order, and was found by the
+    /// reconciliation test asking the engine for an order it had just cancelled
+    /// on its own initiative.
     pub live: Vec<u64>,
 }
 
@@ -129,6 +157,18 @@ pub struct Engine {
     next_order_id: u64,
     next_trade_id: u64,
     stats: EngineStats,
+    /// Resting orders somebody wants to be told about, sorted so membership is
+    /// a binary search rather than a scan on every fill.
+    ///
+    /// Empty unless an order path is attached, which is why the engine on its
+    /// own pays nothing for this.
+    watched: Vec<u64>,
+    /// Fills against watched orders, waiting to be collected.
+    passive_fills: Vec<PassiveFill>,
+    /// Fills against a watched order that did not fit. Non-zero means a client
+    /// was not told about a fill, which is the one thing on this path that must
+    /// never pass quietly.
+    passive_fills_dropped: u64,
 }
 
 impl Engine {
@@ -149,7 +189,39 @@ impl Engine {
             next_order_id: 1,
             next_trade_id: 1,
             stats: EngineStats::default(),
+            watched: Vec::new(),
+            passive_fills: Vec::new(),
+            passive_fills_dropped: 0,
         }
+    }
+
+    /// Asks to be told when `order_id` is filled while resting.
+    ///
+    /// Registered by the order path when a client's order rests, and dropped
+    /// when it reaches a terminal state. The engine does not otherwise care who
+    /// an order belongs to, and should not.
+    pub fn watch_order(&mut self, order_id: u64) {
+        if let Err(pos) = self.watched.binary_search(&order_id) {
+            self.watched.insert(pos, order_id);
+        }
+    }
+
+    pub fn unwatch_order(&mut self, order_id: u64) {
+        if let Ok(pos) = self.watched.binary_search(&order_id) {
+            self.watched.remove(pos);
+        }
+    }
+
+    /// Hands over every passive fill recorded since the last call.
+    pub fn take_passive_fills(&mut self, mut f: impl FnMut(PassiveFill)) {
+        for fill in self.passive_fills.drain(..) {
+            f(fill);
+        }
+    }
+
+    /// Fills against a watched order that could not be recorded.
+    pub fn passive_fills_dropped(&self) -> u64 {
+        self.passive_fills_dropped
     }
 
     pub fn books(&self) -> &Books {
@@ -268,8 +340,18 @@ impl Engine {
         quantity: u32,
         on_sequence: impl FnMut(&Self, u64) -> io::Result<()>,
     ) -> io::Result<()> {
-        self.submit_reported(feed, symbol_id, side, price, quantity, on_sequence, |_| {})
-            .map(|_| ())
+        self.submit_reported(
+            feed,
+            symbol_id,
+            side,
+            price,
+            quantity,
+            // The generator's own flow: it may cancel and amend this later.
+            true,
+            on_sequence,
+            |_| {},
+        )
+        .map(|_| ())
     }
 
     /// `submit`, plus a running account of what happened to the order.
@@ -278,6 +360,10 @@ impl Engine {
     /// does: a gateway has to turn each fill into an `ExecutionReport`, and it
     /// cannot reconstruct them from the feed, because the feed says a trade
     /// happened without saying whose order it was.
+    // Nine arguments, and clippy is right that this is a lot. Bundling them into
+    // a struct would move the same nine values one line further away from the
+    // matching loop that uses them, which is where the reader wants them.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_reported(
         &mut self,
         feed: &mut FeedPublisher,
@@ -285,6 +371,9 @@ impl Engine {
         side: Side,
         price: i64,
         quantity: u32,
+        // Whether the flow generator may later cancel or amend this order: true
+        // for the generator's own orders, false for a client's.
+        generator_may_recycle: bool,
         mut on_sequence: impl FnMut(&Self, u64) -> io::Result<()>,
         mut on_fill: impl FnMut(Fill),
     ) -> io::Result<SubmitOutcome> {
@@ -367,6 +456,25 @@ impl Engine {
                 quantity: fill,
                 leaves: remaining,
             });
+            // And the other side of the same trade. The passive order's owner
+            // made its call long ago and is not in this stack frame; if nobody
+            // records this, nobody ever tells them.
+            if self.watched.binary_search(&resting_id).is_ok() {
+                const MAX_PASSIVE_FILLS: usize = 1024;
+                if self.passive_fills.len() < MAX_PASSIVE_FILLS {
+                    self.passive_fills.push(PassiveFill {
+                        resting_order_id: resting_id,
+                        trade_id,
+                        price: best_price,
+                        quantity: fill,
+                        leaves: resting.quantity - fill,
+                        symbol_id,
+                        side: opposite,
+                    });
+                } else {
+                    self.passive_fills_dropped += 1;
+                }
+            }
         }
 
         if matched_any {
@@ -385,8 +493,10 @@ impl Engine {
                 },
             )?;
             on_sequence(self, seq)?;
-            if let Some(idx) = self.symbol_index(symbol_id) {
-                self.symbols[idx].live.push(order_id);
+            if generator_may_recycle {
+                if let Some(idx) = self.symbol_index(symbol_id) {
+                    self.symbols[idx].live.push(order_id);
+                }
             }
         }
         Ok(SubmitOutcome {

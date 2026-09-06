@@ -218,8 +218,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut order_path = match (&args.order_ring, &args.exec_ring) {
         (Some(o), Some(e)) => {
             let p = OrderPath::open(o, e).map_err(|err| {
-                format!("order path: {err}
-  the risk service creates both rings; start it first")
+                format!(
+                    "order path: {err}
+  the risk service creates both rings; start it first"
+                )
             })?;
             eprintln!("  order path attached: orders from {o}, reports to {e}");
             Some(p)
@@ -492,6 +494,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             s.reconciles_answered,
             s.orders_named_in_reconciliation
         );
+        if engine.passive_fills_dropped() > 0 {
+            // A fill against a client's resting order that was never recorded,
+            // so the client will never be told about it. Louder than anything
+            // else the order path reports.
+            eprintln!(
+                "  order path: {} PASSIVE FILLS WERE NOT RECORDED -- a client's resting order                  was hit and the report was lost.",
+                engine.passive_fills_dropped()
+            );
+        }
         if s.reports_dropped > 0 {
             // Loud, and not a warning that scrolls past. A dropped report means
             // the gateway believes an order is in a state it is not, and the

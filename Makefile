@@ -53,7 +53,7 @@ $(CPP_BUILD)/CMakeCache.txt:
 # --- test ------------------------------------------------------------------
 
 .PHONY: test
-test: test-rust test-cpp test-corruption test-killrestart test-quickfix test-ring-interop smoke ## Run every correctness suite
+test: test-rust test-cpp test-corruption test-killrestart test-quickfix test-ring-interop test-orderpath smoke ## Run every correctness suite
 
 .PHONY: test-rust
 test-rust: ## cargo test the workspace
@@ -70,6 +70,10 @@ test-killrestart: build-cpp ## SIGKILL the FIX gateway mid-session and require i
 .PHONY: test-ring-interop
 test-ring-interop: build-cpp ## Put a Rust process and a C++ process on one shared-memory ring
 	MDSTACK_BUILD_DIR=$(CPP_BUILD) scripts/ring-interop-test.sh
+
+.PHONY: test-orderpath
+test-orderpath: build-cpp ## One order across five processes, four rings and a FIX session
+	MDSTACK_BUILD_DIR=$(CPP_BUILD) scripts/order-path-test.sh
 
 .PHONY: test-quickfix
 test-quickfix: build-cpp ## Run the FIX session layer against QuickFIX and let QuickFIX judge it

@@ -148,6 +148,32 @@ jobs:
           path: results/smoke/
           retention-days: 7
 
+  order-path:
+    name: One order across the whole stack
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build the C++ tree
+        run: |
+          cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build cpp/build
+      # Five processes, four shared-memory rings, a FIX session and a multicast
+      # feed. The assertion that matters is the last one: a process that has
+      # never heard of the order path rebuilds the same book the engine holds.
+      - name: An order becomes a fill, an ExecutionReport, and a book update
+        run: scripts/order-path-test.sh
+      - name: Keep the artifacts when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: order-path-artifacts
+          path: results/order-path/
+          retention-days: 7
+
   cross-language:
     name: The two languages agree, byte for byte
     runs-on: ubuntu-24.04
