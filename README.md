@@ -5,7 +5,7 @@
 **Price-time-priority matching engine publishing a binary feed over redundant A/B UDP multicast, with a Rust feed handler that arbitrates the two and rebuilds MBP/MBO books without allocating.**
 
 ![status](https://img.shields.io/badge/status-in_development-111111?style=flat-square)
-![progress](https://img.shields.io/badge/milestones-7_of_9-4a4a4a?style=flat-square)
+![progress](https://img.shields.io/badge/milestones-8_of_9-4a4a4a?style=flat-square)
 ![licence](https://img.shields.io/badge/licence-MIT-767676?style=flat-square)
 
 ![Rust](https://img.shields.io/badge/Rust-1.98-000000?style=flat-square&logo=rust&logoColor=white)
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 7 of 9 milestones complete.**
+> **This is a build in progress — 8 of 9 milestones complete.**
 >
 > The figures below (`1M+ msg/s · ~100ns decode`) have now been **measured**: 2.78M msg/s sustained receiver-side with zero gaps, three runs within 0.7%, and 8.2ns per message to decode.
 > They are single-host, over loopback, and **batched 32 messages to a datagram** — which is not a footnote, because at one message per datagram the kernel caps out an order of magnitude lower.
@@ -67,7 +67,7 @@ flowchart LR
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[██████████████████░░░░░░] 7/9 milestones · 78%
+[█████████████████████░░░] 8/9 milestones · 89%
 ```
 
 - [x] **M1 · Workspace, wire schema, and cross-language codegen**  
@@ -91,8 +91,9 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - [x] **M7 · C++ FIX 4.4 gateway — the session layer**  
   A FIX session that survives a hard kill: correct sequence numbers, correct resend, correct gap fill, verified against an implementation this project did not write.  
   <sub>Verified two ways, because one would not have been enough. **51 session checks** drive the state machine directly — a resend request for a range half of which is administrative, a `SequenceReset` that moves backwards, `PossDupFlag` on a number above the expected one — inputs a real engine will not produce on demand. Then **QuickFIX 1.15.1** judges the same session as an independent acceptor: a clean logon-orders-logout, a five-message gap manufactured with `fix-seqtool`, and a `ResetSeqNumFlag=Y` reset. **Zero rejects across all three.** `scripts/kill-restart-test.sh` `SIGKILL`s both ends mid-session and both resume from the durable numbers with no reversal — sequence numbers are `fsync`'d before the message they describe reaches the socket, and two slots on separate sectors survive a torn write. **QuickFIX found a bug the in-process checks could not:** an echoed `ResetSeqNumFlag` was read as a second instruction and reissued the sequence number the logon had already spent. That is what an independent counterparty is for, and the trace is in [docs/PROTOCOL.md](docs/PROTOCOL.md). The cross-check runs without a FIX dictionary, so it covers the session layer and **not** application message content — stated here rather than left for a reader to find.</sub>
-- [ ] **M8 · Risk service, order path into the engine, and restart reconciliation**  
-  An order crosses the whole stack — gateway to risk to engine to fill to execution report — and open order state is reconstructed correctly after a hard crash.
+- [x] **M8 · Risk service, order path into the engine, and restart reconciliation**  
+  An order crosses the whole stack — gateway to risk to engine to fill to execution report — and open order state is reconstructed correctly after a hard crash.  
+  <sub>Five processes and four shared-memory SPSC rings. `scripts/order-path-test.sh` sends **one order** over FIX and follows it: risk passes it, the engine fills it against resting liquidity, the fill returns as a FIX `ExecutionReport`, and the `feed-handler` — a fourth process that has never heard of the order path and only reads multicast — rebuilds a book **identical to the engine's at all 795 shared checkpoints**. That last one is the only assertion that proves the market-data half and the order-entry half are the same system. In the same run a quantity breach is rejected with a reason and **never reaches the engine**, witnessed by the engine's own counter rather than by risk reporting its own rejection. Then the gateway is **`SIGKILL`ed with an order working**, restarts from its write-ahead log, asks the engine what it is holding, and the two agree — and nothing is repaired, because the divergence report is the deliverable. Pre-trade limits run on a path that does not touch the heap: **0 allocations across 1,000,000 risk decisions**, under both g++ and clang++, with a control that allocates on purpose and requires the counter to notice. The two ring implementations are generated from one schema and checked against each other by a Rust process and a C++ process on opposite ends of the same ring, 200,000 messages each way, zero mismatches. See [docs/ORDER-PATH.md](docs/ORDER-PATH.md).</sub>
 - [ ] **M9 · Hardening, documentation, and a tagged release**  
   A stranger clones the repo on a clean machine and the four commands on the portfolio page work in order.
 
@@ -197,7 +198,10 @@ crates/replay-service/ — bounded datagram history + TCP range server         [
 cpp/CMakeLists.txt
 cpp/wire/ — generated headers, shared with the Rust codec via the same schema
 cpp/gateway/ — FIX 4.4 session and application layer, sequence persistence
-cpp/risk/ — pre-trade limits on an allocation-free path, counting operator new override
+cpp/risk/ — pre-trade limits on an allocation-free path, counting operator new override   [M8]
+         — bin `risk-service`; the process in the middle of all four rings              [M8]
+cpp/ring/ — SPSC shared-memory ring, the C++ half of one generated agreement            [M8]
+crates/ring/ — the Rust half, plus `ring-poke` for the cross-language check             [M8]
 cpp/gateway/interop/ — a QuickFIX acceptor that judges the session layer          [M7]
 cpp/gateway/tests/ — 51 session checks driving the state machine directly         [M7]
 schema/market-data.xml — the single source of truth for wire layout
