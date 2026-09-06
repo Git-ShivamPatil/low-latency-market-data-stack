@@ -73,6 +73,58 @@ enum class ModifyReason : std::uint8_t {
     }
 }
 
+enum class ExecType : std::uint8_t {
+    kAcknowledged = 0,
+    kPartialFill = 1,
+    kFill = 2,
+    kCanceled = 3,
+    kRejected = 4,
+    kOrderStatus = 5,
+    kStatusComplete = 6,
+};
+
+[[nodiscard]] inline std::optional<ExecType> ExecType_from_raw(std::uint8_t v) noexcept {
+    switch (v) {
+        case 0: return ExecType::kAcknowledged;
+        case 1: return ExecType::kPartialFill;
+        case 2: return ExecType::kFill;
+        case 3: return ExecType::kCanceled;
+        case 4: return ExecType::kRejected;
+        case 5: return ExecType::kOrderStatus;
+        case 6: return ExecType::kStatusComplete;
+        default: return std::nullopt;
+    }
+}
+
+enum class RejectReason : std::uint8_t {
+    kNotRejected = 0,
+    kUnknownSymbol = 1,
+    kMaxOrderQuantity = 2,
+    kMaxNotional = 3,
+    kPriceCollar = 4,
+    kOpenOrderLimit = 5,
+    kPositionLimit = 6,
+    kDuplicateClientOrderId = 7,
+    kUnknownOrder = 8,
+    kQueueFull = 9,
+};
+
+[[nodiscard]] inline std::optional<RejectReason> RejectReason_from_raw(std::uint8_t v) noexcept {
+    switch (v) {
+        case 0: return RejectReason::kNotRejected;
+        case 1: return RejectReason::kUnknownSymbol;
+        case 2: return RejectReason::kMaxOrderQuantity;
+        case 3: return RejectReason::kMaxNotional;
+        case 4: return RejectReason::kPriceCollar;
+        case 5: return RejectReason::kOpenOrderLimit;
+        case 6: return RejectReason::kPositionLimit;
+        case 7: return RejectReason::kDuplicateClientOrderId;
+        case 8: return RejectReason::kUnknownOrder;
+        case 9: return RejectReason::kQueueFull;
+        default: return std::nullopt;
+    }
+}
+
 namespace tmpl {
 inline constexpr std::uint16_t kAddOrder = 1;
 inline constexpr std::uint16_t kModifyOrder = 2;
@@ -81,6 +133,10 @@ inline constexpr std::uint16_t kTrade = 4;
 inline constexpr std::uint16_t kSnapshot = 5;
 inline constexpr std::uint16_t kHeartbeat = 6;
 inline constexpr std::uint16_t kSequenceReset = 7;
+inline constexpr std::uint16_t kNewOrder = 8;
+inline constexpr std::uint16_t kCancelOrder = 9;
+inline constexpr std::uint16_t kExecReport = 10;
+inline constexpr std::uint16_t kReconcileRequest = 11;
 }  // namespace tmpl
 
 /// Read-only view over the datagram header.
@@ -658,6 +714,267 @@ class SequenceResetDecoder {
     std::memset(buf, 0, kLen);
     detail::write_message_header(buf, 8, tmpl::kSequenceReset);
     detail::store_le<std::uint64_t>(buf + kMessageHeaderLen, new_sequence);
+    return kLen;
+}
+
+// --- NewOrder ------------------------------------------------------
+
+/// A client order entering the system: gateway to risk to engine
+class NewOrderDecoder {
+  public:
+    static constexpr std::uint16_t kTemplateId = 8;
+    static constexpr std::uint16_t kBlockLength = 24;
+
+    /// Wraps a buffer whose first byte is the message header. The root
+    /// block length comes from the wire so a newer publisher that
+    /// appended fields is skipped rather than misparsed.
+    [[nodiscard]] static std::optional<NewOrderDecoder> wrap(const std::byte* p, std::size_t len) noexcept {
+        auto hdr = MessageHeaderDecoder::wrap(p, len);
+        if (!hdr) return std::nullopt;
+        if (hdr->template_id() != kTemplateId) return std::nullopt;
+        const std::size_t root_len = hdr->block_length();
+        if (root_len < kBlockLength) return std::nullopt;
+        if (len < kMessageHeaderLen + root_len) return std::nullopt;
+        NewOrderDecoder d(p, root_len);
+        return d;
+    }
+
+    NewOrderDecoder(const std::byte* p, std::size_t root_len) noexcept
+        : p_(p), root_len_(root_len) {}
+
+    /// The gateway's id for this order; carries FIX ClOrdID's meaning
+    [[nodiscard]] std::uint64_t client_order_id() const noexcept { return detail::load_le<std::uint64_t>(p_ + kMessageHeaderLen); }
+    /// Fixed point, scaled by 10^-4.
+    [[nodiscard]] std::int64_t price() const noexcept { return detail::load_le<std::int64_t>(p_ + kMessageHeaderLen + 8); }
+    [[nodiscard]] std::uint32_t quantity() const noexcept { return detail::load_le<std::uint32_t>(p_ + kMessageHeaderLen + 16); }
+    [[nodiscard]] std::uint16_t symbol_id() const noexcept { return detail::load_le<std::uint16_t>(p_ + kMessageHeaderLen + 20); }
+    [[nodiscard]] std::uint8_t side_raw() const noexcept { return detail::load_le<std::uint8_t>(p_ + kMessageHeaderLen + 22); }
+    /// Validating accessor; returns nullopt on an undefined value.
+    [[nodiscard]] std::optional<Side> side() const noexcept { return Side_from_raw(side_raw()); }
+
+    [[nodiscard]] std::size_t total_len() const noexcept { return kMessageHeaderLen + root_len_; }
+
+  private:
+    const std::byte* p_;
+    std::size_t root_len_;
+};
+
+/// Encodes a `NewOrder` at `buf[0]`, header included. Reserved bytes
+/// are zeroed, which is what makes a re-encode byte-identical.
+[[nodiscard]] inline std::optional<std::size_t> encode_new_order(
+    std::byte* buf, std::size_t cap
+    , std::uint64_t client_order_id
+    , std::int64_t price
+    , std::uint32_t quantity
+    , std::uint16_t symbol_id
+    , Side side
+) noexcept {
+    constexpr std::size_t kLen = kMessageHeaderLen + 24;
+    if (cap < kLen) return std::nullopt;
+    std::memset(buf, 0, kLen);
+    detail::write_message_header(buf, 24, tmpl::kNewOrder);
+    detail::store_le<std::uint64_t>(buf + kMessageHeaderLen, client_order_id);
+    detail::store_le<std::int64_t>(buf + kMessageHeaderLen + 8, price);
+    detail::store_le<std::uint32_t>(buf + kMessageHeaderLen + 16, quantity);
+    detail::store_le<std::uint16_t>(buf + kMessageHeaderLen + 20, symbol_id);
+    detail::store_le<std::uint8_t>(buf + kMessageHeaderLen + 22, static_cast<std::uint8_t>(side));
+    return kLen;
+}
+
+// --- CancelOrder ---------------------------------------------------
+
+/// Cancel a live order: gateway to risk to engine
+class CancelOrderDecoder {
+  public:
+    static constexpr std::uint16_t kTemplateId = 9;
+    static constexpr std::uint16_t kBlockLength = 24;
+
+    /// Wraps a buffer whose first byte is the message header. The root
+    /// block length comes from the wire so a newer publisher that
+    /// appended fields is skipped rather than misparsed.
+    [[nodiscard]] static std::optional<CancelOrderDecoder> wrap(const std::byte* p, std::size_t len) noexcept {
+        auto hdr = MessageHeaderDecoder::wrap(p, len);
+        if (!hdr) return std::nullopt;
+        if (hdr->template_id() != kTemplateId) return std::nullopt;
+        const std::size_t root_len = hdr->block_length();
+        if (root_len < kBlockLength) return std::nullopt;
+        if (len < kMessageHeaderLen + root_len) return std::nullopt;
+        CancelOrderDecoder d(p, root_len);
+        return d;
+    }
+
+    CancelOrderDecoder(const std::byte* p, std::size_t root_len) noexcept
+        : p_(p), root_len_(root_len) {}
+
+    /// Identifies this cancel request, not the order
+    [[nodiscard]] std::uint64_t client_order_id() const noexcept { return detail::load_le<std::uint64_t>(p_ + kMessageHeaderLen); }
+    /// The order to cancel
+    [[nodiscard]] std::uint64_t orig_client_order_id() const noexcept { return detail::load_le<std::uint64_t>(p_ + kMessageHeaderLen + 8); }
+    [[nodiscard]] std::uint16_t symbol_id() const noexcept { return detail::load_le<std::uint16_t>(p_ + kMessageHeaderLen + 16); }
+    [[nodiscard]] std::uint8_t side_raw() const noexcept { return detail::load_le<std::uint8_t>(p_ + kMessageHeaderLen + 18); }
+    /// Validating accessor; returns nullopt on an undefined value.
+    [[nodiscard]] std::optional<Side> side() const noexcept { return Side_from_raw(side_raw()); }
+
+    [[nodiscard]] std::size_t total_len() const noexcept { return kMessageHeaderLen + root_len_; }
+
+  private:
+    const std::byte* p_;
+    std::size_t root_len_;
+};
+
+/// Encodes a `CancelOrder` at `buf[0]`, header included. Reserved bytes
+/// are zeroed, which is what makes a re-encode byte-identical.
+[[nodiscard]] inline std::optional<std::size_t> encode_cancel_order(
+    std::byte* buf, std::size_t cap
+    , std::uint64_t client_order_id
+    , std::uint64_t orig_client_order_id
+    , std::uint16_t symbol_id
+    , Side side
+) noexcept {
+    constexpr std::size_t kLen = kMessageHeaderLen + 24;
+    if (cap < kLen) return std::nullopt;
+    std::memset(buf, 0, kLen);
+    detail::write_message_header(buf, 24, tmpl::kCancelOrder);
+    detail::store_le<std::uint64_t>(buf + kMessageHeaderLen, client_order_id);
+    detail::store_le<std::uint64_t>(buf + kMessageHeaderLen + 8, orig_client_order_id);
+    detail::store_le<std::uint16_t>(buf + kMessageHeaderLen + 16, symbol_id);
+    detail::store_le<std::uint8_t>(buf + kMessageHeaderLen + 18, static_cast<std::uint8_t>(side));
+    return kLen;
+}
+
+// --- ExecReport ----------------------------------------------------
+
+/// What happened to an order: engine to risk to gateway, or risk to gateway for a reject
+class ExecReportDecoder {
+  public:
+    static constexpr std::uint16_t kTemplateId = 10;
+    static constexpr std::uint16_t kBlockLength = 48;
+
+    /// Wraps a buffer whose first byte is the message header. The root
+    /// block length comes from the wire so a newer publisher that
+    /// appended fields is skipped rather than misparsed.
+    [[nodiscard]] static std::optional<ExecReportDecoder> wrap(const std::byte* p, std::size_t len) noexcept {
+        auto hdr = MessageHeaderDecoder::wrap(p, len);
+        if (!hdr) return std::nullopt;
+        if (hdr->template_id() != kTemplateId) return std::nullopt;
+        const std::size_t root_len = hdr->block_length();
+        if (root_len < kBlockLength) return std::nullopt;
+        if (len < kMessageHeaderLen + root_len) return std::nullopt;
+        ExecReportDecoder d(p, root_len);
+        return d;
+    }
+
+    ExecReportDecoder(const std::byte* p, std::size_t root_len) noexcept
+        : p_(p), root_len_(root_len) {}
+
+    [[nodiscard]] std::uint64_t client_order_id() const noexcept { return detail::load_le<std::uint64_t>(p_ + kMessageHeaderLen); }
+    /// The engine's order id; zero when the order never reached it
+    [[nodiscard]] std::uint64_t exchange_order_id() const noexcept { return detail::load_le<std::uint64_t>(p_ + kMessageHeaderLen + 8); }
+    /// Zero unless this report is a fill
+    [[nodiscard]] std::uint64_t trade_id() const noexcept { return detail::load_le<std::uint64_t>(p_ + kMessageHeaderLen + 16); }
+    /// Fill price on a fill, order price otherwise
+    /// Fixed point, scaled by 10^-4.
+    [[nodiscard]] std::int64_t price() const noexcept { return detail::load_le<std::int64_t>(p_ + kMessageHeaderLen + 24); }
+    /// This event's quantity: filled on a fill, ordered on an acknowledgement
+    [[nodiscard]] std::uint32_t quantity() const noexcept { return detail::load_le<std::uint32_t>(p_ + kMessageHeaderLen + 32); }
+    /// Still live on the book after this event
+    [[nodiscard]] std::uint32_t leaves_quantity() const noexcept { return detail::load_le<std::uint32_t>(p_ + kMessageHeaderLen + 36); }
+    [[nodiscard]] std::uint16_t symbol_id() const noexcept { return detail::load_le<std::uint16_t>(p_ + kMessageHeaderLen + 40); }
+    [[nodiscard]] std::uint8_t side_raw() const noexcept { return detail::load_le<std::uint8_t>(p_ + kMessageHeaderLen + 42); }
+    /// Validating accessor; returns nullopt on an undefined value.
+    [[nodiscard]] std::optional<Side> side() const noexcept { return Side_from_raw(side_raw()); }
+    [[nodiscard]] std::uint8_t exec_type_raw() const noexcept { return detail::load_le<std::uint8_t>(p_ + kMessageHeaderLen + 43); }
+    /// Validating accessor; returns nullopt on an undefined value.
+    [[nodiscard]] std::optional<ExecType> exec_type() const noexcept { return ExecType_from_raw(exec_type_raw()); }
+    [[nodiscard]] std::uint8_t reject_reason_raw() const noexcept { return detail::load_le<std::uint8_t>(p_ + kMessageHeaderLen + 44); }
+    /// Validating accessor; returns nullopt on an undefined value.
+    [[nodiscard]] std::optional<RejectReason> reject_reason() const noexcept { return RejectReason_from_raw(reject_reason_raw()); }
+
+    [[nodiscard]] std::size_t total_len() const noexcept { return kMessageHeaderLen + root_len_; }
+
+  private:
+    const std::byte* p_;
+    std::size_t root_len_;
+};
+
+/// Encodes a `ExecReport` at `buf[0]`, header included. Reserved bytes
+/// are zeroed, which is what makes a re-encode byte-identical.
+[[nodiscard]] inline std::optional<std::size_t> encode_exec_report(
+    std::byte* buf, std::size_t cap
+    , std::uint64_t client_order_id
+    , std::uint64_t exchange_order_id
+    , std::uint64_t trade_id
+    , std::int64_t price
+    , std::uint32_t quantity
+    , std::uint32_t leaves_quantity
+    , std::uint16_t symbol_id
+    , Side side
+    , ExecType exec_type
+    , RejectReason reject_reason
+) noexcept {
+    constexpr std::size_t kLen = kMessageHeaderLen + 48;
+    if (cap < kLen) return std::nullopt;
+    std::memset(buf, 0, kLen);
+    detail::write_message_header(buf, 48, tmpl::kExecReport);
+    detail::store_le<std::uint64_t>(buf + kMessageHeaderLen, client_order_id);
+    detail::store_le<std::uint64_t>(buf + kMessageHeaderLen + 8, exchange_order_id);
+    detail::store_le<std::uint64_t>(buf + kMessageHeaderLen + 16, trade_id);
+    detail::store_le<std::int64_t>(buf + kMessageHeaderLen + 24, price);
+    detail::store_le<std::uint32_t>(buf + kMessageHeaderLen + 32, quantity);
+    detail::store_le<std::uint32_t>(buf + kMessageHeaderLen + 36, leaves_quantity);
+    detail::store_le<std::uint16_t>(buf + kMessageHeaderLen + 40, symbol_id);
+    detail::store_le<std::uint8_t>(buf + kMessageHeaderLen + 42, static_cast<std::uint8_t>(side));
+    detail::store_le<std::uint8_t>(buf + kMessageHeaderLen + 43, static_cast<std::uint8_t>(exec_type));
+    detail::store_le<std::uint8_t>(buf + kMessageHeaderLen + 44, static_cast<std::uint8_t>(reject_reason));
+    return kLen;
+}
+
+// --- ReconcileRequest ----------------------------------------------
+
+/// After a restart: name every order you still hold for me
+class ReconcileRequestDecoder {
+  public:
+    static constexpr std::uint16_t kTemplateId = 11;
+    static constexpr std::uint16_t kBlockLength = 16;
+
+    /// Wraps a buffer whose first byte is the message header. The root
+    /// block length comes from the wire so a newer publisher that
+    /// appended fields is skipped rather than misparsed.
+    [[nodiscard]] static std::optional<ReconcileRequestDecoder> wrap(const std::byte* p, std::size_t len) noexcept {
+        auto hdr = MessageHeaderDecoder::wrap(p, len);
+        if (!hdr) return std::nullopt;
+        if (hdr->template_id() != kTemplateId) return std::nullopt;
+        const std::size_t root_len = hdr->block_length();
+        if (root_len < kBlockLength) return std::nullopt;
+        if (len < kMessageHeaderLen + root_len) return std::nullopt;
+        ReconcileRequestDecoder d(p, root_len);
+        return d;
+    }
+
+    ReconcileRequestDecoder(const std::byte* p, std::size_t root_len) noexcept
+        : p_(p), root_len_(root_len) {}
+
+    /// Echoed on the StatusComplete that ends the answer
+    [[nodiscard]] std::uint64_t request_id() const noexcept { return detail::load_le<std::uint64_t>(p_ + kMessageHeaderLen); }
+
+    [[nodiscard]] std::size_t total_len() const noexcept { return kMessageHeaderLen + root_len_; }
+
+  private:
+    const std::byte* p_;
+    std::size_t root_len_;
+};
+
+/// Encodes a `ReconcileRequest` at `buf[0]`, header included. Reserved bytes
+/// are zeroed, which is what makes a re-encode byte-identical.
+[[nodiscard]] inline std::optional<std::size_t> encode_reconcile_request(
+    std::byte* buf, std::size_t cap
+    , std::uint64_t request_id
+) noexcept {
+    constexpr std::size_t kLen = kMessageHeaderLen + 16;
+    if (cap < kLen) return std::nullopt;
+    std::memset(buf, 0, kLen);
+    detail::write_message_header(buf, 16, tmpl::kReconcileRequest);
+    detail::store_le<std::uint64_t>(buf + kMessageHeaderLen, request_id);
     return kLen;
 }
 

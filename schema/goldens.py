@@ -68,6 +68,15 @@ FMT_SNAPSHOT_ORDER = "<QqIBBH"   # orderId price quantity side reserved reserved
 FMT_HEARTBEAT = "<Q"             # lastSequence
 FMT_SEQUENCE_RESET = "<Q"        # newSequence
 
+# Order path. These never travel in a datagram -- one lives in one shared-memory
+# ring slot -- so their vectors carry no packetHeader. See docs/ORDER-PATH.md.
+FMT_NEW_ORDER = "<QqIHBB"        # clientOrderId price quantity symbolId side reserved
+FMT_CANCEL_ORDER = "<QQHBBI"     # clientOrderId origClientOrderId symbolId side reserved reserved2
+FMT_EXEC_REPORT = "<QQQqIIHBBBBH"  # clientOrderId exchangeOrderId tradeId price quantity
+                                   # leavesQuantity symbolId side execType rejectReason
+                                   # reserved reserved2
+FMT_RECONCILE_REQUEST = "<QQ"    # requestId reserved
+
 TEMPLATE = {
     "AddOrder": 1,
     "ModifyOrder": 2,
@@ -76,6 +85,10 @@ TEMPLATE = {
     "Snapshot": 5,
     "Heartbeat": 6,
     "SequenceReset": 7,
+    "NewOrder": 8,
+    "CancelOrder": 9,
+    "ExecReport": 10,
+    "ReconcileRequest": 11,
 }
 
 BLOCK_LENGTH = {
@@ -86,12 +99,29 @@ BLOCK_LENGTH = {
     "Snapshot": 12,
     "Heartbeat": 8,
     "SequenceReset": 8,
+    "NewOrder": 24,
+    "CancelOrder": 24,
+    "ExecReport": 48,
+    "ReconcileRequest": 16,
 }
 
 ORDER_BLOCK_LENGTH = 24
 
+#: Which message kinds belong to the order path rather than the feed. Kept here
+#: rather than read from the schema on purpose: this file does not import
+#: codegen.py, so that a wrong scope in one is not a wrong scope in both.
+ORDER_PATH_KINDS = {"NewOrder", "CancelOrder", "ExecReport", "ReconcileRequest"}
+
 BID, ASK = 0, 1
 REDUCE, REPLACE = 0, 1
+
+# ExecType
+ACKNOWLEDGED, PARTIAL_FILL, FILL, CANCELED, REJECTED = 0, 1, 2, 3, 4
+ORDER_STATUS, STATUS_COMPLETE = 5, 6
+
+# RejectReason
+NOT_REJECTED, UNKNOWN_SYMBOL, MAX_ORDER_QUANTITY = 0, 1, 2
+MAX_NOTIONAL, PRICE_COLLAR, OPEN_ORDER_LIMIT, POSITION_LIMIT = 3, 4, 5, 6
 
 
 def msg_header(name: str) -> bytes:
@@ -141,6 +171,27 @@ class Msg:
             return h + struct.pack(FMT_HEARTBEAT, f["last_sequence"])
         if self.kind == "SequenceReset":
             return h + struct.pack(FMT_SEQUENCE_RESET, f["new_sequence"])
+        if self.kind == "NewOrder":
+            return h + struct.pack(
+                FMT_NEW_ORDER,
+                f["client_order_id"], f["price"], f["quantity"], f["symbol_id"],
+                f["side"], 0,
+            )
+        if self.kind == "CancelOrder":
+            return h + struct.pack(
+                FMT_CANCEL_ORDER,
+                f["client_order_id"], f["orig_client_order_id"], f["symbol_id"],
+                f["side"], 0, 0,
+            )
+        if self.kind == "ExecReport":
+            return h + struct.pack(
+                FMT_EXEC_REPORT,
+                f["client_order_id"], f["exchange_order_id"], f["trade_id"],
+                f["price"], f["quantity"], f["leaves_quantity"], f["symbol_id"],
+                f["side"], f["exec_type"], f["reject_reason"], 0, 0,
+            )
+        if self.kind == "ReconcileRequest":
+            return h + struct.pack(FMT_RECONCILE_REQUEST, f["request_id"], 0)
         if self.kind == "Snapshot":
             body = struct.pack(
                 FMT_SNAPSHOT, f["last_sequence"], f["symbol_id"], f["flags"], 0
@@ -164,9 +215,28 @@ class Vector:
     first_sequence: int
     send_timestamp_ns: int
     messages: list[Msg]
+    #: An order-path vector: message headers and blocks, no packetHeader. A ring
+    #: slot is already framed and its position already sequences it, so the
+    #: datagram layer has nothing to do there. The packet fields above are unused
+    #: and are asserted to be zero, so a bare vector cannot quietly carry one.
+    bare: bool = False
+
+    def __post_init__(self) -> None:
+        if self.bare and (
+            self.channel or self.flags or self.first_sequence or self.send_timestamp_ns
+        ):
+            raise AssertionError(f"{self.name}: a bare vector has no packet header to fill")
+        if self.bare != all(m.kind in ORDER_PATH_KINDS for m in self.messages):
+            raise AssertionError(
+                f"{self.name}: bare={self.bare} does not match its messages. "
+                f"Order-path messages never travel in a datagram and feed messages "
+                f"never travel in a ring slot."
+            )
 
     def pack(self) -> bytes:
         body = b"".join(m.pack() for m in self.messages)
+        if self.bare:
+            return body
         head = struct.pack(
             FMT_PACKET_HEADER,
             SCHEMA_ID, SCHEMA_VERSION, len(self.messages),
@@ -230,6 +300,61 @@ HAND_TYPED: dict[str, str] = {
         "0100 0100 0100 00 00 0500100000000000 060504030201a017"
         "0800 0700 0100 0100"
         "0000200000000000",
+
+
+    # ---- order path ----------------------------------------------------
+    # No packetHeader on any of these: an order-path message travels one per
+    # shared-memory ring slot, so the file starts at the message header.
+
+    # NewOrder: blockLength=24(0x18) templateId=8
+    #           clientOrderId=0x1122334455667788 price=1012500(0x0F7314)
+    #           quantity=500(0x1F4) symbolId=7 side=Bid(0) reserved=0
+    "order_new":
+        "1800 0800 0100 0100"
+        "8877665544332211 14730f0000000000 f4010000 0700 00 00",
+
+    # A negative limit price. The field is signed on the wire, and a decoder
+    # that reads it unsigned returns 18446744073709539271 rather than an error,
+    # which is the kind of wrong that survives a smoke test.
+    # NewOrder: clientOrderId=1 price=-12345 quantity=1 symbolId=0 side=Ask(1)
+    "order_new_negative_price":
+        "1800 0800 0100 0100"
+        "0100000000000000 c7cfffffffffffff 01000000 0000 01 00",
+
+    # CancelOrder: blockLength=24(0x18) templateId=9
+    #              clientOrderId=91(0x5B) origClientOrderId=90(0x5A)
+    #              symbolId=7 side=Ask(1) reserved=0 reserved2=0
+    # The cancel carries its own id AND the id of the order it cancels; a
+    # decoder that transposes them cancels nothing and reports success.
+    "order_cancel":
+        "1800 0900 0100 0100"
+        "5b00000000000000 5a00000000000000 0700 01 00 00000000",
+
+    # ExecReport, a partial fill: blockLength=48(0x30) templateId=10
+    #   clientOrderId=0x1122334455667788 exchangeOrderId=4096(0x1000)
+    #   tradeId=77(0x4D) price=1012500 quantity=300(0x12C)
+    #   leavesQuantity=200(0xC8) symbolId=7 side=Bid(0)
+    #   execType=PartialFill(1) rejectReason=NotRejected(0)
+    "order_exec_partial_fill":
+        "3000 0a00 0100 0100"
+        "8877665544332211 0010000000000000 4d00000000000000"
+        "14730f0000000000 2c010000 c8000000 0700 00 01 00 00 0000",
+
+    # ExecReport, a risk reject. exchangeOrderId and tradeId are zero because
+    # the order never reached the engine -- which is the whole point of the
+    # limit, and is asserted rather than assumed.
+    #   clientOrderId=0x1122334455667789 quantity=1000000(0x0F4240)
+    #   leavesQuantity=0 execType=Rejected(4) rejectReason=MaxNotional(3)
+    "order_exec_reject":
+        "3000 0a00 0100 0100"
+        "8977665544332211 0000000000000000 0000000000000000"
+        "14730f0000000000 40420f00 00000000 0700 00 04 03 00 0000",
+
+    # ReconcileRequest: blockLength=16(0x10) templateId=11
+    #                   requestId=0x00000000DEADBEEF reserved=0
+    "order_reconcile":
+        "1000 0b00 0100 0100"
+        "efbeadde00000000 0000000000000000",
 
     # Snapshot with two ORDERS. packetHeader.flags=1 marks the snapshot cycle,
     # and Snapshot.flags=1 marks this as the last fragment for the symbol.
@@ -402,6 +527,118 @@ def vectors() -> list[Vector]:
                 Msg("Heartbeat", {"last_sequence": 0xFFFFFFFFFFFFFFFE}),
             ],
         ),
+        # --- order path ---------------------------------------------------
+        #
+        # bare=True: no packetHeader. These do not travel in datagrams, so
+        # wrapping them in one would be a golden vector for a wire that does not
+        # exist. See docs/ORDER-PATH.md.
+        Vector(
+            name="order_new",
+            why="A client order entering the system. Anchors the NewOrder block.",
+            channel=0, flags=0, first_sequence=0, send_timestamp_ns=0, bare=True,
+            messages=[Msg("NewOrder", {
+                "client_order_id": 0x1122334455667788, "price": 1_012_500,
+                "quantity": 500, "symbol_id": 7, "side": BID,
+            })],
+        ),
+        Vector(
+            name="order_new_negative_price",
+            why=(
+                "A negative limit price. The field is signed on the wire, and a "
+                "decoder that reads it unsigned returns a colossal positive number "
+                "rather than an error."
+            ),
+            channel=0, flags=0, first_sequence=0, send_timestamp_ns=0, bare=True,
+            messages=[Msg("NewOrder", {
+                "client_order_id": 1, "price": -12_345,
+                "quantity": 1, "symbol_id": 0, "side": ASK,
+            })],
+        ),
+        Vector(
+            name="order_cancel",
+            why=(
+                "A cancel carries its own id and the id of the order it cancels; "
+                "transposing the two cancels nothing and reports success."
+            ),
+            channel=0, flags=0, first_sequence=0, send_timestamp_ns=0, bare=True,
+            messages=[Msg("CancelOrder", {
+                "client_order_id": 91, "orig_client_order_id": 90,
+                "symbol_id": 7, "side": ASK,
+            })],
+        ),
+        Vector(
+            name="order_exec_partial_fill",
+            why="A partial fill: quantity is what traded, leavesQuantity what is still live.",
+            channel=0, flags=0, first_sequence=0, send_timestamp_ns=0, bare=True,
+            messages=[Msg("ExecReport", {
+                "client_order_id": 0x1122334455667788, "exchange_order_id": 4096,
+                "trade_id": 77, "price": 1_012_500, "quantity": 300,
+                "leaves_quantity": 200, "symbol_id": 7, "side": BID,
+                "exec_type": PARTIAL_FILL, "reject_reason": NOT_REJECTED,
+            })],
+        ),
+        Vector(
+            name="order_exec_reject",
+            why=(
+                "A risk reject. exchangeOrderId and tradeId are zero because the "
+                "order never reached the engine, which is what the limit is for."
+            ),
+            channel=0, flags=0, first_sequence=0, send_timestamp_ns=0, bare=True,
+            messages=[Msg("ExecReport", {
+                "client_order_id": 0x1122334455667789, "exchange_order_id": 0,
+                "trade_id": 0, "price": 1_012_500, "quantity": 1_000_000,
+                "leaves_quantity": 0, "symbol_id": 7, "side": BID,
+                "exec_type": REJECTED, "reject_reason": MAX_NOTIONAL,
+            })],
+        ),
+        Vector(
+            name="order_reconcile",
+            why="After a restart: name every order you still hold for me.",
+            channel=0, flags=0, first_sequence=0, send_timestamp_ns=0, bare=True,
+            messages=[Msg("ReconcileRequest", {"request_id": 0xDEADBEEF})],
+        ),
+        Vector(
+            name="order_new_then_cancel",
+            why=(
+                "Two order-path messages back to back. Nothing frames them but "
+                "their own blockLength, so a walk that advances by the wrong "
+                "amount lands mid-message on the second."
+            ),
+            channel=0, flags=0, first_sequence=0, send_timestamp_ns=0, bare=True,
+            messages=[
+                Msg("NewOrder", {
+                    "client_order_id": 90, "price": 1_012_500,
+                    "quantity": 500, "symbol_id": 7, "side": BID,
+                }),
+                Msg("CancelOrder", {
+                    "client_order_id": 91, "orig_client_order_id": 90,
+                    "symbol_id": 7, "side": BID,
+                }),
+            ],
+        ),
+        Vector(
+            name="order_status_pair",
+            why=(
+                "A reconciliation answer: one status line, then the marker that "
+                "ends it carrying how many there were. A gateway that stops at the "
+                "first message concludes the engine holds nothing."
+            ),
+            channel=0, flags=0, first_sequence=0, send_timestamp_ns=0, bare=True,
+            messages=[
+                Msg("ExecReport", {
+                    "client_order_id": 90, "exchange_order_id": 4096, "trade_id": 0,
+                    "price": 1_012_500, "quantity": 500, "leaves_quantity": 300,
+                    "symbol_id": 7, "side": BID,
+                    "exec_type": ORDER_STATUS, "reject_reason": NOT_REJECTED,
+                }),
+                Msg("ExecReport", {
+                    "client_order_id": 0, "exchange_order_id": 0, "trade_id": 0,
+                    "price": 0, "quantity": 1, "leaves_quantity": 0,
+                    "symbol_id": 0, "side": BID,
+                    "exec_type": STATUS_COMPLETE, "reject_reason": NOT_REJECTED,
+                }),
+            ],
+        ),
     ]
 
 
@@ -431,18 +668,27 @@ def annotate(v: Vector) -> str:
         out.append(f"  {pos:04x}  {chunk.hex(' '):<48}  {label}")
         pos += n
 
-    out.append("packetHeader")
-    row(2, f"schemaId = {SCHEMA_ID}")
-    row(2, f"version = {SCHEMA_VERSION}")
-    row(2, f"messageCount = {len(v.messages)}")
-    row(1, f"channel = {v.channel}")
-    row(1, f"flags = 0x{v.flags:02x}")
-    row(8, f"firstSequence = {v.first_sequence} (0x{v.first_sequence:016x})")
-    row(8, f"sendTimestampNs = {v.send_timestamp_ns} (0x{v.send_timestamp_ns:016x})")
+    if v.bare:
+        out.append("No packetHeader: this is an order-path vector, and an order-path")
+        out.append("message travels one per shared-memory ring slot rather than batched")
+        out.append("into a datagram. See docs/ORDER-PATH.md.")
+        out.append("")
+    else:
+        out.append("packetHeader")
+        row(2, f"schemaId = {SCHEMA_ID}")
+        row(2, f"version = {SCHEMA_VERSION}")
+        row(2, f"messageCount = {len(v.messages)}")
+        row(1, f"channel = {v.channel}")
+        row(1, f"flags = 0x{v.flags:02x}")
+        row(8, f"firstSequence = {v.first_sequence} (0x{v.first_sequence:016x})")
+        row(8, f"sendTimestampNs = {v.send_timestamp_ns} (0x{v.send_timestamp_ns:016x})")
 
     for i, m in enumerate(v.messages):
         out.append("")
-        out.append(f"message {i}  sequence = {v.first_sequence + i}  {m.kind}")
+        if v.bare:
+            out.append(f"message {i}  {m.kind}")
+        else:
+            out.append(f"message {i}  sequence = {v.first_sequence + i}  {m.kind}")
         row(2, f"blockLength = {BLOCK_LENGTH[m.kind]}")
         row(2, f"templateId = {TEMPLATE[m.kind]}")
         row(2, f"schemaId = {SCHEMA_ID}")
@@ -460,8 +706,16 @@ def annotate(v: Vector) -> str:
                     row(width, f"orders[{j}].{fname} = {fval}")
                 row(1, f"orders[{j}].reserved = 0")
                 row(2, f"orders[{j}].reserved2 = 0")
-        elif m.kind in ("AddOrder", "DeleteOrder", "Trade"):
+        elif m.kind in ("AddOrder", "DeleteOrder", "Trade", "NewOrder"):
             row(1, "reserved = 0")
+        elif m.kind == "CancelOrder":
+            row(1, "reserved = 0")
+            row(4, "reserved2 = 0")
+        elif m.kind == "ExecReport":
+            row(1, "reserved = 0")
+            row(2, "reserved2 = 0")
+        elif m.kind == "ReconcileRequest":
+            row(8, "reserved = 0")
 
     if pos != len(data):
         raise AssertionError(
@@ -492,6 +746,18 @@ FIELD_WIDTH = {
     "Snapshot": {"last_sequence": 8, "symbol_id": 2, "flags": 1},
     "Heartbeat": {"last_sequence": 8},
     "SequenceReset": {"new_sequence": 8},
+    "NewOrder": {
+        "client_order_id": 8, "price": 8, "quantity": 4, "symbol_id": 2, "side": 1,
+    },
+    "CancelOrder": {
+        "client_order_id": 8, "orig_client_order_id": 8, "symbol_id": 2, "side": 1,
+    },
+    "ExecReport": {
+        "client_order_id": 8, "exchange_order_id": 8, "trade_id": 8, "price": 8,
+        "quantity": 4, "leaves_quantity": 4, "symbol_id": 2, "side": 1,
+        "exec_type": 1, "reject_reason": 1,
+    },
+    "ReconcileRequest": {"request_id": 8},
 }
 
 ORDER_FIELD_WIDTH = {"order_id": 8, "price": 8, "quantity": 4, "side": 1}
@@ -510,14 +776,67 @@ RUST_REASON = {REDUCE: "ModifyReason::Reduce", REPLACE: "ModifyReason::Replace"}
 CPP_SIDE = {BID: "Side::kBid", ASK: "Side::kAsk"}
 CPP_REASON = {REDUCE: "ModifyReason::kReduce", REPLACE: "ModifyReason::kReplace"}
 
+RUST_EXEC_TYPE = {
+    ACKNOWLEDGED: "ExecType::Acknowledged", PARTIAL_FILL: "ExecType::PartialFill",
+    FILL: "ExecType::Fill", CANCELED: "ExecType::Canceled",
+    REJECTED: "ExecType::Rejected", ORDER_STATUS: "ExecType::OrderStatus",
+    STATUS_COMPLETE: "ExecType::StatusComplete",
+}
+CPP_EXEC_TYPE = {
+    ACKNOWLEDGED: "ExecType::kAcknowledged", PARTIAL_FILL: "ExecType::kPartialFill",
+    FILL: "ExecType::kFill", CANCELED: "ExecType::kCanceled",
+    REJECTED: "ExecType::kRejected", ORDER_STATUS: "ExecType::kOrderStatus",
+    STATUS_COMPLETE: "ExecType::kStatusComplete",
+}
+RUST_REJECT_REASON = {
+    NOT_REJECTED: "RejectReason::NotRejected",
+    UNKNOWN_SYMBOL: "RejectReason::UnknownSymbol",
+    MAX_ORDER_QUANTITY: "RejectReason::MaxOrderQuantity",
+    MAX_NOTIONAL: "RejectReason::MaxNotional",
+    PRICE_COLLAR: "RejectReason::PriceCollar",
+    OPEN_ORDER_LIMIT: "RejectReason::OpenOrderLimit",
+    POSITION_LIMIT: "RejectReason::PositionLimit",
+}
+CPP_REJECT_REASON = {
+    NOT_REJECTED: "RejectReason::kNotRejected",
+    UNKNOWN_SYMBOL: "RejectReason::kUnknownSymbol",
+    MAX_ORDER_QUANTITY: "RejectReason::kMaxOrderQuantity",
+    MAX_NOTIONAL: "RejectReason::kMaxNotional",
+    PRICE_COLLAR: "RejectReason::kPriceCollar",
+    OPEN_ORDER_LIMIT: "RejectReason::kOpenOrderLimit",
+    POSITION_LIMIT: "RejectReason::kPositionLimit",
+}
+
 # Which fields are enums, so the emitters compare against the enum rather than raw.
-ENUM_FIELDS = {"side", "aggressor_side", "reason"}
+ENUM_FIELDS = {"side", "aggressor_side", "reason", "exec_type", "reject_reason"}
+
+
+def rust_enum_table(fname: str) -> tuple[dict, str]:
+    if fname == "reason":
+        return RUST_REASON, "ModifyReason"
+    if fname == "exec_type":
+        return RUST_EXEC_TYPE, "ExecType"
+    if fname == "reject_reason":
+        return RUST_REJECT_REASON, "RejectReason"
+    return RUST_SIDE, "Side"
+
+
+def cpp_enum_table(fname: str) -> dict:
+    if fname == "reason":
+        return CPP_REASON
+    if fname == "exec_type":
+        return CPP_EXEC_TYPE
+    if fname == "reject_reason":
+        return CPP_REJECT_REASON
+    return CPP_SIDE
 
 RUST_SUFFIX = {
     "order_id": "u64", "price": "i64", "quantity": "u32", "symbol_id": "u16",
     "new_price": "i64", "new_quantity": "u32", "trade_id": "u64",
     "aggressor_order_id": "u64", "resting_order_id": "u64",
     "last_sequence": "u64", "new_sequence": "u64", "flags": "u8",
+    "client_order_id": "u64", "orig_client_order_id": "u64",
+    "exchange_order_id": "u64", "leaves_quantity": "u32", "request_id": "u64",
 }
 
 
@@ -584,6 +903,9 @@ def emit_rust(vs: list[Vector]) -> str:
 
 
 def emit_rust_check(o: list[str], v: Vector) -> None:
+    if v.bare:
+        emit_rust_check_bare(o, v)
+        return
     o.append(f"/// {v.why}")
     o.append(f"pub fn check_{v.name}(buf: &[u8]) -> Result<(), String> {{")
     o.append("    let r = PacketReader::new(buf).map_err(|e| format!(\"packet header: {e}\"))?;")
@@ -649,12 +971,46 @@ def emit_rust_check(o: list[str], v: Vector) -> None:
     o.append("")
 
 
+def emit_rust_check_bare(o: list[str], v: Vector) -> None:
+    """An order-path vector: message headers and blocks, no datagram around them.
+
+    Walks with `decode_order_path_message`, which is a different dispatch from
+    the feed's on purpose -- a feed template id fails here and an order-path one
+    fails in `decode_message`, so neither wire can decode the other's traffic by
+    accident.
+    """
+    o.append(f"/// {v.why}")
+    o.append(f"pub fn check_{v.name}(buf: &[u8]) -> Result<(), String> {{")
+    o.append("    let mut pos = 0usize;")
+    for i, m in enumerate(v.messages):
+        o.append(f"    // message {i}")
+        o.append("    let msg = decode_order_path_message(&buf[pos..])")
+        o.append(f'        .map_err(|e| format!("message {i}: {{e}}"))?;')
+        o.append(f"    let OrderPathMessage::{m.kind}(d) = msg else {{")
+        o.append(
+            f'        return Err(format!("message {i}: expected {m.kind}, got template {{}}", '
+            f"msg.template_id()));"
+        )
+        o.append("    };")
+        for fname, fval in m.fields.items():
+            emit_rust_field_check(o, f"message {i}.{fname}", "d", fname, fval, m.kind)
+        o.append("    pos += d.total_len();")
+        o.append("")
+    o.append("    if pos != buf.len() {")
+    o.append(
+        '        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));'
+    )
+    o.append("    }")
+    o.append("    Ok(())")
+    o.append("}")
+    o.append("")
+
+
 def emit_rust_field_check(
     o: list[str], label: str, var: str, fname: str, fval: object, kind: str
 ) -> None:
     if fname in ENUM_FIELDS:
-        table = RUST_REASON if fname == "reason" else RUST_SIDE
-        ty = "ModifyReason" if fname == "reason" else "Side"
+        table, ty = rust_enum_table(fname)
         o.append(
             f'    if {var}.{fname}().map_err(|e| format!("{label}: {{e}}"))? != {table[fval]} {{'
         )
@@ -677,6 +1033,9 @@ def emit_rust_field_check(
 
 
 def emit_rust_build(o: list[str], v: Vector) -> None:
+    if v.bare:
+        emit_rust_build_bare(o, v)
+        return
     o.append(f"/// Re-encodes `{v.name}` from the same values `check_{v.name}` asserts.")
     o.append(f"pub fn build_{v.name}(out: &mut [u8]) -> Result<usize, WireError> {{")
     o.append("    let mut w = PacketWriter::new(")
@@ -733,6 +1092,47 @@ def emit_rust_build(o: list[str], v: Vector) -> None:
 # ---------------------------------------------------------------------------
 
 
+def emit_rust_build_bare(o: list[str], v: Vector) -> None:
+    """No PacketWriter here -- there is deliberately no method to call.
+
+    The generator gives `append_*` only to feed messages, so an order-path
+    message has no way onto a datagram. Encoding one means calling its encoder
+    directly into the buffer, which is exactly what a ring slot gets.
+    """
+    o.append(f"/// Re-encodes `{v.name}` from the same values `check_{v.name}` asserts.")
+    o.append(f"pub fn build_{v.name}(out: &mut [u8]) -> Result<usize, WireError> {{")
+    o.append("    let mut pos = 0usize;")
+    for i, m in enumerate(v.messages):
+        args = []
+        for fname, fval in m.fields.items():
+            if fname in ENUM_FIELDS:
+                table, _ = rust_enum_table(fname)
+                args.append(table[fval])
+            elif fname in ("price", "new_price"):
+                args.append(f"{fval}i64")
+            else:
+                args.append(rust_lit(fname, fval))
+        o.append(f"    // message {i}")
+        o.append(f"    let n = encode_{snake(m.kind)}(&mut out[pos..]")
+        for a in args:
+            o.append(f"        , {a}")
+        o.append("    )?;")
+        o.append("    pos += n;")
+    o.append("    Ok(pos)")
+    o.append("}")
+    o.append("")
+
+
+def snake(name: str) -> str:
+    """CamelCase to snake_case, matching the generator's own naming."""
+    out: list[str] = []
+    for i, ch in enumerate(name):
+        if ch.isupper() and i > 0:
+            out.append("_")
+        out.append(ch.lower())
+    return "".join(out)
+
+
 def emit_cpp(vs: list[Vector]) -> str:
     o: list[str] = []
     for line in BANNER:
@@ -775,6 +1175,9 @@ def emit_cpp(vs: list[Vector]) -> str:
 
 
 def emit_cpp_check(o: list[str], v: Vector) -> None:
+    if v.bare:
+        emit_cpp_check_bare(o, v)
+        return
     o.append(f"// {v.why}")
     o.append(
         f"inline std::string check_{v.name}(const std::byte* buf, std::size_t len) {{"
@@ -840,12 +1243,33 @@ def emit_cpp_check(o: list[str], v: Vector) -> None:
     o.append("")
 
 
+def emit_cpp_check_bare(o: list[str], v: Vector) -> None:
+    o.append(f"// {v.why}")
+    o.append(
+        f"inline std::string check_{v.name}(const std::byte* buf, std::size_t len) {{"
+    )
+    o.append("    std::size_t pos = 0;")
+    for i, m in enumerate(v.messages):
+        o.append(f"    // message {i}")
+        o.append("    {")
+        o.append(f"        auto d = {m.kind}Decoder::wrap(buf + pos, len - pos);")
+        o.append(f'        if (!d) return "message {i}: not a decodable {m.kind}";')
+        for fname, fval in m.fields.items():
+            emit_cpp_field_check(o, f"message {i}.{fname}", "d->", fname, fval)
+        o.append("        pos += d->total_len();")
+        o.append("    }")
+    o.append('    if (pos != len) return "trailing bytes past the last message";')
+    o.append('    return "";')
+    o.append("}")
+    o.append("")
+
+
 def emit_cpp_field_check(
     o: list[str], label: str, var: str, fname: str, fval: object,
     indent: str = "        ",
 ) -> None:
     if fname in ENUM_FIELDS:
-        table = CPP_REASON if fname == "reason" else CPP_SIDE
+        table = cpp_enum_table(fname)
         o.append(f"{indent}{{")
         o.append(f"{indent}    auto e = {var}{fname}();")
         o.append(f'{indent}    if (!e) return "{label}: undefined enum value";')
@@ -866,6 +1290,9 @@ def emit_cpp_field_check(
 
 
 def emit_cpp_build(o: list[str], v: Vector) -> None:
+    if v.bare:
+        emit_cpp_build_bare(o, v)
+        return
     o.append(f"// Re-encodes `{v.name}` from the same values check_{v.name} asserts.")
     o.append(
         f"inline std::size_t build_{v.name}(std::byte* out, std::size_t cap, "
@@ -913,8 +1340,7 @@ def emit_cpp_build(o: list[str], v: Vector) -> None:
         o.append(f"        auto n = {fn}(out + pos, cap - pos")
         for fname, fval in m.fields.items():
             if fname in ENUM_FIELDS:
-                table = CPP_REASON if fname == "reason" else CPP_SIDE
-                o.append(f"            , {table[fval]}")
+                o.append(f"            , {cpp_enum_table(fname)[fval]}")
             else:
                 o.append(f"            , {cpp_arg(m.kind, fname, fval)}")
         o.append("        );")
@@ -926,6 +1352,31 @@ def emit_cpp_build(o: list[str], v: Vector) -> None:
         f"static_cast<std::uint16_t>({len(v.messages)})))"
     )
     o.append('        { err = "could not patch messageCount"; return 0; }')
+    o.append("    return pos;")
+    o.append("}")
+    o.append("")
+
+
+def emit_cpp_build_bare(o: list[str], v: Vector) -> None:
+    o.append(f"// Re-encodes `{v.name}` from the same values check_{v.name} asserts.")
+    o.append(
+        f"inline std::size_t build_{v.name}(std::byte* out, std::size_t cap, "
+        "std::string& err) {"
+    )
+    o.append("    std::size_t pos = 0;")
+    for i, m in enumerate(v.messages):
+        o.append(f"    // message {i}")
+        o.append("    {")
+        o.append(f"        auto n = encode_{snake(m.kind)}(out + pos, cap - pos")
+        for fname, fval in m.fields.items():
+            if fname in ENUM_FIELDS:
+                o.append(f"            , {cpp_enum_table(fname)[fval]}")
+            else:
+                o.append(f"            , {cpp_arg(m.kind, fname, fval)}")
+        o.append("        );")
+        o.append(f'        if (!n) {{ err = "message {i} did not fit"; return 0; }}')
+        o.append("        pos += *n;")
+        o.append("    }")
     o.append("    return pos;")
     o.append("}")
     o.append("")

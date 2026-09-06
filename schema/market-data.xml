@@ -72,6 +72,40 @@
       <validValue name="Reduce">0</validValue>
       <validValue name="Replace">1</validValue>
     </enum>
+
+    <!-- Order path only. What happened to an order, in the sense FIX's
+         ExecType (150) means it: one message type reports acknowledgement,
+         fills, cancels, rejects and status, because they all answer the same
+         question about the same order. -->
+    <enum name="ExecType" encodingType="uint8">
+      <validValue name="Acknowledged">0</validValue>
+      <validValue name="PartialFill">1</validValue>
+      <validValue name="Fill">2</validValue>
+      <validValue name="Canceled">3</validValue>
+      <validValue name="Rejected">4</validValue>
+      <!-- The two reconciliation forms: one line per open order the engine
+           holds, then a marker carrying how many there were. -->
+      <validValue name="OrderStatus">5</validValue>
+      <validValue name="StatusComplete">6</validValue>
+    </enum>
+
+    <!-- Order path only. Why an order was refused. NotRejected is the value
+         every non-reject carries; it is named rather than left as an implicit
+         zero so that a reader of a hex dump does not have to guess. -->
+    <enum name="RejectReason" encodingType="uint8">
+      <validValue name="NotRejected">0</validValue>
+      <validValue name="UnknownSymbol">1</validValue>
+      <validValue name="MaxOrderQuantity">2</validValue>
+      <validValue name="MaxNotional">3</validValue>
+      <validValue name="PriceCollar">4</validValue>
+      <validValue name="OpenOrderLimit">5</validValue>
+      <validValue name="PositionLimit">6</validValue>
+      <validValue name="DuplicateClientOrderId">7</validValue>
+      <validValue name="UnknownOrder">8</validValue>
+      <!-- The ring was full. Rejecting is the only honest answer: blocking
+           stalls the FIX session and dropping loses an order silently. -->
+      <validValue name="QueueFull">9</validValue>
+    </enum>
   </types>
 
   <message name="AddOrder" id="1" blockLength="24"
@@ -149,6 +183,71 @@
   <message name="SequenceReset" id="7" blockLength="8"
            description="The publisher restarts its sequence; the handler must resynchronise">
     <field name="newSequence" id="1" type="uint64" offset="0" description="The sequence the next message will carry"/>
+  </message>
+
+  <!--
+    ===================================================================
+    The order path. scope="orderPath" rather than the default "feed".
+    ===================================================================
+
+    These four never appear on multicast. They travel one per slot in the
+    shared-memory rings between the gateway, the risk service and the engine:
+    messageHeader then the block, with no packetHeader, because a ring slot is
+    already framed and its position already sequences it.
+
+    The generator enforces that rather than trusting this comment. A message
+    with scope="orderPath" gets no `PacketWriter` append method in either
+    language, so the feed publisher has no way to put an order request on the
+    wire, and the packet reader treats its template id as unknown.
+
+    They live in this file rather than a schema of their own so that `Side`
+    means the same byte on both wires by construction, and so that both wires
+    get the same layout checks: every byte named, padding included, natural
+    alignment within the block, and a hand-typed golden vector.
+
+    See docs/ORDER-PATH.md.
+  -->
+
+  <message name="NewOrder" id="8" blockLength="24" scope="orderPath"
+           description="A client order entering the system: gateway to risk to engine">
+    <field name="clientOrderId" id="1" type="uint64" offset="0"  description="The gateway's id for this order; carries FIX ClOrdID's meaning"/>
+    <field name="price"         id="2" type="int64"  offset="8"  semanticType="Price"/>
+    <field name="quantity"      id="3" type="uint32" offset="16"/>
+    <field name="symbolId"      id="4" type="uint16" offset="20"/>
+    <field name="side"          id="5" type="Side"   offset="22"/>
+    <field name="reserved"      id="6" type="uint8"  offset="23"/>
+  </message>
+
+  <message name="CancelOrder" id="9" blockLength="24" scope="orderPath"
+           description="Cancel a live order: gateway to risk to engine">
+    <field name="clientOrderId"     id="1" type="uint64" offset="0"  description="Identifies this cancel request, not the order"/>
+    <field name="origClientOrderId" id="2" type="uint64" offset="8"  description="The order to cancel"/>
+    <field name="symbolId"          id="3" type="uint16" offset="16"/>
+    <field name="side"              id="4" type="Side"   offset="18"/>
+    <field name="reserved"          id="5" type="uint8"  offset="19"/>
+    <field name="reserved2"         id="6" type="uint32" offset="20"/>
+  </message>
+
+  <message name="ExecReport" id="10" blockLength="48" scope="orderPath"
+           description="What happened to an order: engine to risk to gateway, or risk to gateway for a reject">
+    <field name="clientOrderId"   id="1"  type="uint64"       offset="0"/>
+    <field name="exchangeOrderId" id="2"  type="uint64"       offset="8"  description="The engine's order id; zero when the order never reached it"/>
+    <field name="tradeId"         id="3"  type="uint64"       offset="16" description="Zero unless this report is a fill"/>
+    <field name="price"           id="4"  type="int64"        offset="24" semanticType="Price" description="Fill price on a fill, order price otherwise"/>
+    <field name="quantity"        id="5"  type="uint32"       offset="32" description="This event's quantity: filled on a fill, ordered on an acknowledgement"/>
+    <field name="leavesQuantity"  id="6"  type="uint32"       offset="36" description="Still live on the book after this event"/>
+    <field name="symbolId"        id="7"  type="uint16"       offset="40"/>
+    <field name="side"            id="8"  type="Side"         offset="42"/>
+    <field name="execType"        id="9"  type="ExecType"     offset="43"/>
+    <field name="rejectReason"    id="10" type="RejectReason" offset="44"/>
+    <field name="reserved"        id="11" type="uint8"        offset="45"/>
+    <field name="reserved2"       id="12" type="uint16"       offset="46"/>
+  </message>
+
+  <message name="ReconcileRequest" id="11" blockLength="16" scope="orderPath"
+           description="After a restart: name every order you still hold for me">
+    <field name="requestId"  id="1" type="uint64" offset="0" description="Echoed on the StatusComplete that ends the answer"/>
+    <field name="reserved"   id="2" type="uint64" offset="8"/>
   </message>
 
 </messageSchema>

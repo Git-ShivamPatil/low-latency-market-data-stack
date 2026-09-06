@@ -89,6 +89,9 @@ class Group:
     description: str = ""
 
 
+SCOPES = ("feed", "orderPath")
+
+
 @dataclass
 class Message:
     name: str
@@ -97,6 +100,14 @@ class Message:
     fields: list[Field]
     description: str = ""
     group: Group | None = None
+    #: Which wire this message belongs to. `feed` travels in datagrams behind a
+    #: packetHeader; `orderPath` travels one per shared-memory ring slot. The
+    #: distinction is generated rather than documented -- see `feed_messages`.
+    scope: str = "feed"
+
+    @property
+    def is_feed(self) -> bool:
+        return self.scope == "feed"
 
 
 @dataclass
@@ -111,6 +122,21 @@ class Schema:
     enums: dict[str, Enum] = dc_field(default_factory=dict)
     composites: dict[str, Composite] = dc_field(default_factory=dict)
     messages: list[Message] = dc_field(default_factory=list)
+
+    @property
+    def feed_messages(self) -> list[Message]:
+        """Messages that may appear in a datagram.
+
+        The packet reader and writer are generated from this list alone, so a
+        message the schema marks `orderPath` has no `append_*` method to call
+        and decodes as an unknown template. That is the enforcement; the comment
+        in the schema is only the explanation.
+        """
+        return [m for m in self.messages if m.is_feed]
+
+    @property
+    def order_path_messages(self) -> list[Message]:
+        return [m for m in self.messages if not m.is_feed]
 
 
 def size_of(type_name: str, enums: dict[str, Enum]) -> int:
@@ -192,6 +218,7 @@ def parse_schema(path: Path = SCHEMA_PATH) -> Schema:
                 fields=_fields(m),
                 description=m.attrib.get("description", ""),
                 group=group,
+                scope=m.attrib.get("scope", "feed"),
             )
         )
 
@@ -241,6 +268,18 @@ def validate(schema: Schema) -> None:
         if m.name in names:
             raise SchemaError(f"duplicate message name {m.name}")
         names.add(m.name)
+        if m.scope not in SCOPES:
+            raise SchemaError(
+                f"message {m.name} has scope {m.scope!r}; expected one of {SCOPES}"
+            )
+        if not m.is_feed and m.group is not None:
+            # A ring slot is a fixed size, so a variable-length message in one
+            # would either waste the slot or not fit. Nothing needs it yet, and
+            # refusing now is cheaper than discovering it at run time.
+            raise SchemaError(
+                f"message {m.name} is scope={m.scope} and has a repeating group; "
+                f"order-path messages must be fixed size"
+            )
         check_block(f"message {m.name}", m.fields, m.block_length)
         if m.group is not None:
             check_block(
@@ -661,9 +700,13 @@ def emit_rust(schema: Schema) -> str:
 
     # --- dispatch ---------------------------------------------------------
     o.append("/// One decoded message, still borrowing the datagram buffer.")
+    o.append("///")
+    o.append("/// Feed messages only. An order-path template id decodes as")
+    o.append("/// [`WireError::UnknownTemplate`], which is what keeps the two wires")
+    o.append("/// apart without anyone having to remember to check.")
     o.append("#[derive(Debug, Clone, Copy)]")
     o.append("pub enum Message<'a> {")
-    for m in schema.messages:
+    for m in schema.feed_messages:
         o.append(f"    {m.name}({m.name}Decoder<'a>),")
     o.append("}")
     o.append("")
@@ -672,7 +715,7 @@ def emit_rust(schema: Schema) -> str:
     o.append("    #[inline(always)]")
     o.append("    pub fn total_len(&self) -> usize {")
     o.append("        match self {")
-    for m in schema.messages:
+    for m in schema.feed_messages:
         o.append(f"            Self::{m.name}(d) => d.total_len(),")
     o.append("        }")
     o.append("    }")
@@ -680,7 +723,7 @@ def emit_rust(schema: Schema) -> str:
     o.append("    #[inline(always)]")
     o.append("    pub fn template_id(&self) -> u16 {")
     o.append("        match self {")
-    for m in schema.messages:
+    for m in schema.feed_messages:
         o.append(f"            Self::{m.name}(_) => template::{screaming(m.name)},")
     o.append("        }")
     o.append("    }")
@@ -697,7 +740,7 @@ def emit_rust(schema: Schema) -> str:
     o.append("        });")
     o.append("    }")
     o.append("    match hdr.template_id() {")
-    for m in schema.messages:
+    for m in schema.feed_messages:
         o.append(
             f"        template::{screaming(m.name)} => "
             f"Ok(Message::{m.name}({m.name}Decoder::wrap(buf)?)),"
@@ -706,6 +749,9 @@ def emit_rust(schema: Schema) -> str:
     o.append("    }")
     o.append("}")
     o.append("")
+
+    if schema.order_path_messages:
+        emit_rust_order_path(o, schema)
 
     emit_rust_packet_reader(o, schema)
     emit_rust_packet_writer(o, schema)
@@ -1009,6 +1055,64 @@ def emit_rust_group_encoder(o: list[str], m: Message, schema: Schema) -> None:
     o.append("")
 
 
+def emit_rust_order_path(o: list[str], schema: Schema) -> None:
+    """The order path's own dispatch, separate from the feed's on purpose."""
+    o.append("/// One decoded order-path message.")
+    o.append("///")
+    o.append("/// These never travel in a datagram. One lives in one shared-memory ring")
+    o.append("/// slot: `messageHeader` then the block, with no `packetHeader`, because")
+    o.append("/// the slot is already framed and its position already sequences it.")
+    o.append("/// See docs/ORDER-PATH.md.")
+    o.append("#[derive(Debug, Clone, Copy)]")
+    o.append("pub enum OrderPathMessage<'a> {")
+    for m in schema.order_path_messages:
+        o.append(f"    {m.name}({m.name}Decoder<'a>),")
+    o.append("}")
+    o.append("")
+    o.append("impl<'a> OrderPathMessage<'a> {")
+    o.append("    #[inline(always)]")
+    o.append("    pub fn total_len(&self) -> usize {")
+    o.append("        match self {")
+    for m in schema.order_path_messages:
+        o.append(f"            Self::{m.name}(d) => d.total_len(),")
+    o.append("        }")
+    o.append("    }")
+    o.append("")
+    o.append("    #[inline(always)]")
+    o.append("    pub fn template_id(&self) -> u16 {")
+    o.append("        match self {")
+    for m in schema.order_path_messages:
+        o.append(f"            Self::{m.name}(_) => template::{screaming(m.name)},")
+    o.append("        }")
+    o.append("    }")
+    o.append("}")
+    o.append("")
+    o.append("/// Decodes one order-path message from the start of `buf`.")
+    o.append("///")
+    o.append("/// A feed template id is rejected here exactly as an order-path one is")
+    o.append("/// rejected by [`decode_message`]. Neither wire will decode the other's")
+    o.append("/// traffic by accident.")
+    o.append("#[inline]")
+    o.append("pub fn decode_order_path_message(buf: &[u8]) -> Result<OrderPathMessage<\'_>, WireError> {")
+    o.append("    let hdr = MessageHeaderDecoder::wrap(buf)?;")
+    o.append("    if hdr.schema_id() != SCHEMA_ID {")
+    o.append("        return Err(WireError::SchemaMismatch {")
+    o.append("            expected: SCHEMA_ID,")
+    o.append("            got: hdr.schema_id(),")
+    o.append("        });")
+    o.append("    }")
+    o.append("    match hdr.template_id() {")
+    for m in schema.order_path_messages:
+        o.append(
+            f"        template::{screaming(m.name)} => "
+            f"Ok(OrderPathMessage::{m.name}({m.name}Decoder::wrap(buf)?)),"
+        )
+    o.append("        other => Err(WireError::UnknownTemplate(other)),")
+    o.append("    }")
+    o.append("}")
+    o.append("")
+
+
 def emit_rust_packet_reader(o: list[str], schema: Schema) -> None:
     o.append("/// Walks the messages in one datagram.")
     o.append("///")
@@ -1156,7 +1260,7 @@ def emit_rust_packet_writer(o: list[str], schema: Schema) -> None:
     o.append("        Ok(())")
     o.append("    }")
     o.append("")
-    for m in schema.messages:
+    for m in schema.feed_messages:
         if m.group is not None:
             continue
         params = rust_param_list(m.fields, schema)

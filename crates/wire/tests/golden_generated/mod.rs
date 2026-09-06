@@ -116,6 +116,62 @@ pub const VECTORS: &[Vector] = &[
         check: check_sequence_wrap_high,
         build: build_sequence_wrap_high,
     },
+    Vector {
+        name: "order_new",
+        file: "order_new.bin",
+        why: "A client order entering the system. Anchors the NewOrder block.",
+        check: check_order_new,
+        build: build_order_new,
+    },
+    Vector {
+        name: "order_new_negative_price",
+        file: "order_new_negative_price.bin",
+        why: "A negative limit price. The field is signed on the wire, and a decoder that reads it unsigned returns a colossal positive number rather than an error.",
+        check: check_order_new_negative_price,
+        build: build_order_new_negative_price,
+    },
+    Vector {
+        name: "order_cancel",
+        file: "order_cancel.bin",
+        why: "A cancel carries its own id and the id of the order it cancels; transposing the two cancels nothing and reports success.",
+        check: check_order_cancel,
+        build: build_order_cancel,
+    },
+    Vector {
+        name: "order_exec_partial_fill",
+        file: "order_exec_partial_fill.bin",
+        why: "A partial fill: quantity is what traded, leavesQuantity what is still live.",
+        check: check_order_exec_partial_fill,
+        build: build_order_exec_partial_fill,
+    },
+    Vector {
+        name: "order_exec_reject",
+        file: "order_exec_reject.bin",
+        why: "A risk reject. exchangeOrderId and tradeId are zero because the order never reached the engine, which is what the limit is for.",
+        check: check_order_exec_reject,
+        build: build_order_exec_reject,
+    },
+    Vector {
+        name: "order_reconcile",
+        file: "order_reconcile.bin",
+        why: "After a restart: name every order you still hold for me.",
+        check: check_order_reconcile,
+        build: build_order_reconcile,
+    },
+    Vector {
+        name: "order_new_then_cancel",
+        file: "order_new_then_cancel.bin",
+        why: "Two order-path messages back to back. Nothing frames them but their own blockLength, so a walk that advances by the wrong amount lands mid-message on the second.",
+        check: check_order_new_then_cancel,
+        build: build_order_new_then_cancel,
+    },
+    Vector {
+        name: "order_status_pair",
+        file: "order_status_pair.bin",
+        why: "A reconciliation answer: one status line, then the marker that ends it carrying how many there were. A gateway that stops at the first message concludes the engine holds nothing.",
+        check: check_order_status_pair,
+        build: build_order_status_pair,
+    },
 ];
 
 /// One AddOrder. Anchors the AddOrder block and the packet header.
@@ -951,4 +1007,510 @@ pub fn build_sequence_wrap_high(out: &mut [u8]) -> Result<usize, WireError> {
     w.heartbeat(18446744073709551613)?;
     w.heartbeat(18446744073709551614)?;
     Ok(w.finish())
+}
+
+/// A client order entering the system. Anchors the NewOrder block.
+pub fn check_order_new(buf: &[u8]) -> Result<(), String> {
+    let mut pos = 0usize;
+    // message 0
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 0: {e}"))?;
+    let OrderPathMessage::NewOrder(d) = msg else {
+        return Err(format!(
+            "message 0: expected NewOrder, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64(
+        "message 0.client_order_id",
+        d.client_order_id(),
+        1234605616436508552u64,
+    )?;
+    eq_i64("message 0.price", d.price(), 1012500)?;
+    eq_u32("message 0.quantity", d.quantity(), 500u32)?;
+    eq_u16("message 0.symbol_id", d.symbol_id(), 7u16)?;
+    if d.side().map_err(|e| format!("message 0.side: {e}"))? != Side::Bid {
+        return Err(format!(
+            "message 0.side: expected Side::Bid, got {:?}",
+            d.side()
+        ));
+    }
+    pos += d.total_len();
+
+    if pos != buf.len() {
+        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Re-encodes `order_new` from the same values `check_order_new` asserts.
+pub fn build_order_new(out: &mut [u8]) -> Result<usize, WireError> {
+    let mut pos = 0usize;
+    // message 0
+    let n = encode_new_order(
+        &mut out[pos..],
+        1234605616436508552u64,
+        1012500i64,
+        500u32,
+        7u16,
+        Side::Bid,
+    )?;
+    pos += n;
+    Ok(pos)
+}
+
+/// A negative limit price. The field is signed on the wire, and a decoder that reads it unsigned returns a colossal positive number rather than an error.
+pub fn check_order_new_negative_price(buf: &[u8]) -> Result<(), String> {
+    let mut pos = 0usize;
+    // message 0
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 0: {e}"))?;
+    let OrderPathMessage::NewOrder(d) = msg else {
+        return Err(format!(
+            "message 0: expected NewOrder, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64("message 0.client_order_id", d.client_order_id(), 1u64)?;
+    eq_i64("message 0.price", d.price(), -12345)?;
+    eq_u32("message 0.quantity", d.quantity(), 1u32)?;
+    eq_u16("message 0.symbol_id", d.symbol_id(), 0u16)?;
+    if d.side().map_err(|e| format!("message 0.side: {e}"))? != Side::Ask {
+        return Err(format!(
+            "message 0.side: expected Side::Ask, got {:?}",
+            d.side()
+        ));
+    }
+    pos += d.total_len();
+
+    if pos != buf.len() {
+        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Re-encodes `order_new_negative_price` from the same values `check_order_new_negative_price` asserts.
+pub fn build_order_new_negative_price(out: &mut [u8]) -> Result<usize, WireError> {
+    let mut pos = 0usize;
+    // message 0
+    let n = encode_new_order(&mut out[pos..], 1u64, -12345i64, 1u32, 0u16, Side::Ask)?;
+    pos += n;
+    Ok(pos)
+}
+
+/// A cancel carries its own id and the id of the order it cancels; transposing the two cancels nothing and reports success.
+pub fn check_order_cancel(buf: &[u8]) -> Result<(), String> {
+    let mut pos = 0usize;
+    // message 0
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 0: {e}"))?;
+    let OrderPathMessage::CancelOrder(d) = msg else {
+        return Err(format!(
+            "message 0: expected CancelOrder, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64("message 0.client_order_id", d.client_order_id(), 91u64)?;
+    eq_u64(
+        "message 0.orig_client_order_id",
+        d.orig_client_order_id(),
+        90u64,
+    )?;
+    eq_u16("message 0.symbol_id", d.symbol_id(), 7u16)?;
+    if d.side().map_err(|e| format!("message 0.side: {e}"))? != Side::Ask {
+        return Err(format!(
+            "message 0.side: expected Side::Ask, got {:?}",
+            d.side()
+        ));
+    }
+    pos += d.total_len();
+
+    if pos != buf.len() {
+        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Re-encodes `order_cancel` from the same values `check_order_cancel` asserts.
+pub fn build_order_cancel(out: &mut [u8]) -> Result<usize, WireError> {
+    let mut pos = 0usize;
+    // message 0
+    let n = encode_cancel_order(&mut out[pos..], 91u64, 90u64, 7u16, Side::Ask)?;
+    pos += n;
+    Ok(pos)
+}
+
+/// A partial fill: quantity is what traded, leavesQuantity what is still live.
+pub fn check_order_exec_partial_fill(buf: &[u8]) -> Result<(), String> {
+    let mut pos = 0usize;
+    // message 0
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 0: {e}"))?;
+    let OrderPathMessage::ExecReport(d) = msg else {
+        return Err(format!(
+            "message 0: expected ExecReport, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64(
+        "message 0.client_order_id",
+        d.client_order_id(),
+        1234605616436508552u64,
+    )?;
+    eq_u64(
+        "message 0.exchange_order_id",
+        d.exchange_order_id(),
+        4096u64,
+    )?;
+    eq_u64("message 0.trade_id", d.trade_id(), 77u64)?;
+    eq_i64("message 0.price", d.price(), 1012500)?;
+    eq_u32("message 0.quantity", d.quantity(), 300u32)?;
+    eq_u32("message 0.leaves_quantity", d.leaves_quantity(), 200u32)?;
+    eq_u16("message 0.symbol_id", d.symbol_id(), 7u16)?;
+    if d.side().map_err(|e| format!("message 0.side: {e}"))? != Side::Bid {
+        return Err(format!(
+            "message 0.side: expected Side::Bid, got {:?}",
+            d.side()
+        ));
+    }
+    if d.exec_type()
+        .map_err(|e| format!("message 0.exec_type: {e}"))?
+        != ExecType::PartialFill
+    {
+        return Err(format!(
+            "message 0.exec_type: expected ExecType::PartialFill, got {:?}",
+            d.exec_type()
+        ));
+    }
+    if d.reject_reason()
+        .map_err(|e| format!("message 0.reject_reason: {e}"))?
+        != RejectReason::NotRejected
+    {
+        return Err(format!(
+            "message 0.reject_reason: expected RejectReason::NotRejected, got {:?}",
+            d.reject_reason()
+        ));
+    }
+    pos += d.total_len();
+
+    if pos != buf.len() {
+        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Re-encodes `order_exec_partial_fill` from the same values `check_order_exec_partial_fill` asserts.
+pub fn build_order_exec_partial_fill(out: &mut [u8]) -> Result<usize, WireError> {
+    let mut pos = 0usize;
+    // message 0
+    let n = encode_exec_report(
+        &mut out[pos..],
+        1234605616436508552u64,
+        4096u64,
+        77u64,
+        1012500i64,
+        300u32,
+        200u32,
+        7u16,
+        Side::Bid,
+        ExecType::PartialFill,
+        RejectReason::NotRejected,
+    )?;
+    pos += n;
+    Ok(pos)
+}
+
+/// A risk reject. exchangeOrderId and tradeId are zero because the order never reached the engine, which is what the limit is for.
+pub fn check_order_exec_reject(buf: &[u8]) -> Result<(), String> {
+    let mut pos = 0usize;
+    // message 0
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 0: {e}"))?;
+    let OrderPathMessage::ExecReport(d) = msg else {
+        return Err(format!(
+            "message 0: expected ExecReport, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64(
+        "message 0.client_order_id",
+        d.client_order_id(),
+        1234605616436508553u64,
+    )?;
+    eq_u64("message 0.exchange_order_id", d.exchange_order_id(), 0u64)?;
+    eq_u64("message 0.trade_id", d.trade_id(), 0u64)?;
+    eq_i64("message 0.price", d.price(), 1012500)?;
+    eq_u32("message 0.quantity", d.quantity(), 1000000u32)?;
+    eq_u32("message 0.leaves_quantity", d.leaves_quantity(), 0u32)?;
+    eq_u16("message 0.symbol_id", d.symbol_id(), 7u16)?;
+    if d.side().map_err(|e| format!("message 0.side: {e}"))? != Side::Bid {
+        return Err(format!(
+            "message 0.side: expected Side::Bid, got {:?}",
+            d.side()
+        ));
+    }
+    if d.exec_type()
+        .map_err(|e| format!("message 0.exec_type: {e}"))?
+        != ExecType::Rejected
+    {
+        return Err(format!(
+            "message 0.exec_type: expected ExecType::Rejected, got {:?}",
+            d.exec_type()
+        ));
+    }
+    if d.reject_reason()
+        .map_err(|e| format!("message 0.reject_reason: {e}"))?
+        != RejectReason::MaxNotional
+    {
+        return Err(format!(
+            "message 0.reject_reason: expected RejectReason::MaxNotional, got {:?}",
+            d.reject_reason()
+        ));
+    }
+    pos += d.total_len();
+
+    if pos != buf.len() {
+        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Re-encodes `order_exec_reject` from the same values `check_order_exec_reject` asserts.
+pub fn build_order_exec_reject(out: &mut [u8]) -> Result<usize, WireError> {
+    let mut pos = 0usize;
+    // message 0
+    let n = encode_exec_report(
+        &mut out[pos..],
+        1234605616436508553u64,
+        0u64,
+        0u64,
+        1012500i64,
+        1000000u32,
+        0u32,
+        7u16,
+        Side::Bid,
+        ExecType::Rejected,
+        RejectReason::MaxNotional,
+    )?;
+    pos += n;
+    Ok(pos)
+}
+
+/// After a restart: name every order you still hold for me.
+pub fn check_order_reconcile(buf: &[u8]) -> Result<(), String> {
+    let mut pos = 0usize;
+    // message 0
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 0: {e}"))?;
+    let OrderPathMessage::ReconcileRequest(d) = msg else {
+        return Err(format!(
+            "message 0: expected ReconcileRequest, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64("message 0.request_id", d.request_id(), 3735928559u64)?;
+    pos += d.total_len();
+
+    if pos != buf.len() {
+        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Re-encodes `order_reconcile` from the same values `check_order_reconcile` asserts.
+pub fn build_order_reconcile(out: &mut [u8]) -> Result<usize, WireError> {
+    let mut pos = 0usize;
+    // message 0
+    let n = encode_reconcile_request(&mut out[pos..], 3735928559u64)?;
+    pos += n;
+    Ok(pos)
+}
+
+/// Two order-path messages back to back. Nothing frames them but their own blockLength, so a walk that advances by the wrong amount lands mid-message on the second.
+pub fn check_order_new_then_cancel(buf: &[u8]) -> Result<(), String> {
+    let mut pos = 0usize;
+    // message 0
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 0: {e}"))?;
+    let OrderPathMessage::NewOrder(d) = msg else {
+        return Err(format!(
+            "message 0: expected NewOrder, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64("message 0.client_order_id", d.client_order_id(), 90u64)?;
+    eq_i64("message 0.price", d.price(), 1012500)?;
+    eq_u32("message 0.quantity", d.quantity(), 500u32)?;
+    eq_u16("message 0.symbol_id", d.symbol_id(), 7u16)?;
+    if d.side().map_err(|e| format!("message 0.side: {e}"))? != Side::Bid {
+        return Err(format!(
+            "message 0.side: expected Side::Bid, got {:?}",
+            d.side()
+        ));
+    }
+    pos += d.total_len();
+
+    // message 1
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 1: {e}"))?;
+    let OrderPathMessage::CancelOrder(d) = msg else {
+        return Err(format!(
+            "message 1: expected CancelOrder, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64("message 1.client_order_id", d.client_order_id(), 91u64)?;
+    eq_u64(
+        "message 1.orig_client_order_id",
+        d.orig_client_order_id(),
+        90u64,
+    )?;
+    eq_u16("message 1.symbol_id", d.symbol_id(), 7u16)?;
+    if d.side().map_err(|e| format!("message 1.side: {e}"))? != Side::Bid {
+        return Err(format!(
+            "message 1.side: expected Side::Bid, got {:?}",
+            d.side()
+        ));
+    }
+    pos += d.total_len();
+
+    if pos != buf.len() {
+        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Re-encodes `order_new_then_cancel` from the same values `check_order_new_then_cancel` asserts.
+pub fn build_order_new_then_cancel(out: &mut [u8]) -> Result<usize, WireError> {
+    let mut pos = 0usize;
+    // message 0
+    let n = encode_new_order(&mut out[pos..], 90u64, 1012500i64, 500u32, 7u16, Side::Bid)?;
+    pos += n;
+    // message 1
+    let n = encode_cancel_order(&mut out[pos..], 91u64, 90u64, 7u16, Side::Bid)?;
+    pos += n;
+    Ok(pos)
+}
+
+/// A reconciliation answer: one status line, then the marker that ends it carrying how many there were. A gateway that stops at the first message concludes the engine holds nothing.
+pub fn check_order_status_pair(buf: &[u8]) -> Result<(), String> {
+    let mut pos = 0usize;
+    // message 0
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 0: {e}"))?;
+    let OrderPathMessage::ExecReport(d) = msg else {
+        return Err(format!(
+            "message 0: expected ExecReport, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64("message 0.client_order_id", d.client_order_id(), 90u64)?;
+    eq_u64(
+        "message 0.exchange_order_id",
+        d.exchange_order_id(),
+        4096u64,
+    )?;
+    eq_u64("message 0.trade_id", d.trade_id(), 0u64)?;
+    eq_i64("message 0.price", d.price(), 1012500)?;
+    eq_u32("message 0.quantity", d.quantity(), 500u32)?;
+    eq_u32("message 0.leaves_quantity", d.leaves_quantity(), 300u32)?;
+    eq_u16("message 0.symbol_id", d.symbol_id(), 7u16)?;
+    if d.side().map_err(|e| format!("message 0.side: {e}"))? != Side::Bid {
+        return Err(format!(
+            "message 0.side: expected Side::Bid, got {:?}",
+            d.side()
+        ));
+    }
+    if d.exec_type()
+        .map_err(|e| format!("message 0.exec_type: {e}"))?
+        != ExecType::OrderStatus
+    {
+        return Err(format!(
+            "message 0.exec_type: expected ExecType::OrderStatus, got {:?}",
+            d.exec_type()
+        ));
+    }
+    if d.reject_reason()
+        .map_err(|e| format!("message 0.reject_reason: {e}"))?
+        != RejectReason::NotRejected
+    {
+        return Err(format!(
+            "message 0.reject_reason: expected RejectReason::NotRejected, got {:?}",
+            d.reject_reason()
+        ));
+    }
+    pos += d.total_len();
+
+    // message 1
+    let msg = decode_order_path_message(&buf[pos..]).map_err(|e| format!("message 1: {e}"))?;
+    let OrderPathMessage::ExecReport(d) = msg else {
+        return Err(format!(
+            "message 1: expected ExecReport, got template {}",
+            msg.template_id()
+        ));
+    };
+    eq_u64("message 1.client_order_id", d.client_order_id(), 0u64)?;
+    eq_u64("message 1.exchange_order_id", d.exchange_order_id(), 0u64)?;
+    eq_u64("message 1.trade_id", d.trade_id(), 0u64)?;
+    eq_i64("message 1.price", d.price(), 0)?;
+    eq_u32("message 1.quantity", d.quantity(), 1u32)?;
+    eq_u32("message 1.leaves_quantity", d.leaves_quantity(), 0u32)?;
+    eq_u16("message 1.symbol_id", d.symbol_id(), 0u16)?;
+    if d.side().map_err(|e| format!("message 1.side: {e}"))? != Side::Bid {
+        return Err(format!(
+            "message 1.side: expected Side::Bid, got {:?}",
+            d.side()
+        ));
+    }
+    if d.exec_type()
+        .map_err(|e| format!("message 1.exec_type: {e}"))?
+        != ExecType::StatusComplete
+    {
+        return Err(format!(
+            "message 1.exec_type: expected ExecType::StatusComplete, got {:?}",
+            d.exec_type()
+        ));
+    }
+    if d.reject_reason()
+        .map_err(|e| format!("message 1.reject_reason: {e}"))?
+        != RejectReason::NotRejected
+    {
+        return Err(format!(
+            "message 1.reject_reason: expected RejectReason::NotRejected, got {:?}",
+            d.reject_reason()
+        ));
+    }
+    pos += d.total_len();
+
+    if pos != buf.len() {
+        return Err(format!("trailing bytes: consumed {pos} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Re-encodes `order_status_pair` from the same values `check_order_status_pair` asserts.
+pub fn build_order_status_pair(out: &mut [u8]) -> Result<usize, WireError> {
+    let mut pos = 0usize;
+    // message 0
+    let n = encode_exec_report(
+        &mut out[pos..],
+        90u64,
+        4096u64,
+        0u64,
+        1012500i64,
+        500u32,
+        300u32,
+        7u16,
+        Side::Bid,
+        ExecType::OrderStatus,
+        RejectReason::NotRejected,
+    )?;
+    pos += n;
+    // message 1
+    let n = encode_exec_report(
+        &mut out[pos..],
+        0u64,
+        0u64,
+        0u64,
+        0i64,
+        1u32,
+        0u32,
+        0u16,
+        Side::Bid,
+        ExecType::StatusComplete,
+        RejectReason::NotRejected,
+    )?;
+    pos += n;
+    Ok(pos)
 }

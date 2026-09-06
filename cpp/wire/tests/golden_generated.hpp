@@ -874,6 +874,436 @@ inline std::size_t build_sequence_wrap_high(std::byte* out, std::size_t cap, std
     return pos;
 }
 
+// A client order entering the system. Anchors the NewOrder block.
+inline std::string check_order_new(const std::byte* buf, std::size_t len) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto d = NewOrderDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 0: not a decodable NewOrder";
+        CHECK_EQ("message 0.client_order_id", d->client_order_id(), 1234605616436508552ULL);
+        CHECK_EQ("message 0.price", d->price(), 1012500);
+        CHECK_EQ("message 0.quantity", d->quantity(), 500);
+        CHECK_EQ("message 0.symbol_id", d->symbol_id(), 7);
+        {
+            auto e = d->side();
+            if (!e) return "message 0.side: undefined enum value";
+            CHECK_EQ("message 0.side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+        }
+        pos += d->total_len();
+    }
+    if (pos != len) return "trailing bytes past the last message";
+    return "";
+}
+
+// Re-encodes `order_new` from the same values check_order_new asserts.
+inline std::size_t build_order_new(std::byte* out, std::size_t cap, std::string& err) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto n = encode_new_order(out + pos, cap - pos
+            , static_cast<std::uint64_t>(1234605616436508552ULL)
+            , static_cast<std::int64_t>(1012500)
+            , static_cast<std::uint32_t>(500ULL)
+            , static_cast<std::uint16_t>(7ULL)
+            , Side::kBid
+        );
+        if (!n) { err = "message 0 did not fit"; return 0; }
+        pos += *n;
+    }
+    return pos;
+}
+
+// A negative limit price. The field is signed on the wire, and a decoder that reads it unsigned returns a colossal positive number rather than an error.
+inline std::string check_order_new_negative_price(const std::byte* buf, std::size_t len) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto d = NewOrderDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 0: not a decodable NewOrder";
+        CHECK_EQ("message 0.client_order_id", d->client_order_id(), 1);
+        CHECK_EQ("message 0.price", d->price(), static_cast<std::int64_t>(-12345));
+        CHECK_EQ("message 0.quantity", d->quantity(), 1);
+        CHECK_EQ("message 0.symbol_id", d->symbol_id(), 0);
+        {
+            auto e = d->side();
+            if (!e) return "message 0.side: undefined enum value";
+            CHECK_EQ("message 0.side", static_cast<int>(*e), static_cast<int>(Side::kAsk));
+        }
+        pos += d->total_len();
+    }
+    if (pos != len) return "trailing bytes past the last message";
+    return "";
+}
+
+// Re-encodes `order_new_negative_price` from the same values check_order_new_negative_price asserts.
+inline std::size_t build_order_new_negative_price(std::byte* out, std::size_t cap, std::string& err) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto n = encode_new_order(out + pos, cap - pos
+            , static_cast<std::uint64_t>(1ULL)
+            , static_cast<std::int64_t>(-12345)
+            , static_cast<std::uint32_t>(1ULL)
+            , static_cast<std::uint16_t>(0ULL)
+            , Side::kAsk
+        );
+        if (!n) { err = "message 0 did not fit"; return 0; }
+        pos += *n;
+    }
+    return pos;
+}
+
+// A cancel carries its own id and the id of the order it cancels; transposing the two cancels nothing and reports success.
+inline std::string check_order_cancel(const std::byte* buf, std::size_t len) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto d = CancelOrderDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 0: not a decodable CancelOrder";
+        CHECK_EQ("message 0.client_order_id", d->client_order_id(), 91);
+        CHECK_EQ("message 0.orig_client_order_id", d->orig_client_order_id(), 90);
+        CHECK_EQ("message 0.symbol_id", d->symbol_id(), 7);
+        {
+            auto e = d->side();
+            if (!e) return "message 0.side: undefined enum value";
+            CHECK_EQ("message 0.side", static_cast<int>(*e), static_cast<int>(Side::kAsk));
+        }
+        pos += d->total_len();
+    }
+    if (pos != len) return "trailing bytes past the last message";
+    return "";
+}
+
+// Re-encodes `order_cancel` from the same values check_order_cancel asserts.
+inline std::size_t build_order_cancel(std::byte* out, std::size_t cap, std::string& err) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto n = encode_cancel_order(out + pos, cap - pos
+            , static_cast<std::uint64_t>(91ULL)
+            , static_cast<std::uint64_t>(90ULL)
+            , static_cast<std::uint16_t>(7ULL)
+            , Side::kAsk
+        );
+        if (!n) { err = "message 0 did not fit"; return 0; }
+        pos += *n;
+    }
+    return pos;
+}
+
+// A partial fill: quantity is what traded, leavesQuantity what is still live.
+inline std::string check_order_exec_partial_fill(const std::byte* buf, std::size_t len) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto d = ExecReportDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 0: not a decodable ExecReport";
+        CHECK_EQ("message 0.client_order_id", d->client_order_id(), 1234605616436508552ULL);
+        CHECK_EQ("message 0.exchange_order_id", d->exchange_order_id(), 4096);
+        CHECK_EQ("message 0.trade_id", d->trade_id(), 77);
+        CHECK_EQ("message 0.price", d->price(), 1012500);
+        CHECK_EQ("message 0.quantity", d->quantity(), 300);
+        CHECK_EQ("message 0.leaves_quantity", d->leaves_quantity(), 200);
+        CHECK_EQ("message 0.symbol_id", d->symbol_id(), 7);
+        {
+            auto e = d->side();
+            if (!e) return "message 0.side: undefined enum value";
+            CHECK_EQ("message 0.side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+        }
+        {
+            auto e = d->exec_type();
+            if (!e) return "message 0.exec_type: undefined enum value";
+            CHECK_EQ("message 0.exec_type", static_cast<int>(*e), static_cast<int>(ExecType::kPartialFill));
+        }
+        {
+            auto e = d->reject_reason();
+            if (!e) return "message 0.reject_reason: undefined enum value";
+            CHECK_EQ("message 0.reject_reason", static_cast<int>(*e), static_cast<int>(RejectReason::kNotRejected));
+        }
+        pos += d->total_len();
+    }
+    if (pos != len) return "trailing bytes past the last message";
+    return "";
+}
+
+// Re-encodes `order_exec_partial_fill` from the same values check_order_exec_partial_fill asserts.
+inline std::size_t build_order_exec_partial_fill(std::byte* out, std::size_t cap, std::string& err) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto n = encode_exec_report(out + pos, cap - pos
+            , static_cast<std::uint64_t>(1234605616436508552ULL)
+            , static_cast<std::uint64_t>(4096ULL)
+            , static_cast<std::uint64_t>(77ULL)
+            , static_cast<std::int64_t>(1012500)
+            , static_cast<std::uint32_t>(300ULL)
+            , static_cast<std::uint32_t>(200ULL)
+            , static_cast<std::uint16_t>(7ULL)
+            , Side::kBid
+            , ExecType::kPartialFill
+            , RejectReason::kNotRejected
+        );
+        if (!n) { err = "message 0 did not fit"; return 0; }
+        pos += *n;
+    }
+    return pos;
+}
+
+// A risk reject. exchangeOrderId and tradeId are zero because the order never reached the engine, which is what the limit is for.
+inline std::string check_order_exec_reject(const std::byte* buf, std::size_t len) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto d = ExecReportDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 0: not a decodable ExecReport";
+        CHECK_EQ("message 0.client_order_id", d->client_order_id(), 1234605616436508553ULL);
+        CHECK_EQ("message 0.exchange_order_id", d->exchange_order_id(), 0);
+        CHECK_EQ("message 0.trade_id", d->trade_id(), 0);
+        CHECK_EQ("message 0.price", d->price(), 1012500);
+        CHECK_EQ("message 0.quantity", d->quantity(), 1000000);
+        CHECK_EQ("message 0.leaves_quantity", d->leaves_quantity(), 0);
+        CHECK_EQ("message 0.symbol_id", d->symbol_id(), 7);
+        {
+            auto e = d->side();
+            if (!e) return "message 0.side: undefined enum value";
+            CHECK_EQ("message 0.side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+        }
+        {
+            auto e = d->exec_type();
+            if (!e) return "message 0.exec_type: undefined enum value";
+            CHECK_EQ("message 0.exec_type", static_cast<int>(*e), static_cast<int>(ExecType::kRejected));
+        }
+        {
+            auto e = d->reject_reason();
+            if (!e) return "message 0.reject_reason: undefined enum value";
+            CHECK_EQ("message 0.reject_reason", static_cast<int>(*e), static_cast<int>(RejectReason::kMaxNotional));
+        }
+        pos += d->total_len();
+    }
+    if (pos != len) return "trailing bytes past the last message";
+    return "";
+}
+
+// Re-encodes `order_exec_reject` from the same values check_order_exec_reject asserts.
+inline std::size_t build_order_exec_reject(std::byte* out, std::size_t cap, std::string& err) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto n = encode_exec_report(out + pos, cap - pos
+            , static_cast<std::uint64_t>(1234605616436508553ULL)
+            , static_cast<std::uint64_t>(0ULL)
+            , static_cast<std::uint64_t>(0ULL)
+            , static_cast<std::int64_t>(1012500)
+            , static_cast<std::uint32_t>(1000000ULL)
+            , static_cast<std::uint32_t>(0ULL)
+            , static_cast<std::uint16_t>(7ULL)
+            , Side::kBid
+            , ExecType::kRejected
+            , RejectReason::kMaxNotional
+        );
+        if (!n) { err = "message 0 did not fit"; return 0; }
+        pos += *n;
+    }
+    return pos;
+}
+
+// After a restart: name every order you still hold for me.
+inline std::string check_order_reconcile(const std::byte* buf, std::size_t len) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto d = ReconcileRequestDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 0: not a decodable ReconcileRequest";
+        CHECK_EQ("message 0.request_id", d->request_id(), 3735928559);
+        pos += d->total_len();
+    }
+    if (pos != len) return "trailing bytes past the last message";
+    return "";
+}
+
+// Re-encodes `order_reconcile` from the same values check_order_reconcile asserts.
+inline std::size_t build_order_reconcile(std::byte* out, std::size_t cap, std::string& err) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto n = encode_reconcile_request(out + pos, cap - pos
+            , static_cast<std::uint64_t>(3735928559ULL)
+        );
+        if (!n) { err = "message 0 did not fit"; return 0; }
+        pos += *n;
+    }
+    return pos;
+}
+
+// Two order-path messages back to back. Nothing frames them but their own blockLength, so a walk that advances by the wrong amount lands mid-message on the second.
+inline std::string check_order_new_then_cancel(const std::byte* buf, std::size_t len) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto d = NewOrderDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 0: not a decodable NewOrder";
+        CHECK_EQ("message 0.client_order_id", d->client_order_id(), 90);
+        CHECK_EQ("message 0.price", d->price(), 1012500);
+        CHECK_EQ("message 0.quantity", d->quantity(), 500);
+        CHECK_EQ("message 0.symbol_id", d->symbol_id(), 7);
+        {
+            auto e = d->side();
+            if (!e) return "message 0.side: undefined enum value";
+            CHECK_EQ("message 0.side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+        }
+        pos += d->total_len();
+    }
+    // message 1
+    {
+        auto d = CancelOrderDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 1: not a decodable CancelOrder";
+        CHECK_EQ("message 1.client_order_id", d->client_order_id(), 91);
+        CHECK_EQ("message 1.orig_client_order_id", d->orig_client_order_id(), 90);
+        CHECK_EQ("message 1.symbol_id", d->symbol_id(), 7);
+        {
+            auto e = d->side();
+            if (!e) return "message 1.side: undefined enum value";
+            CHECK_EQ("message 1.side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+        }
+        pos += d->total_len();
+    }
+    if (pos != len) return "trailing bytes past the last message";
+    return "";
+}
+
+// Re-encodes `order_new_then_cancel` from the same values check_order_new_then_cancel asserts.
+inline std::size_t build_order_new_then_cancel(std::byte* out, std::size_t cap, std::string& err) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto n = encode_new_order(out + pos, cap - pos
+            , static_cast<std::uint64_t>(90ULL)
+            , static_cast<std::int64_t>(1012500)
+            , static_cast<std::uint32_t>(500ULL)
+            , static_cast<std::uint16_t>(7ULL)
+            , Side::kBid
+        );
+        if (!n) { err = "message 0 did not fit"; return 0; }
+        pos += *n;
+    }
+    // message 1
+    {
+        auto n = encode_cancel_order(out + pos, cap - pos
+            , static_cast<std::uint64_t>(91ULL)
+            , static_cast<std::uint64_t>(90ULL)
+            , static_cast<std::uint16_t>(7ULL)
+            , Side::kBid
+        );
+        if (!n) { err = "message 1 did not fit"; return 0; }
+        pos += *n;
+    }
+    return pos;
+}
+
+// A reconciliation answer: one status line, then the marker that ends it carrying how many there were. A gateway that stops at the first message concludes the engine holds nothing.
+inline std::string check_order_status_pair(const std::byte* buf, std::size_t len) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto d = ExecReportDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 0: not a decodable ExecReport";
+        CHECK_EQ("message 0.client_order_id", d->client_order_id(), 90);
+        CHECK_EQ("message 0.exchange_order_id", d->exchange_order_id(), 4096);
+        CHECK_EQ("message 0.trade_id", d->trade_id(), 0);
+        CHECK_EQ("message 0.price", d->price(), 1012500);
+        CHECK_EQ("message 0.quantity", d->quantity(), 500);
+        CHECK_EQ("message 0.leaves_quantity", d->leaves_quantity(), 300);
+        CHECK_EQ("message 0.symbol_id", d->symbol_id(), 7);
+        {
+            auto e = d->side();
+            if (!e) return "message 0.side: undefined enum value";
+            CHECK_EQ("message 0.side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+        }
+        {
+            auto e = d->exec_type();
+            if (!e) return "message 0.exec_type: undefined enum value";
+            CHECK_EQ("message 0.exec_type", static_cast<int>(*e), static_cast<int>(ExecType::kOrderStatus));
+        }
+        {
+            auto e = d->reject_reason();
+            if (!e) return "message 0.reject_reason: undefined enum value";
+            CHECK_EQ("message 0.reject_reason", static_cast<int>(*e), static_cast<int>(RejectReason::kNotRejected));
+        }
+        pos += d->total_len();
+    }
+    // message 1
+    {
+        auto d = ExecReportDecoder::wrap(buf + pos, len - pos);
+        if (!d) return "message 1: not a decodable ExecReport";
+        CHECK_EQ("message 1.client_order_id", d->client_order_id(), 0);
+        CHECK_EQ("message 1.exchange_order_id", d->exchange_order_id(), 0);
+        CHECK_EQ("message 1.trade_id", d->trade_id(), 0);
+        CHECK_EQ("message 1.price", d->price(), 0);
+        CHECK_EQ("message 1.quantity", d->quantity(), 1);
+        CHECK_EQ("message 1.leaves_quantity", d->leaves_quantity(), 0);
+        CHECK_EQ("message 1.symbol_id", d->symbol_id(), 0);
+        {
+            auto e = d->side();
+            if (!e) return "message 1.side: undefined enum value";
+            CHECK_EQ("message 1.side", static_cast<int>(*e), static_cast<int>(Side::kBid));
+        }
+        {
+            auto e = d->exec_type();
+            if (!e) return "message 1.exec_type: undefined enum value";
+            CHECK_EQ("message 1.exec_type", static_cast<int>(*e), static_cast<int>(ExecType::kStatusComplete));
+        }
+        {
+            auto e = d->reject_reason();
+            if (!e) return "message 1.reject_reason: undefined enum value";
+            CHECK_EQ("message 1.reject_reason", static_cast<int>(*e), static_cast<int>(RejectReason::kNotRejected));
+        }
+        pos += d->total_len();
+    }
+    if (pos != len) return "trailing bytes past the last message";
+    return "";
+}
+
+// Re-encodes `order_status_pair` from the same values check_order_status_pair asserts.
+inline std::size_t build_order_status_pair(std::byte* out, std::size_t cap, std::string& err) {
+    std::size_t pos = 0;
+    // message 0
+    {
+        auto n = encode_exec_report(out + pos, cap - pos
+            , static_cast<std::uint64_t>(90ULL)
+            , static_cast<std::uint64_t>(4096ULL)
+            , static_cast<std::uint64_t>(0ULL)
+            , static_cast<std::int64_t>(1012500)
+            , static_cast<std::uint32_t>(500ULL)
+            , static_cast<std::uint32_t>(300ULL)
+            , static_cast<std::uint16_t>(7ULL)
+            , Side::kBid
+            , ExecType::kOrderStatus
+            , RejectReason::kNotRejected
+        );
+        if (!n) { err = "message 0 did not fit"; return 0; }
+        pos += *n;
+    }
+    // message 1
+    {
+        auto n = encode_exec_report(out + pos, cap - pos
+            , static_cast<std::uint64_t>(0ULL)
+            , static_cast<std::uint64_t>(0ULL)
+            , static_cast<std::uint64_t>(0ULL)
+            , static_cast<std::int64_t>(0)
+            , static_cast<std::uint32_t>(1ULL)
+            , static_cast<std::uint32_t>(0ULL)
+            , static_cast<std::uint16_t>(0ULL)
+            , Side::kBid
+            , ExecType::kStatusComplete
+            , RejectReason::kNotRejected
+        );
+        if (!n) { err = "message 1 did not fit"; return 0; }
+        pos += *n;
+    }
+    return pos;
+}
+
 struct Vector {
     const char* name;
     const char* file;
@@ -894,6 +1324,14 @@ inline constexpr Vector kVectors[] = {
     {"batch_mixed", "batch_mixed.bin", "Six messages of five types behind one header, including a variable-length snapshot in the middle. This is the vector that proves a decoder can walk a batch: get any total_len wrong and every message after it is garbage. Batching is not an optimisation here, it is the framing the throughput target depends on.", check_batch_mixed, build_batch_mixed},
     {"negative_price", "negative_price.bin", "Prices are signed on the wire. Spreads, settlement marks and a few real contracts go below zero, and a decoder that reads the field as unsigned looks correct until the day one does.", check_negative_price, build_negative_price},
     {"sequence_wrap_high", "sequence_wrap_high.bin", "firstSequence near 2^64. The sequence of message i is firstSequence+i, so a reader that widens through i32 or i64 breaks here and nowhere else.", check_sequence_wrap_high, build_sequence_wrap_high},
+    {"order_new", "order_new.bin", "A client order entering the system. Anchors the NewOrder block.", check_order_new, build_order_new},
+    {"order_new_negative_price", "order_new_negative_price.bin", "A negative limit price. The field is signed on the wire, and a decoder that reads it unsigned returns a colossal positive number rather than an error.", check_order_new_negative_price, build_order_new_negative_price},
+    {"order_cancel", "order_cancel.bin", "A cancel carries its own id and the id of the order it cancels; transposing the two cancels nothing and reports success.", check_order_cancel, build_order_cancel},
+    {"order_exec_partial_fill", "order_exec_partial_fill.bin", "A partial fill: quantity is what traded, leavesQuantity what is still live.", check_order_exec_partial_fill, build_order_exec_partial_fill},
+    {"order_exec_reject", "order_exec_reject.bin", "A risk reject. exchangeOrderId and tradeId are zero because the order never reached the engine, which is what the limit is for.", check_order_exec_reject, build_order_exec_reject},
+    {"order_reconcile", "order_reconcile.bin", "After a restart: name every order you still hold for me.", check_order_reconcile, build_order_reconcile},
+    {"order_new_then_cancel", "order_new_then_cancel.bin", "Two order-path messages back to back. Nothing frames them but their own blockLength, so a walk that advances by the wrong amount lands mid-message on the second.", check_order_new_then_cancel, build_order_new_then_cancel},
+    {"order_status_pair", "order_status_pair.bin", "A reconciliation answer: one status line, then the marker that ends it carrying how many there were. A gateway that stops at the first message concludes the engine holds nothing.", check_order_status_pair, build_order_status_pair},
 };
 
 }  // namespace mdstack::golden

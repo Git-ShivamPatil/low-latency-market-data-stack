@@ -167,6 +167,90 @@ impl ModifyReason {
     }
 }
 
+/// `ExecType` as encoded on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ExecType {
+    Acknowledged = 0,
+    PartialFill = 1,
+    Fill = 2,
+    Canceled = 3,
+    Rejected = 4,
+    OrderStatus = 5,
+    StatusComplete = 6,
+}
+
+impl ExecType {
+    /// Reject anything the schema does not define rather than
+    /// transmuting an unknown discriminant.
+    #[inline]
+    pub fn from_u8(v: u8) -> Result<Self, WireError> {
+        match v {
+            0 => Ok(Self::Acknowledged),
+            1 => Ok(Self::PartialFill),
+            2 => Ok(Self::Fill),
+            3 => Ok(Self::Canceled),
+            4 => Ok(Self::Rejected),
+            5 => Ok(Self::OrderStatus),
+            6 => Ok(Self::StatusComplete),
+            other => Err(WireError::InvalidEnum {
+                name: "ExecType",
+                value: other as u64,
+            }),
+        }
+    }
+
+    #[inline(always)]
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// `RejectReason` as encoded on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RejectReason {
+    NotRejected = 0,
+    UnknownSymbol = 1,
+    MaxOrderQuantity = 2,
+    MaxNotional = 3,
+    PriceCollar = 4,
+    OpenOrderLimit = 5,
+    PositionLimit = 6,
+    DuplicateClientOrderId = 7,
+    UnknownOrder = 8,
+    QueueFull = 9,
+}
+
+impl RejectReason {
+    /// Reject anything the schema does not define rather than
+    /// transmuting an unknown discriminant.
+    #[inline]
+    pub fn from_u8(v: u8) -> Result<Self, WireError> {
+        match v {
+            0 => Ok(Self::NotRejected),
+            1 => Ok(Self::UnknownSymbol),
+            2 => Ok(Self::MaxOrderQuantity),
+            3 => Ok(Self::MaxNotional),
+            4 => Ok(Self::PriceCollar),
+            5 => Ok(Self::OpenOrderLimit),
+            6 => Ok(Self::PositionLimit),
+            7 => Ok(Self::DuplicateClientOrderId),
+            8 => Ok(Self::UnknownOrder),
+            9 => Ok(Self::QueueFull),
+            other => Err(WireError::InvalidEnum {
+                name: "RejectReason",
+                value: other as u64,
+            }),
+        }
+    }
+
+    #[inline(always)]
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Template ids, as they appear in `messageHeader.templateId`.
 pub mod template {
     /// A new order rests on the book
@@ -183,6 +267,14 @@ pub mod template {
     pub const HEARTBEAT: u16 = 6;
     /// The publisher restarts its sequence; the handler must resynchronise
     pub const SEQUENCE_RESET: u16 = 7;
+    /// A client order entering the system: gateway to risk to engine
+    pub const NEW_ORDER: u16 = 8;
+    /// Cancel a live order: gateway to risk to engine
+    pub const CANCEL_ORDER: u16 = 9;
+    /// What happened to an order: engine to risk to gateway, or risk to gateway for a reject
+    pub const EXEC_REPORT: u16 = 10;
+    /// After a restart: name every order you still hold for me
+    pub const RECONCILE_REQUEST: u16 = 11;
 }
 
 /// Read-only view over the 24-byte datagram header.
@@ -1291,7 +1383,489 @@ pub fn encode_sequence_reset(buf: &mut [u8], new_sequence: u64) -> Result<usize,
     Ok(LEN)
 }
 
+// --- NewOrder ------------------------------------------------------
+
+/// A client order entering the system: gateway to risk to engine
+///
+/// Borrows the datagram; decoding copies nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct NewOrderDecoder<'a> {
+    buf: &'a [u8],
+    root_len: usize,
+}
+
+impl<'a> NewOrderDecoder<'a> {
+    pub const TEMPLATE_ID: u16 = 8;
+    pub const BLOCK_LENGTH: u16 = 24;
+
+    /// Wraps a buffer whose first byte is the message header.
+    ///
+    /// The root block length comes from the wire, not from the constant,
+    /// so a newer publisher that appended fields is skipped correctly
+    /// rather than misparsed.
+    #[inline]
+    pub fn wrap(buf: &'a [u8]) -> Result<Self, WireError> {
+        let hdr = MessageHeaderDecoder::wrap(buf)?;
+        if hdr.template_id() != Self::TEMPLATE_ID {
+            return Err(WireError::TemplateMismatch {
+                expected: Self::TEMPLATE_ID,
+                got: hdr.template_id(),
+            });
+        }
+        let root_len = hdr.block_length() as usize;
+        if root_len < Self::BLOCK_LENGTH as usize {
+            return Err(WireError::BlockTooSmall {
+                message: "NewOrder",
+                needed: Self::BLOCK_LENGTH,
+                got: hdr.block_length(),
+            });
+        }
+        let need = MESSAGE_HEADER_LEN + root_len;
+        if buf.len() < need {
+            return Err(WireError::ShortBuffer {
+                needed: need,
+                got: buf.len(),
+            });
+        }
+        let d = Self { buf, root_len };
+        Ok(d)
+    }
+
+    /// The gateway's id for this order; carries FIX ClOrdID's meaning
+    #[inline(always)]
+    pub fn client_order_id(&self) -> u64 {
+        le_u64(self.buf, MESSAGE_HEADER_LEN)
+    }
+
+    /// Fixed point, scaled by 10^-4.
+    #[inline(always)]
+    pub fn price(&self) -> i64 {
+        le_i64(self.buf, MESSAGE_HEADER_LEN + 8)
+    }
+
+    #[inline(always)]
+    pub fn quantity(&self) -> u32 {
+        le_u32(self.buf, MESSAGE_HEADER_LEN + 16)
+    }
+
+    #[inline(always)]
+    pub fn symbol_id(&self) -> u16 {
+        le_u16(self.buf, MESSAGE_HEADER_LEN + 20)
+    }
+
+    #[inline(always)]
+    pub fn side_raw(&self) -> u8 {
+        le_u8(self.buf, MESSAGE_HEADER_LEN + 22)
+    }
+
+    /// Validating accessor. Use `side_raw()` on the hot path.
+    #[inline]
+    pub fn side(&self) -> Result<Side, WireError> {
+        Side::from_u8(self.side_raw())
+    }
+
+    /// Total bytes, header included.
+    #[inline(always)]
+    pub fn total_len(&self) -> usize {
+        MESSAGE_HEADER_LEN + self.root_len
+    }
+}
+
+/// Encodes a `NewOrder` at `buf[0]`, header included.
+///
+/// Returns the bytes written. Reserved bytes are zeroed, which is what
+/// makes a re-encode byte-identical to the golden vector.
+#[inline]
+pub fn encode_new_order(
+    buf: &mut [u8],
+    client_order_id: u64,
+    price: i64,
+    quantity: u32,
+    symbol_id: u16,
+    side: Side,
+) -> Result<usize, WireError> {
+    const LEN: usize = MESSAGE_HEADER_LEN + 24;
+    if buf.len() < LEN {
+        return Err(WireError::ShortBuffer {
+            needed: LEN,
+            got: buf.len(),
+        });
+    }
+    buf[..LEN].fill(0);
+    write_message_header(buf, 24, template::NEW_ORDER);
+    put_u64(buf, MESSAGE_HEADER_LEN, client_order_id);
+    put_i64(buf, MESSAGE_HEADER_LEN + 8, price);
+    put_u32(buf, MESSAGE_HEADER_LEN + 16, quantity);
+    put_u16(buf, MESSAGE_HEADER_LEN + 20, symbol_id);
+    put_u8(buf, MESSAGE_HEADER_LEN + 22, side as u8);
+    Ok(LEN)
+}
+
+// --- CancelOrder ---------------------------------------------------
+
+/// Cancel a live order: gateway to risk to engine
+///
+/// Borrows the datagram; decoding copies nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelOrderDecoder<'a> {
+    buf: &'a [u8],
+    root_len: usize,
+}
+
+impl<'a> CancelOrderDecoder<'a> {
+    pub const TEMPLATE_ID: u16 = 9;
+    pub const BLOCK_LENGTH: u16 = 24;
+
+    /// Wraps a buffer whose first byte is the message header.
+    ///
+    /// The root block length comes from the wire, not from the constant,
+    /// so a newer publisher that appended fields is skipped correctly
+    /// rather than misparsed.
+    #[inline]
+    pub fn wrap(buf: &'a [u8]) -> Result<Self, WireError> {
+        let hdr = MessageHeaderDecoder::wrap(buf)?;
+        if hdr.template_id() != Self::TEMPLATE_ID {
+            return Err(WireError::TemplateMismatch {
+                expected: Self::TEMPLATE_ID,
+                got: hdr.template_id(),
+            });
+        }
+        let root_len = hdr.block_length() as usize;
+        if root_len < Self::BLOCK_LENGTH as usize {
+            return Err(WireError::BlockTooSmall {
+                message: "CancelOrder",
+                needed: Self::BLOCK_LENGTH,
+                got: hdr.block_length(),
+            });
+        }
+        let need = MESSAGE_HEADER_LEN + root_len;
+        if buf.len() < need {
+            return Err(WireError::ShortBuffer {
+                needed: need,
+                got: buf.len(),
+            });
+        }
+        let d = Self { buf, root_len };
+        Ok(d)
+    }
+
+    /// Identifies this cancel request, not the order
+    #[inline(always)]
+    pub fn client_order_id(&self) -> u64 {
+        le_u64(self.buf, MESSAGE_HEADER_LEN)
+    }
+
+    /// The order to cancel
+    #[inline(always)]
+    pub fn orig_client_order_id(&self) -> u64 {
+        le_u64(self.buf, MESSAGE_HEADER_LEN + 8)
+    }
+
+    #[inline(always)]
+    pub fn symbol_id(&self) -> u16 {
+        le_u16(self.buf, MESSAGE_HEADER_LEN + 16)
+    }
+
+    #[inline(always)]
+    pub fn side_raw(&self) -> u8 {
+        le_u8(self.buf, MESSAGE_HEADER_LEN + 18)
+    }
+
+    /// Validating accessor. Use `side_raw()` on the hot path.
+    #[inline]
+    pub fn side(&self) -> Result<Side, WireError> {
+        Side::from_u8(self.side_raw())
+    }
+
+    /// Total bytes, header included.
+    #[inline(always)]
+    pub fn total_len(&self) -> usize {
+        MESSAGE_HEADER_LEN + self.root_len
+    }
+}
+
+/// Encodes a `CancelOrder` at `buf[0]`, header included.
+///
+/// Returns the bytes written. Reserved bytes are zeroed, which is what
+/// makes a re-encode byte-identical to the golden vector.
+#[inline]
+pub fn encode_cancel_order(
+    buf: &mut [u8],
+    client_order_id: u64,
+    orig_client_order_id: u64,
+    symbol_id: u16,
+    side: Side,
+) -> Result<usize, WireError> {
+    const LEN: usize = MESSAGE_HEADER_LEN + 24;
+    if buf.len() < LEN {
+        return Err(WireError::ShortBuffer {
+            needed: LEN,
+            got: buf.len(),
+        });
+    }
+    buf[..LEN].fill(0);
+    write_message_header(buf, 24, template::CANCEL_ORDER);
+    put_u64(buf, MESSAGE_HEADER_LEN, client_order_id);
+    put_u64(buf, MESSAGE_HEADER_LEN + 8, orig_client_order_id);
+    put_u16(buf, MESSAGE_HEADER_LEN + 16, symbol_id);
+    put_u8(buf, MESSAGE_HEADER_LEN + 18, side as u8);
+    Ok(LEN)
+}
+
+// --- ExecReport ----------------------------------------------------
+
+/// What happened to an order: engine to risk to gateway, or risk to gateway for a reject
+///
+/// Borrows the datagram; decoding copies nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecReportDecoder<'a> {
+    buf: &'a [u8],
+    root_len: usize,
+}
+
+impl<'a> ExecReportDecoder<'a> {
+    pub const TEMPLATE_ID: u16 = 10;
+    pub const BLOCK_LENGTH: u16 = 48;
+
+    /// Wraps a buffer whose first byte is the message header.
+    ///
+    /// The root block length comes from the wire, not from the constant,
+    /// so a newer publisher that appended fields is skipped correctly
+    /// rather than misparsed.
+    #[inline]
+    pub fn wrap(buf: &'a [u8]) -> Result<Self, WireError> {
+        let hdr = MessageHeaderDecoder::wrap(buf)?;
+        if hdr.template_id() != Self::TEMPLATE_ID {
+            return Err(WireError::TemplateMismatch {
+                expected: Self::TEMPLATE_ID,
+                got: hdr.template_id(),
+            });
+        }
+        let root_len = hdr.block_length() as usize;
+        if root_len < Self::BLOCK_LENGTH as usize {
+            return Err(WireError::BlockTooSmall {
+                message: "ExecReport",
+                needed: Self::BLOCK_LENGTH,
+                got: hdr.block_length(),
+            });
+        }
+        let need = MESSAGE_HEADER_LEN + root_len;
+        if buf.len() < need {
+            return Err(WireError::ShortBuffer {
+                needed: need,
+                got: buf.len(),
+            });
+        }
+        let d = Self { buf, root_len };
+        Ok(d)
+    }
+
+    #[inline(always)]
+    pub fn client_order_id(&self) -> u64 {
+        le_u64(self.buf, MESSAGE_HEADER_LEN)
+    }
+
+    /// The engine's order id; zero when the order never reached it
+    #[inline(always)]
+    pub fn exchange_order_id(&self) -> u64 {
+        le_u64(self.buf, MESSAGE_HEADER_LEN + 8)
+    }
+
+    /// Zero unless this report is a fill
+    #[inline(always)]
+    pub fn trade_id(&self) -> u64 {
+        le_u64(self.buf, MESSAGE_HEADER_LEN + 16)
+    }
+
+    /// Fill price on a fill, order price otherwise
+    /// Fixed point, scaled by 10^-4.
+    #[inline(always)]
+    pub fn price(&self) -> i64 {
+        le_i64(self.buf, MESSAGE_HEADER_LEN + 24)
+    }
+
+    /// This event's quantity: filled on a fill, ordered on an acknowledgement
+    #[inline(always)]
+    pub fn quantity(&self) -> u32 {
+        le_u32(self.buf, MESSAGE_HEADER_LEN + 32)
+    }
+
+    /// Still live on the book after this event
+    #[inline(always)]
+    pub fn leaves_quantity(&self) -> u32 {
+        le_u32(self.buf, MESSAGE_HEADER_LEN + 36)
+    }
+
+    #[inline(always)]
+    pub fn symbol_id(&self) -> u16 {
+        le_u16(self.buf, MESSAGE_HEADER_LEN + 40)
+    }
+
+    #[inline(always)]
+    pub fn side_raw(&self) -> u8 {
+        le_u8(self.buf, MESSAGE_HEADER_LEN + 42)
+    }
+
+    /// Validating accessor. Use `side_raw()` on the hot path.
+    #[inline]
+    pub fn side(&self) -> Result<Side, WireError> {
+        Side::from_u8(self.side_raw())
+    }
+
+    #[inline(always)]
+    pub fn exec_type_raw(&self) -> u8 {
+        le_u8(self.buf, MESSAGE_HEADER_LEN + 43)
+    }
+
+    /// Validating accessor. Use `exec_type_raw()` on the hot path.
+    #[inline]
+    pub fn exec_type(&self) -> Result<ExecType, WireError> {
+        ExecType::from_u8(self.exec_type_raw())
+    }
+
+    #[inline(always)]
+    pub fn reject_reason_raw(&self) -> u8 {
+        le_u8(self.buf, MESSAGE_HEADER_LEN + 44)
+    }
+
+    /// Validating accessor. Use `reject_reason_raw()` on the hot path.
+    #[inline]
+    pub fn reject_reason(&self) -> Result<RejectReason, WireError> {
+        RejectReason::from_u8(self.reject_reason_raw())
+    }
+
+    /// Total bytes, header included.
+    #[inline(always)]
+    pub fn total_len(&self) -> usize {
+        MESSAGE_HEADER_LEN + self.root_len
+    }
+}
+
+/// Encodes a `ExecReport` at `buf[0]`, header included.
+///
+/// Returns the bytes written. Reserved bytes are zeroed, which is what
+/// makes a re-encode byte-identical to the golden vector.
+#[inline]
+pub fn encode_exec_report(
+    buf: &mut [u8],
+    client_order_id: u64,
+    exchange_order_id: u64,
+    trade_id: u64,
+    price: i64,
+    quantity: u32,
+    leaves_quantity: u32,
+    symbol_id: u16,
+    side: Side,
+    exec_type: ExecType,
+    reject_reason: RejectReason,
+) -> Result<usize, WireError> {
+    const LEN: usize = MESSAGE_HEADER_LEN + 48;
+    if buf.len() < LEN {
+        return Err(WireError::ShortBuffer {
+            needed: LEN,
+            got: buf.len(),
+        });
+    }
+    buf[..LEN].fill(0);
+    write_message_header(buf, 48, template::EXEC_REPORT);
+    put_u64(buf, MESSAGE_HEADER_LEN, client_order_id);
+    put_u64(buf, MESSAGE_HEADER_LEN + 8, exchange_order_id);
+    put_u64(buf, MESSAGE_HEADER_LEN + 16, trade_id);
+    put_i64(buf, MESSAGE_HEADER_LEN + 24, price);
+    put_u32(buf, MESSAGE_HEADER_LEN + 32, quantity);
+    put_u32(buf, MESSAGE_HEADER_LEN + 36, leaves_quantity);
+    put_u16(buf, MESSAGE_HEADER_LEN + 40, symbol_id);
+    put_u8(buf, MESSAGE_HEADER_LEN + 42, side as u8);
+    put_u8(buf, MESSAGE_HEADER_LEN + 43, exec_type as u8);
+    put_u8(buf, MESSAGE_HEADER_LEN + 44, reject_reason as u8);
+    Ok(LEN)
+}
+
+// --- ReconcileRequest ----------------------------------------------
+
+/// After a restart: name every order you still hold for me
+///
+/// Borrows the datagram; decoding copies nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct ReconcileRequestDecoder<'a> {
+    buf: &'a [u8],
+    root_len: usize,
+}
+
+impl<'a> ReconcileRequestDecoder<'a> {
+    pub const TEMPLATE_ID: u16 = 11;
+    pub const BLOCK_LENGTH: u16 = 16;
+
+    /// Wraps a buffer whose first byte is the message header.
+    ///
+    /// The root block length comes from the wire, not from the constant,
+    /// so a newer publisher that appended fields is skipped correctly
+    /// rather than misparsed.
+    #[inline]
+    pub fn wrap(buf: &'a [u8]) -> Result<Self, WireError> {
+        let hdr = MessageHeaderDecoder::wrap(buf)?;
+        if hdr.template_id() != Self::TEMPLATE_ID {
+            return Err(WireError::TemplateMismatch {
+                expected: Self::TEMPLATE_ID,
+                got: hdr.template_id(),
+            });
+        }
+        let root_len = hdr.block_length() as usize;
+        if root_len < Self::BLOCK_LENGTH as usize {
+            return Err(WireError::BlockTooSmall {
+                message: "ReconcileRequest",
+                needed: Self::BLOCK_LENGTH,
+                got: hdr.block_length(),
+            });
+        }
+        let need = MESSAGE_HEADER_LEN + root_len;
+        if buf.len() < need {
+            return Err(WireError::ShortBuffer {
+                needed: need,
+                got: buf.len(),
+            });
+        }
+        let d = Self { buf, root_len };
+        Ok(d)
+    }
+
+    /// Echoed on the StatusComplete that ends the answer
+    #[inline(always)]
+    pub fn request_id(&self) -> u64 {
+        le_u64(self.buf, MESSAGE_HEADER_LEN)
+    }
+
+    /// Total bytes, header included.
+    #[inline(always)]
+    pub fn total_len(&self) -> usize {
+        MESSAGE_HEADER_LEN + self.root_len
+    }
+}
+
+/// Encodes a `ReconcileRequest` at `buf[0]`, header included.
+///
+/// Returns the bytes written. Reserved bytes are zeroed, which is what
+/// makes a re-encode byte-identical to the golden vector.
+#[inline]
+pub fn encode_reconcile_request(buf: &mut [u8], request_id: u64) -> Result<usize, WireError> {
+    const LEN: usize = MESSAGE_HEADER_LEN + 16;
+    if buf.len() < LEN {
+        return Err(WireError::ShortBuffer {
+            needed: LEN,
+            got: buf.len(),
+        });
+    }
+    buf[..LEN].fill(0);
+    write_message_header(buf, 16, template::RECONCILE_REQUEST);
+    put_u64(buf, MESSAGE_HEADER_LEN, request_id);
+    Ok(LEN)
+}
+
 /// One decoded message, still borrowing the datagram buffer.
+///
+/// Feed messages only. An order-path template id decodes as
+/// [`WireError::UnknownTemplate`], which is what keeps the two wires
+/// apart without anyone having to remember to check.
 #[derive(Debug, Clone, Copy)]
 pub enum Message<'a> {
     AddOrder(AddOrderDecoder<'a>),
@@ -1350,6 +1924,69 @@ pub fn decode_message(buf: &[u8]) -> Result<Message<'_>, WireError> {
         template::SNAPSHOT => Ok(Message::Snapshot(SnapshotDecoder::wrap(buf)?)),
         template::HEARTBEAT => Ok(Message::Heartbeat(HeartbeatDecoder::wrap(buf)?)),
         template::SEQUENCE_RESET => Ok(Message::SequenceReset(SequenceResetDecoder::wrap(buf)?)),
+        other => Err(WireError::UnknownTemplate(other)),
+    }
+}
+
+/// One decoded order-path message.
+///
+/// These never travel in a datagram. One lives in one shared-memory ring
+/// slot: `messageHeader` then the block, with no `packetHeader`, because
+/// the slot is already framed and its position already sequences it.
+/// See docs/ORDER-PATH.md.
+#[derive(Debug, Clone, Copy)]
+pub enum OrderPathMessage<'a> {
+    NewOrder(NewOrderDecoder<'a>),
+    CancelOrder(CancelOrderDecoder<'a>),
+    ExecReport(ExecReportDecoder<'a>),
+    ReconcileRequest(ReconcileRequestDecoder<'a>),
+}
+
+impl<'a> OrderPathMessage<'a> {
+    #[inline(always)]
+    pub fn total_len(&self) -> usize {
+        match self {
+            Self::NewOrder(d) => d.total_len(),
+            Self::CancelOrder(d) => d.total_len(),
+            Self::ExecReport(d) => d.total_len(),
+            Self::ReconcileRequest(d) => d.total_len(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn template_id(&self) -> u16 {
+        match self {
+            Self::NewOrder(_) => template::NEW_ORDER,
+            Self::CancelOrder(_) => template::CANCEL_ORDER,
+            Self::ExecReport(_) => template::EXEC_REPORT,
+            Self::ReconcileRequest(_) => template::RECONCILE_REQUEST,
+        }
+    }
+}
+
+/// Decodes one order-path message from the start of `buf`.
+///
+/// A feed template id is rejected here exactly as an order-path one is
+/// rejected by [`decode_message`]. Neither wire will decode the other's
+/// traffic by accident.
+#[inline]
+pub fn decode_order_path_message(buf: &[u8]) -> Result<OrderPathMessage<'_>, WireError> {
+    let hdr = MessageHeaderDecoder::wrap(buf)?;
+    if hdr.schema_id() != SCHEMA_ID {
+        return Err(WireError::SchemaMismatch {
+            expected: SCHEMA_ID,
+            got: hdr.schema_id(),
+        });
+    }
+    match hdr.template_id() {
+        template::NEW_ORDER => Ok(OrderPathMessage::NewOrder(NewOrderDecoder::wrap(buf)?)),
+        template::CANCEL_ORDER => Ok(OrderPathMessage::CancelOrder(CancelOrderDecoder::wrap(
+            buf,
+        )?)),
+        template::EXEC_REPORT => Ok(OrderPathMessage::ExecReport(ExecReportDecoder::wrap(buf)?)),
+        template::RECONCILE_REQUEST => Ok(OrderPathMessage::ReconcileRequest(
+            ReconcileRequestDecoder::wrap(buf)?,
+        )),
         other => Err(WireError::UnknownTemplate(other)),
     }
 }
