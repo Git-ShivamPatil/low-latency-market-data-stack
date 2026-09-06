@@ -444,6 +444,25 @@ def emit_rust(schema: Schema) -> str:
     o.append("/// Bytes of per-group framing.")
     o.append(f"pub const GROUP_SIZE_ENCODING_LEN: usize = {gse.length};")
     o.append("")
+    o.append("/// Byte offsets and lengths, for code that addresses a composite's bytes")
+    o.append("/// directly instead of through a decoder.")
+    o.append("///")
+    o.append("/// The ring header is the reason this exists. Its indices have to be loaded")
+    o.append("/// with acquire ordering and stored with release ordering, and an ordinary")
+    o.append("/// field accessor gives neither -- so each language writes its own atomic")
+    o.append("/// access over these offsets rather than getting a decoder it must not use.")
+    o.append("pub mod layout {")
+    for c in schema.composites.values():
+        o.append(f"    /// `{c.name}`{': ' + c.description if c.description else ''}")
+        o.append(f"    pub mod {snake(c.name)} {{")
+        o.append(f"        pub const LEN: usize = {c.length};")
+        for f in c.fields:
+            if f.is_reserved:
+                continue
+            o.append(f"        pub const {screaming(f.name)}: usize = {f.offset};")
+        o.append("    }")
+    o.append("}")
+    o.append("")
     o.append("/// `packetHeader.flags` bit 0: this datagram belongs to a snapshot cycle.")
     o.append("pub const PACKET_FLAG_SNAPSHOT: u8 = 0x01;")
     o.append("/// `Snapshot.flags` bit 0: the last fragment for this symbol in this cycle.")
@@ -1414,6 +1433,21 @@ def emit_cpp(schema: Schema) -> str:
         o.append("}")
         o.append("")
 
+    o.append("// Byte offsets and lengths, for code that addresses a composite's bytes")
+    o.append("// directly instead of through a decoder. See the Rust `layout` module for")
+    o.append("// why the ring header gets constants and no accessors.")
+    o.append("namespace layout {")
+    for c in schema.composites.values():
+        o.append(f"// {c.name}{': ' + c.description if c.description else ''}")
+        o.append(f"namespace {snake(c.name)} {{")
+        o.append(f"inline constexpr std::size_t kLen = {c.length};")
+        for f in c.fields:
+            if f.is_reserved:
+                continue
+            o.append(f"inline constexpr std::size_t k{pascal(f.name)} = {f.offset};")
+        o.append(f"}}  // namespace {snake(c.name)}")
+    o.append("}  // namespace layout")
+    o.append("")
     o.append("namespace tmpl {")
     for m in schema.messages:
         o.append(f"inline constexpr std::uint16_t k{m.name} = {m.id};")

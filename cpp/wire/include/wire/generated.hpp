@@ -125,6 +125,52 @@ enum class RejectReason : std::uint8_t {
     }
 }
 
+// Byte offsets and lengths, for code that addresses a composite's bytes
+// directly instead of through a decoder. See the Rust `layout` module for
+// why the ring header gets constants and no accessors.
+namespace layout {
+// packetHeader: Per-datagram framing
+namespace packet_header {
+inline constexpr std::size_t kLen = 24;
+inline constexpr std::size_t kSchemaId = 0;
+inline constexpr std::size_t kVersion = 2;
+inline constexpr std::size_t kMessageCount = 4;
+inline constexpr std::size_t kChannel = 6;
+inline constexpr std::size_t kFlags = 7;
+inline constexpr std::size_t kFirstSequence = 8;
+inline constexpr std::size_t kSendTimestampNs = 16;
+}  // namespace packet_header
+// messageHeader: Per-message framing
+namespace message_header {
+inline constexpr std::size_t kLen = 8;
+inline constexpr std::size_t kBlockLength = 0;
+inline constexpr std::size_t kTemplateId = 2;
+inline constexpr std::size_t kSchemaId = 4;
+inline constexpr std::size_t kVersion = 6;
+}  // namespace message_header
+// groupSizeEncoding: Repeating-group framing
+namespace group_size_encoding {
+inline constexpr std::size_t kLen = 4;
+inline constexpr std::size_t kBlockLength = 0;
+inline constexpr std::size_t kNumInGroup = 2;
+}  // namespace group_size_encoding
+// ringHeader: SPSC shared-memory ring header
+namespace ring_header {
+inline constexpr std::size_t kLen = 192;
+inline constexpr std::size_t kMagic = 0;
+inline constexpr std::size_t kVersion = 8;
+inline constexpr std::size_t kSlotSize = 12;
+inline constexpr std::size_t kCapacity = 16;
+inline constexpr std::size_t kWriteIndex = 64;
+inline constexpr std::size_t kReadIndex = 128;
+}  // namespace ring_header
+// ringSlot: Per-slot framing inside an SPSC ring
+namespace ring_slot {
+inline constexpr std::size_t kLen = 8;
+inline constexpr std::size_t kLength = 0;
+}  // namespace ring_slot
+}  // namespace layout
+
 namespace tmpl {
 inline constexpr std::uint16_t kAddOrder = 1;
 inline constexpr std::uint16_t kModifyOrder = 2;

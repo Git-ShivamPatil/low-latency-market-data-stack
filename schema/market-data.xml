@@ -60,6 +60,63 @@
       <field name="numInGroup"  type="uint16" offset="2" description="Number of entries"/>
     </composite>
 
+    <!--
+      Order path only. The header of an SPSC shared-memory ring.
+
+      Deliberately gets layout constants and no decoder. Reading writeIndex
+      through an ordinary accessor is exactly the race this design exists to
+      avoid: the index has to be loaded with acquire ordering and stored with
+      release ordering, and a plain field read gives neither. Each language
+      writes its own atomic access over these offsets. See docs/ORDER-PATH.md.
+
+      The three 64-byte regions are the whole point. The producer writes
+      writeIndex and the consumer writes readIndex; sharing a cache line
+      between them makes every write invalidate the other core's copy, which
+      leaves the queue correct and several times slower for no visible reason.
+    -->
+    <composite name="ringHeader" description="SPSC shared-memory ring header">
+      <!-- Region 1: written once at creation, read-only thereafter. -->
+      <field name="magic"     type="uint64" offset="0"  description="Identifies the file as a ring; a mismatch is a hard refusal, not a guess"/>
+      <field name="version"   type="uint32" offset="8"  description="Ring layout version, separate from the schema version"/>
+      <field name="slotSize"  type="uint32" offset="12" description="Bytes per slot, including the length prefix"/>
+      <field name="capacity"  type="uint32" offset="16" description="Slots; always a power of two so index-to-slot is a mask"/>
+      <field name="reserved"  type="uint32" offset="20"/>
+      <field name="reserved2" type="uint64" offset="24"/>
+      <field name="reserved3" type="uint64" offset="32"/>
+      <field name="reserved4" type="uint64" offset="40"/>
+      <field name="reserved5" type="uint64" offset="48"/>
+      <field name="reserved6" type="uint64" offset="56"/>
+      <!-- Region 2: the producer's, and nobody else's. -->
+      <field name="writeIndex" type="uint64" offset="64" description="Free-running count of slots published; never wrapped"/>
+      <field name="reserved7"  type="uint64" offset="72"/>
+      <field name="reserved8"  type="uint64" offset="80"/>
+      <field name="reserved9"  type="uint64" offset="88"/>
+      <field name="reserved10" type="uint64" offset="96"/>
+      <field name="reserved11" type="uint64" offset="104"/>
+      <field name="reserved12" type="uint64" offset="112"/>
+      <field name="reserved13" type="uint64" offset="120"/>
+      <!-- Region 3: the consumer's, and nobody else's. -->
+      <field name="readIndex"  type="uint64" offset="128" description="Free-running count of slots consumed; write minus read is the depth"/>
+      <field name="reserved14" type="uint64" offset="136"/>
+      <field name="reserved15" type="uint64" offset="144"/>
+      <field name="reserved16" type="uint64" offset="152"/>
+      <field name="reserved17" type="uint64" offset="160"/>
+      <field name="reserved18" type="uint64" offset="168"/>
+      <field name="reserved19" type="uint64" offset="176"/>
+      <field name="reserved20" type="uint64" offset="184"/>
+    </composite>
+
+    <!--
+      Order path only. The per-slot prefix. A slot holds this then the message,
+      padded out to slotSize. The length is what tells the consumer how many of
+      the slot's bytes are real, and it is written before the release store that
+      publishes the slot.
+    -->
+    <composite name="ringSlot" description="Per-slot framing inside an SPSC ring">
+      <field name="length"    type="uint32" offset="0" description="Bytes of message in this slot"/>
+      <field name="reserved"  type="uint32" offset="4"/>
+    </composite>
+
     <enum name="Side" encodingType="uint8">
       <validValue name="Bid">0</validValue>
       <validValue name="Ask">1</validValue>

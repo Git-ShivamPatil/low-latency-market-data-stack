@@ -1,0 +1,25 @@
+[package]
+name = "ring"
+description = "SPSC shared-memory ring shared with the C++ order path (milestone 8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The header offsets come from the schema, so the C++ side cannot drift from
+# this one without a regeneration diff failing in CI.
+wire = { path = "../wire" }
+# mmap, munmap, ftruncate. Nothing else; this crate is a page of libc calls and
+# two atomics.
+libc = "0.2"
+
+[dev-dependencies]
+# "The push path does not allocate" is a claim, and milestone 5 built the thing
+# that checks claims like that.
+alloc-guard = { path = "../alloc-guard" }

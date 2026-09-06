@@ -22,6 +22,56 @@ pub const MESSAGE_HEADER_LEN: usize = 8;
 /// Bytes of per-group framing.
 pub const GROUP_SIZE_ENCODING_LEN: usize = 4;
 
+/// Byte offsets and lengths, for code that addresses a composite's bytes
+/// directly instead of through a decoder.
+///
+/// The ring header is the reason this exists. Its indices have to be loaded
+/// with acquire ordering and stored with release ordering, and an ordinary
+/// field accessor gives neither -- so each language writes its own atomic
+/// access over these offsets rather than getting a decoder it must not use.
+pub mod layout {
+    /// `packetHeader`: Per-datagram framing
+    pub mod packet_header {
+        pub const LEN: usize = 24;
+        pub const SCHEMA_ID: usize = 0;
+        pub const VERSION: usize = 2;
+        pub const MESSAGE_COUNT: usize = 4;
+        pub const CHANNEL: usize = 6;
+        pub const FLAGS: usize = 7;
+        pub const FIRST_SEQUENCE: usize = 8;
+        pub const SEND_TIMESTAMP_NS: usize = 16;
+    }
+    /// `messageHeader`: Per-message framing
+    pub mod message_header {
+        pub const LEN: usize = 8;
+        pub const BLOCK_LENGTH: usize = 0;
+        pub const TEMPLATE_ID: usize = 2;
+        pub const SCHEMA_ID: usize = 4;
+        pub const VERSION: usize = 6;
+    }
+    /// `groupSizeEncoding`: Repeating-group framing
+    pub mod group_size_encoding {
+        pub const LEN: usize = 4;
+        pub const BLOCK_LENGTH: usize = 0;
+        pub const NUM_IN_GROUP: usize = 2;
+    }
+    /// `ringHeader`: SPSC shared-memory ring header
+    pub mod ring_header {
+        pub const LEN: usize = 192;
+        pub const MAGIC: usize = 0;
+        pub const VERSION: usize = 8;
+        pub const SLOT_SIZE: usize = 12;
+        pub const CAPACITY: usize = 16;
+        pub const WRITE_INDEX: usize = 64;
+        pub const READ_INDEX: usize = 128;
+    }
+    /// `ringSlot`: Per-slot framing inside an SPSC ring
+    pub mod ring_slot {
+        pub const LEN: usize = 8;
+        pub const LENGTH: usize = 0;
+    }
+}
+
 /// `packetHeader.flags` bit 0: this datagram belongs to a snapshot cycle.
 pub const PACKET_FLAG_SNAPSHOT: u8 = 0x01;
 /// `Snapshot.flags` bit 0: the last fragment for this symbol in this cycle.

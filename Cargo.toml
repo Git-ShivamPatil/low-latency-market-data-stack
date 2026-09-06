@@ -12,6 +12,7 @@ members = [
     "crates/matching-engine",
     "crates/feed-handler",
     "crates/replay-service",
+    "crates/ring",
     "bench",
 ]
 

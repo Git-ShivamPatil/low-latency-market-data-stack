@@ -149,7 +149,7 @@ jobs:
           retention-days: 7
 
   cross-language:
-    name: Both codecs agree, and a corrupt vector fails both
+    name: The two languages agree, byte for byte
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -163,3 +163,10 @@ jobs:
           cmake --build cpp/build
       - name: A one-byte edit must fail both suites
         run: make test-corruption
+
+      # The rings are generated from one schema, but generated is not the same
+      # as checked -- and a layout disagreement between the two ends does not
+      # fail loudly. An index read from the wrong offset is a plausible number,
+      # and a price read from the wrong offset is a plausible price.
+      - name: A Rust process and a C++ process on one shared-memory ring
+        run: scripts/ring-interop-test.sh
