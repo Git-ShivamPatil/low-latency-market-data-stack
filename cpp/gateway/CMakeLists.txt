@@ -4,10 +4,13 @@
 add_library(mdstack_fix STATIC
   src/message.cpp
   src/seqstore.cpp
+  src/orderstore.cpp
   src/session.cpp
   src/transport.cpp
 )
 target_include_directories(mdstack_fix PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# orderstore.hpp names Side, which is generated.
+target_link_libraries(mdstack_fix PUBLIC mdstack_wire)
 
 # The binary the kill-restart test SIGKILLs.
 add_executable(fix-gateway src/gateway_main.cpp)
@@ -20,6 +23,10 @@ add_test(NAME fix_message COMMAND fix_message_test)
 add_executable(fix_seqstore_test tests/seqstore_test.cpp)
 target_link_libraries(fix_seqstore_test PRIVATE mdstack_fix)
 add_test(NAME fix_seqstore COMMAND fix_seqstore_test)
+
+add_executable(fix_orderstore_test tests/orderstore_test.cpp)
+target_link_libraries(fix_orderstore_test PRIVATE mdstack_fix)
+add_test(NAME fix_orderstore COMMAND fix_orderstore_test)
 
 add_executable(fix_session_test tests/session_test.cpp)
 target_link_libraries(fix_session_test PRIVATE mdstack_fix)
