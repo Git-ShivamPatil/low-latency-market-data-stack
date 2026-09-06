@@ -4,6 +4,7 @@
 add_library(mdstack_fix STATIC
   src/message.cpp
   src/seqstore.cpp
+  src/session.cpp
 )
 target_include_directories(mdstack_fix PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -14,3 +15,7 @@ add_test(NAME fix_message COMMAND fix_message_test)
 add_executable(fix_seqstore_test tests/seqstore_test.cpp)
 target_link_libraries(fix_seqstore_test PRIVATE mdstack_fix)
 add_test(NAME fix_seqstore COMMAND fix_seqstore_test)
+
+add_executable(fix_session_test tests/session_test.cpp)
+target_link_libraries(fix_session_test PRIVATE mdstack_fix)
+add_test(NAME fix_session COMMAND fix_session_test)
