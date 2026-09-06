@@ -179,6 +179,44 @@ void reset_seq_num_flag_returns_both_directions_to_one() {
           "after a reset the next expected inbound is 2, the logon having been 1");
 }
 
+// This one exists because the in-process suite did not have it and QuickFIX
+// did. The case above is the counterparty asking for a reset. The case below is
+// *us* asking — and the counterparty confirming by echoing the flag back, which
+// is what the spec says it does and what every real engine actually does.
+//
+// The bug: `handle_logon` treated the echo as a fresh instruction and reset the
+// store a second time, throwing away the sequence number `connect` had just
+// spent on the Logon. Every subsequent message then went out one number too
+// low. Against a simulator that never echoed the flag this was invisible.
+// QuickFIX answered "MsgSeqNum too low, expecting 2 but received 1" and hung up.
+void a_reset_we_asked_for_is_not_applied_twice() {
+    Harness h("reset-echo");
+    h.session->send_application(fix::msg_type::NewOrderSingle, nullptr, h.sink, h.now);
+    h.captured.clear();
+
+    h.session->connect(h.sink, h.now, /*reset_sequences=*/true);
+    auto logon = h.captured.first_of(fix::msg_type::Logon);
+    check(logon && logon->find_int(fix::tag::MsgSeqNum) == 1,
+          "a reset logon goes out as sequence 1");
+    check(h.store.current().outbound == 2, "and the store has moved on to 2");
+
+    // The confirming logon. Same flag, coming back the other way.
+    h.inbound(fix::msg_type::Logon, 1, [](fix::Builder& b) {
+        b.add(fix::tag::EncryptMethod, std::int64_t{0});
+        b.add(fix::tag::HeartBtInt, std::int64_t{30});
+        b.add_bool(fix::tag::ResetSeqNumFlag, true);
+    });
+    check(h.session->state() == fix::SessionState::Active, "the confirmation activates the session");
+    check(h.store.current().outbound == 2,
+          "the confirmation does not reissue the number the logon already spent");
+
+    h.captured.clear();
+    h.session->send_application(fix::msg_type::NewOrderSingle, nullptr, h.sink, h.now);
+    auto order = h.captured.first_of(fix::msg_type::NewOrderSingle);
+    check(order && order->find_int(fix::tag::MsgSeqNum) == 2,
+          "so the first message after the reset is 2, not 1 again");
+}
+
 // --- liveness --------------------------------------------------------------
 
 void a_quiet_session_heartbeats() {
@@ -443,6 +481,7 @@ void sequence_numbers_are_persisted_before_the_bytes_leave() {
 int main() {
     logon_round_trip();
     reset_seq_num_flag_returns_both_directions_to_one();
+    a_reset_we_asked_for_is_not_applied_twice();
     a_quiet_session_heartbeats();
     a_silent_counterparty_is_prodded_then_dropped();
     a_test_request_is_answered_with_its_id();

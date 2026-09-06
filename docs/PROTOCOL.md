@@ -1,8 +1,9 @@
 # FIX 4.4 session layer — what is implemented, and what is not
 
-> **Status: milestone 7, in progress.** This document is written *before* the
+> **Status: milestone 7, complete.** This document was written *before* the
 > code, because its job is to fix the boundary rather than describe wherever the
-> code happens to stop.
+> code happens to stop. Everything in the "in scope" list below is implemented
+> and verified; nothing was moved into "out of scope" after the fact.
 
 ## Why this file exists
 
@@ -130,16 +131,57 @@ choosing one arbitrarily.
 simulator, "correct" would mean "consistent with my own reading of the spec" —
 which is exactly the failure mode this document opens with.
 
-1. **`fix-sim`** — a scripted counterparty in this repo. It can be told to send
-   an exact sequence of malformed, out-of-order and duplicate messages, which a
-   real implementation will not do on demand. This is how the awkward cases get
-   covered.
-2. **QuickFIX** — an independent implementation, used as an acceptor. The same
-   conformance suite runs against both. A behaviour that passes against `fix-sim`
-   and fails against QuickFIX is a bug in this gateway or a misreading of the
-   spec, and either way it is worth knowing.
+1. **A scripted counterparty** — `cpp/gateway/tests/session_test.cpp`, 51 checks
+   driving the session as a state machine rather than over a socket. It can be
+   told to send an exact sequence of malformed, out-of-order and duplicate
+   messages, which a real implementation will not do on demand. This is how the
+   awkward cases in the section above get covered.
+2. **QuickFIX** — an independent implementation, used as an acceptor by
+   `scripts/quickfix-interop-test.sh`. It shares no code with this gateway and
+   has no idea what this project thinks FIX 4.4 says.
 
-QuickFIX is a free, apt-installable C++ library. No paid dependency.
+QuickFIX is a free, apt-installable C++ library (`libquickfix-dev`, Ubuntu
+universe). No paid dependency.
+
+### What QuickFIX actually judges
+
+Three scenarios, against one persistent QuickFIX store:
+
+| | What has to happen |
+|---|---|
+| A clean session | Logon, five `NewOrderSingle`, heartbeats, logout. A malformed message, a missing required field, a wrong `BodyLength` or `CheckSum` gets a `Reject` and the test fails. |
+| A gap made on purpose | `fix-seqtool` moves this gateway's outbound five ahead. QuickFIX has to notice the hole, send a `ResendRequest`, and accept the `SequenceReset-GapFill` it gets back. |
+| `ResetSeqNumFlag=Y` | QuickFIX has to follow us back to 1 and keep the session up. |
+
+**One limitation, stated rather than implied.** Debian's `libquickfix-dev` is a
+`+dfsg` package with the FIX XML dictionaries stripped — FIX Protocol Ltd's spec
+files are not DFSG-free — so the acceptor runs `UseDataDictionary=N`. QuickFIX
+still does the whole session layer, which is what this document is about. It does
+**not** validate application message *content*, so nothing here proves a
+`NewOrderSingle` carries every field FIX 4.4 requires of one.
+
+### It found a bug the scripted counterparty could not
+
+The third scenario failed the first time it ran, and the failure was real.
+
+When this gateway sends `Logon` with `ResetSeqNumFlag=Y`, `connect` resets the
+store and spends sequence 1 on that logon. The counterparty then confirms by
+**echoing the flag back** on its own logon — which is what the spec says it does
+and what every real engine does. `handle_logon` read that echo as a fresh
+instruction and reset the store a second time, reissuing the number the logon had
+already spent. Every message after went out one too low:
+
+```
+→ 35=A 34=1 141=Y     our logon, reset requested
+← 35=A 34=1 141=Y     QuickFIX agrees and resets
+→ 35=D 34=1           our first order — sequence 1 again
+← 35=5 "MsgSeqNum too low, expecting 2 but received 1"
+```
+
+The scripted counterparty never echoed the flag, so it never saw this. That is
+the entire argument for testing against something you did not write, and it is
+why the fix ships with a regression case
+(`a_reset_we_asked_for_is_not_applied_twice`) rather than only a code change.
 
 ### The kill-restart test
 
@@ -154,6 +196,14 @@ shutdown, no destructors, no flush. On restart it must:
 
 A session layer that only works when it is shut down politely has not
 implemented the part that matters.
+
+**What that script does and does not reach.** It proves points 1 and 4 every
+run. Points 2 and 3 it reaches only when the two ends genuinely disagree, and
+over loopback with a per-message `fsync` they usually do not — so
+`resend requests sent 0` in its output is that run having had nothing to resend,
+not a failure. The resend path is proven deliberately instead: by the scripted
+counterparty, which can construct the disagreement, and by the QuickFIX interop
+test, which manufactures a real one with `fix-seqtool`.
 
 ---
 

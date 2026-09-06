@@ -213,6 +213,16 @@ class Session {
     bool test_request_outstanding_{false};
     std::uint64_t test_request_id_{};
 
+    /// Set when *we* sent `ResetSeqNumFlag=Y`, cleared once the counterparty's
+    /// Logon has been dealt with.
+    ///
+    /// The counterparty confirms a reset by echoing the flag back on its own
+    /// Logon. That echo is an acknowledgement, not a second instruction: acting
+    /// on it would clear a store we already cleared, and reissue the sequence
+    /// number our own Logon has just spent. QuickFIX catches this immediately —
+    /// "MsgSeqNum too low, expecting 2 but received 1" — and drops the session.
+    bool reset_requested_{false};
+
     /// Live traffic that arrived while a resend was outstanding. Applied in
     /// order once the gap closes; see `AwaitingResend`.
     std::vector<std::string> queued_;

@@ -99,8 +99,10 @@ jobs:
         compiler: [g++, clang++]
     steps:
       - uses: actions/checkout@v5
-      - name: Install ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install ninja and QuickFIX
+        # QuickFIX is the independent judge of the FIX session layer. It is in
+        # Ubuntu universe, so it costs nothing.
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libquickfix-dev
       - name: Configure
         run: cmake -S cpp -B cpp/build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DCMAKE_BUILD_TYPE=RelWithDebInfo
       - name: Build
@@ -115,6 +117,15 @@ jobs:
       - name: FIX gateway survives a hard kill
         if: matrix.compiler == 'g++'
         run: scripts/kill-restart-test.sh
+
+      # The cross-check that stops "correct" meaning "consistent with my own
+      # reading of the spec". QUICKFIX_REQUIRED turns a missing QuickFIX from a
+      # skip into a failure — a cross-check that quietly skips is not one.
+      - name: FIX gateway interoperates with QuickFIX
+        if: matrix.compiler == 'g++'
+        env:
+          QUICKFIX_REQUIRED: "1"
+        run: scripts/quickfix-interop-test.sh
 
   smoke:
     name: Engine and handler reconcile over real sockets

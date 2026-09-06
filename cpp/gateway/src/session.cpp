@@ -159,6 +159,7 @@ void Session::reset_for_new_connection() {
     last_sent_ = {};
     last_received_ = {};
     test_request_outstanding_ = false;
+    reset_requested_ = false;
     queued_.clear();
     for (auto& slot : ring_) {
         slot = Sent{};
@@ -175,6 +176,7 @@ void Session::connect(Sink& out, Clock::time_point now, bool reset_sequences) {
         state_ = SessionState::LoggedOut;
         return;
     }
+    reset_requested_ = reset_sequences;
     emit(msg_type::Logon,
          [this, reset_sequences](Builder& b) {
              b.add(tag::EncryptMethod, std::int64_t{0});
@@ -341,8 +343,15 @@ void Session::on_message(const Message& m, Sink& out, Clock::time_point now) {
 }
 
 void Session::handle_logon(const Message& m, Sink& out, Clock::time_point now) {
-    if (m.flag(tag::ResetSeqNumFlag)) {
+    const bool we_asked = reset_requested_;
+    reset_requested_ = false;
+    if (m.flag(tag::ResetSeqNumFlag) && !we_asked) {
         // Both directions to 1, durably, before anything else happens.
+        //
+        // Only when the counterparty is the one asking. If we sent
+        // `ResetSeqNumFlag=Y` ourselves, `connect` already reset the store and
+        // spent sequence 1 on the Logon; this flag coming back is the other end
+        // agreeing, and resetting again would reissue that number.
         if (store_.reset()) {
             fail(SessionError::StoreFailure, "could not persist a sequence reset", out, now);
             return;
