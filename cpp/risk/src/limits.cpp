@@ -1,6 +1,8 @@
 #include "risk/limits.hpp"
 
 #include <bit>
+#include <limits>
+#include <optional>
 #include <utility>
 
 namespace risk {
@@ -29,6 +31,38 @@ std::size_t mix(std::uint64_t id) noexcept {
         h *= 0x100000001b3ULL;
     }
     return static_cast<std::size_t>(h);
+}
+
+/// The largest distance from `ref` that a collar of `bps` basis points allows.
+///
+/// `nullopt` means that distance is larger than any 64-bit distance can be, so
+/// nothing is outside the collar and there is nothing to check.
+///
+/// The obvious test is `away * 10000 > ref * bps`, and both of those products
+/// overflow on values that arrive off a ring. This splits `ref * bps / 10000`
+/// into a quotient term and a remainder term so no intermediate can overflow,
+/// and it is *exactly* equivalent: `away > floor(x)` and `away > x` agree for
+/// every integer `away`.
+std::optional<std::uint64_t> collar_distance(std::uint64_t ref, std::uint64_t bps) noexcept {
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    constexpr std::uint64_t kScale = 10'000;
+    if (bps == 0) {
+        return 0;
+    }
+    const std::uint64_t whole = ref / kScale;
+    const std::uint64_t rem = ref % kScale;
+    if (whole > kMax / bps) {
+        return std::nullopt;
+    }
+    const std::uint64_t a = whole * bps;
+    if (rem != 0 && bps > kMax / rem) {
+        return std::nullopt;
+    }
+    const std::uint64_t b = (rem * bps) / kScale;
+    if (a > kMax - b) {
+        return std::nullopt;
+    }
+    return a + b;
 }
 
 }  // namespace
@@ -120,24 +154,48 @@ Decision RiskEngine::on_new_order(std::uint64_t client_order_id, std::uint16_t s
         return reject(RejectReason::kMaxOrderQuantity);
     }
 
-    // 3. Max notional. In 64-bit integers throughout; a price of 10^12 times a
-    //    quantity of 10^6 is 10^18, still inside the range, and the quantity is
-    //    already bounded by the check above.
-    const std::int64_t notional = price * static_cast<std::int64_t>(quantity);
-    const std::int64_t magnitude = notional < 0 ? -notional : notional;
-    if (magnitude > lim.max_notional) {
+    // 3. Max notional.
+    //
+    //    `price` arrives off a ring with no bound on it at all -- the quantity
+    //    was bounded by the check above, the price was not -- so the obvious
+    //    `price * quantity` is signed overflow on a value somebody else chose,
+    //    which is undefined behaviour rather than a wrong answer. It is done by
+    //    division instead: `px * qty > max` exactly when `px > max / qty`, and
+    //    the division cannot overflow.
+    if (price == std::numeric_limits<std::int64_t>::min()) {
+        // The one value with no positive counterpart. Negating it is undefined,
+        // and no real price is within fifteen orders of magnitude of it.
+        return reject(RejectReason::kMaxNotional);
+    }
+    const std::int64_t px = price < 0 ? -price : price;
+    const auto qty64 = static_cast<std::int64_t>(quantity);
+    if (lim.max_notional < 0 || px > lim.max_notional / qty64) {
         return reject(RejectReason::kMaxNotional);
     }
 
-    // 4. Price collar. Basis points against the reference, in integers: the
-    //    comparison is `|price - ref| * 10000 > ref * bps`, which needs no
-    //    division and therefore no rounding decision.
+    // 4. Price collar. Basis points against the reference: reject when
+    //    `|price - ref| * 10000 > |ref| * bps`.
+    //
+    //    Both sides are computed in unsigned arithmetic, and each multiplication
+    //    is guarded by the division that would overflow it. Unsigned because the
+    //    difference of two signed values can be larger than either -- the
+    //    subtraction below is the standard two's-complement idiom for a
+    //    magnitude, and it is exact for every pair of inputs.
     if (lim.collar_bps > 0 && lim.reference_price != 0) {
-        const std::int64_t ref = lim.reference_price < 0 ? -lim.reference_price
-                                                         : lim.reference_price;
-        const std::int64_t away = price > lim.reference_price ? price - lim.reference_price
-                                                              : lim.reference_price - price;
-        if (away * 10'000 > ref * lim.collar_bps) {
+        const auto ref_signed = lim.reference_price;
+        const std::uint64_t ref =
+            ref_signed < 0 ? static_cast<std::uint64_t>(-(ref_signed + 1)) + 1
+                           : static_cast<std::uint64_t>(ref_signed);
+        // Unsigned, because the difference of two signed values can be larger
+        // than either. This is the two's-complement idiom for a magnitude and
+        // it is exact for every pair of inputs, including the ones that would
+        // overflow a signed subtraction.
+        const std::uint64_t away =
+            price > ref_signed
+                ? static_cast<std::uint64_t>(price) - static_cast<std::uint64_t>(ref_signed)
+                : static_cast<std::uint64_t>(ref_signed) - static_cast<std::uint64_t>(price);
+        const auto allowed = collar_distance(ref, static_cast<std::uint64_t>(lim.collar_bps));
+        if (allowed && away > *allowed) {
             return reject(RejectReason::kPriceCollar);
         }
     }

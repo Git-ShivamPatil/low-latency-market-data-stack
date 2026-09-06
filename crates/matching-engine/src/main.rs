@@ -11,6 +11,7 @@
 mod engine;
 mod feed;
 mod generator;
+mod orderpath;
 mod rng;
 mod uplink;
 
@@ -27,6 +28,7 @@ use transport::{Publisher, TransportMode};
 use crate::engine::Engine;
 use crate::feed::{DropMode, FeedPublisher};
 use crate::generator::{Generator, Intent, Shape};
+use crate::orderpath::OrderPath;
 use book::DigestLog;
 
 #[derive(Parser, Debug)]
@@ -136,6 +138,18 @@ struct Args {
     #[arg(long, value_name = "ADDR")]
     replay_uplink: Option<String>,
 
+    /// Ring the risk service writes accepted orders into.
+    ///
+    /// Both order-path rings are created by the risk service, which is the only
+    /// process that touches all four. The engine opens them; a second creator
+    /// would reset the indices under whoever was already attached.
+    #[arg(long, value_name = "PATH", requires = "exec_ring")]
+    order_ring: Option<String>,
+
+    /// Ring the engine writes execution reports into.
+    #[arg(long, value_name = "PATH", requires = "order_ring")]
+    exec_ring: Option<String>,
+
     /// Print the resolved configuration and exit without sending anything.
     #[arg(long)]
     dry_run: bool,
@@ -197,6 +211,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut digest_log = DigestLog::open(cfg.engine.digest_path.as_deref())?;
     let digest_interval = cfg.engine.digest_interval;
+
+    // The order path is optional. Without it the engine is exactly what
+    // milestones 2 through 6 built: a generator, a book and a feed. With it, an
+    // order can also arrive from a client.
+    let mut order_path = match (&args.order_ring, &args.exec_ring) {
+        (Some(o), Some(e)) => {
+            let p = OrderPath::open(o, e).map_err(|err| {
+                format!("order path: {err}
+  the risk service creates both rings; start it first")
+            })?;
+            eprintln!("  order path attached: orders from {o}, reports to {e}");
+            Some(p)
+        }
+        _ => None,
+    };
 
     let self_check = args.self_check || cfg.engine.self_check;
     if self_check {
@@ -287,6 +316,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // state no consumer could reconcile.
         if message_limit > 0 && feed.stats().messages >= message_limit {
             break;
+        }
+
+        // Client orders first. They are somebody waiting on an answer; the
+        // generator's flow is synthetic and can wait a microsecond longer.
+        if let Some(op) = order_path.as_mut() {
+            op.pump(&mut engine, &mut feed)?;
         }
 
         let idx = generator.pick_symbol(engine.symbols.len());
@@ -444,6 +479,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     eprintln!("  final book {}", engine.digest());
+    if let Some(op) = order_path.as_ref() {
+        let s = op.stats();
+        eprintln!(
+            "  order path: {} orders and {} cancels in; {} fills, {} acks, {} cancels and              {} rejects out; {} reconciliations naming {} orders",
+            s.orders_received,
+            s.cancels_received,
+            s.fills_reported,
+            s.acks_reported,
+            s.cancels_reported,
+            s.rejects_reported,
+            s.reconciles_answered,
+            s.orders_named_in_reconciliation
+        );
+        if s.reports_dropped > 0 {
+            // Loud, and not a warning that scrolls past. A dropped report means
+            // the gateway believes an order is in a state it is not, and the
+            // only thing that resolves that is a reconciliation.
+            eprintln!(
+                "  order path: {} EXECUTION REPORTS WERE DROPPED -- the reports ring was full                  or a message would not encode. The gateway's view of those orders is stale                  until it reconciles.",
+                s.reports_dropped
+            );
+        }
+    }
     engine
         .books()
         .check_invariants()

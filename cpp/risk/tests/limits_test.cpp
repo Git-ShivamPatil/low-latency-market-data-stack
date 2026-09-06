@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,52 @@ void a_negative_price_counts_its_magnitude_against_the_notional() {
     check(rejected_with(e.on_new_order(1, kSymbol, Side::kBid, -kRef, 6),
                         RejectReason::kMaxNotional),
           "a negative price counts its magnitude against the notional limit");
+}
+
+void an_absurd_price_is_refused_rather_than_overflowing() {
+    // `price` arrives off a ring with no bound on it. The obvious
+    // `price * quantity` is signed overflow on a value somebody else chose,
+    // which is undefined behaviour rather than a wrong answer -- and the wrong
+    // answer it usually produces is a *small* notional, so the order is
+    // accepted. Found by review, not by a failing test, which is why these
+    // exist now.
+    RiskEngine e(config());
+    const std::int64_t huge = std::numeric_limits<std::int64_t>::max() / 2;
+    check(rejected_with(e.on_new_order(1, kSymbol, Side::kBid, huge, 1'000),
+                        RejectReason::kMaxNotional),
+          "a price near the top of the range is refused, not multiplied");
+    check(rejected_with(e.on_new_order(2, kSymbol, Side::kBid, -huge, 1'000),
+                        RejectReason::kMaxNotional),
+          "and the same on the negative side");
+    // The one value with no positive counterpart; negating it is undefined.
+    check(rejected_with(e.on_new_order(3, kSymbol, Side::kBid,
+                                       std::numeric_limits<std::int64_t>::min(), 1),
+                        RejectReason::kMaxNotional),
+          "and INT64_MIN, which cannot even be negated");
+    check(e.open_orders() == 0, "none of them became a live order");
+}
+
+void the_collar_arithmetic_does_not_overflow_either() {
+    RiskConfig cfg = config();
+    // A reference price and a collar wide enough that `ref * bps` would not fit
+    // in 64 bits. The comparison has to reach an answer rather than wrap.
+    cfg.symbols[kSymbol].reference_price = std::numeric_limits<std::int64_t>::max() / 4;
+    cfg.symbols[kSymbol].collar_bps = 1'000'000;
+    cfg.symbols[kSymbol].max_notional = std::numeric_limits<std::int64_t>::max();
+    RiskEngine e(std::move(cfg));
+    // The collar is wider than any price can be, so nothing is outside it.
+    check(e.on_new_order(1, kSymbol, Side::kBid, 1'000, 1).accepted,
+          "a collar too wide to overflow into a rejection rejects nothing");
+
+    RiskConfig tight = config();
+    tight.symbols[kSymbol].reference_price = 1'000;
+    tight.symbols[kSymbol].collar_bps = 1;
+    tight.symbols[kSymbol].max_notional = std::numeric_limits<std::int64_t>::max();
+    RiskEngine t(std::move(tight));
+    check(rejected_with(t.on_new_order(1, kSymbol, Side::kBid,
+                                       std::numeric_limits<std::int64_t>::max() / 4, 1),
+                        RejectReason::kPriceCollar),
+          "and a price too far away to scale is refused rather than wrapping into range");
 }
 
 void an_order_outside_the_collar_is_refused() {
@@ -347,6 +394,8 @@ int main() {
     a_zero_quantity_order_is_refused_as_invalid_not_as_oversized();
     an_order_over_the_quantity_limit_is_refused();
     an_order_over_the_notional_limit_is_refused();
+    an_absurd_price_is_refused_rather_than_overflowing();
+    the_collar_arithmetic_does_not_overflow_either();
     a_negative_price_counts_its_magnitude_against_the_notional();
     an_order_outside_the_collar_is_refused();
     the_collar_follows_the_market();

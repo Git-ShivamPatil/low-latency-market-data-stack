@@ -26,6 +26,29 @@ use wire::{ModifyReason, Side};
 
 use crate::feed::FeedPublisher;
 
+/// One fill against an order that was just submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fill {
+    pub trade_id: u64,
+    /// The resting order's price. The passive side set the terms.
+    pub price: i64,
+    pub quantity: u32,
+    /// Still unfilled after this fill. Reported rather than derived, because a
+    /// running total kept at the far end is a second source of truth.
+    pub leaves: u32,
+}
+
+/// What became of a submitted order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitOutcome {
+    /// The engine's id for the order. This is what a FIX `OrderID` is.
+    pub order_id: u64,
+    pub filled: u32,
+    /// What is resting on the book. Zero when the order filled completely, in
+    /// which case no `AddOrder` was published for it either.
+    pub resting: u32,
+}
+
 /// A book change and the message that announces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -230,6 +253,12 @@ impl Engine {
     ///
     /// `on_sequence` is called after every published message with the sequence
     /// it received, which is where the caller takes digest checkpoints.
+    /// One fill against a submitted order, in the order it happened.
+    ///
+    /// `leaves` is what is still unfilled *after* this fill, which is what a FIX
+    /// `ExecutionReport` carries and what the risk service needs to take the
+    /// right amount out of its pending exposure. Deriving it at the far end from
+    /// a running total is how the two sides end up disagreeing.
     pub fn submit(
         &mut self,
         feed: &mut FeedPublisher,
@@ -237,8 +266,28 @@ impl Engine {
         side: Side,
         price: i64,
         quantity: u32,
-        mut on_sequence: impl FnMut(&Self, u64) -> io::Result<()>,
+        on_sequence: impl FnMut(&Self, u64) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.submit_reported(feed, symbol_id, side, price, quantity, on_sequence, |_| {})
+            .map(|_| ())
+    }
+
+    /// `submit`, plus a running account of what happened to the order.
+    ///
+    /// The order flow generator does not care and calls `submit`. The order path
+    /// does: a gateway has to turn each fill into an `ExecutionReport`, and it
+    /// cannot reconstruct them from the feed, because the feed says a trade
+    /// happened without saying whose order it was.
+    pub fn submit_reported(
+        &mut self,
+        feed: &mut FeedPublisher,
+        symbol_id: u16,
+        side: Side,
+        price: i64,
+        quantity: u32,
+        mut on_sequence: impl FnMut(&Self, u64) -> io::Result<()>,
+        mut on_fill: impl FnMut(Fill),
+    ) -> io::Result<SubmitOutcome> {
         let order_id = self.next_order_id;
         self.next_order_id += 1;
         self.stats.orders_submitted += 1;
@@ -312,6 +361,12 @@ impl Engine {
             matched_any = true;
             self.stats.trades += 1;
             self.stats.shares_traded += u64::from(fill);
+            on_fill(Fill {
+                trade_id,
+                price: best_price,
+                quantity: fill,
+                leaves: remaining,
+            });
         }
 
         if matched_any {
@@ -334,7 +389,11 @@ impl Engine {
                 self.symbols[idx].live.push(order_id);
             }
         }
-        Ok(())
+        Ok(SubmitOutcome {
+            order_id,
+            filled: quantity - remaining,
+            resting: remaining,
+        })
     }
 
     pub fn cancel(
@@ -342,10 +401,26 @@ impl Engine {
         feed: &mut FeedPublisher,
         symbol_id: u16,
         order_id: u64,
-        mut on_sequence: impl FnMut(&Self, u64) -> io::Result<()>,
+        on_sequence: impl FnMut(&Self, u64) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.cancel_reported(feed, symbol_id, order_id, on_sequence)
+            .map(|_| ())
+    }
+
+    /// `cancel`, and says whether there was anything to cancel.
+    ///
+    /// `Ok(None)` means the book does not hold that order. That is a reject at
+    /// the far end rather than a silent success: a client that asked to cancel
+    /// something and was told nothing would go on believing it is still live.
+    pub fn cancel_reported(
+        &mut self,
+        feed: &mut FeedPublisher,
+        symbol_id: u16,
+        order_id: u64,
+        mut on_sequence: impl FnMut(&Self, u64) -> io::Result<()>,
+    ) -> io::Result<Option<u32>> {
         let Some(resting) = self.books.get_or_create(symbol_id).get(order_id).copied() else {
-            return Ok(());
+            return Ok(None);
         };
         let seq = self.publish(
             feed,
@@ -360,7 +435,7 @@ impl Engine {
             self.symbols[idx].remove_live(order_id);
         }
         self.stats.cancels += 1;
-        Ok(())
+        Ok(Some(resting.quantity))
     }
 
     pub fn amend(

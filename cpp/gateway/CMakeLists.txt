@@ -5,12 +5,14 @@ add_library(mdstack_fix STATIC
   src/message.cpp
   src/seqstore.cpp
   src/orderstore.cpp
+  src/orderpath.cpp
   src/session.cpp
   src/transport.cpp
 )
 target_include_directories(mdstack_fix PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # orderstore.hpp names Side, which is generated.
-target_link_libraries(mdstack_fix PUBLIC mdstack_wire)
+# orderpath.hpp names the ring as well as the generated codec.
+target_link_libraries(mdstack_fix PUBLIC mdstack_wire mdstack_ring)
 
 # The binary the kill-restart test SIGKILLs.
 add_executable(fix-gateway src/gateway_main.cpp)

@@ -100,11 +100,15 @@ void Ring::close() noexcept {
         mapped_ = 0;
         capacity_ = 0;
         slot_size_ = 0;
+        cached_read_ = 0;
+        cached_write_ = 0;
     }
 }
 
 Ring::Ring(Ring&& other) noexcept
-    : base_(std::exchange(other.base_, nullptr)),
+    : cached_read_(std::exchange(other.cached_read_, 0)),
+      cached_write_(std::exchange(other.cached_write_, 0)),
+      base_(std::exchange(other.base_, nullptr)),
       mapped_(std::exchange(other.mapped_, 0)),
       capacity_(std::exchange(other.capacity_, 0)),
       slot_size_(std::exchange(other.slot_size_, 0)) {}
@@ -112,6 +116,8 @@ Ring::Ring(Ring&& other) noexcept
 Ring& Ring::operator=(Ring&& other) noexcept {
     if (this != &other) {
         close();
+        cached_read_ = std::exchange(other.cached_read_, 0);
+        cached_write_ = std::exchange(other.cached_write_, 0);
         base_ = std::exchange(other.base_, nullptr);
         mapped_ = std::exchange(other.mapped_, 0);
         capacity_ = std::exchange(other.capacity_, 0);
@@ -148,6 +154,7 @@ std::optional<RingError> Ring::create(const std::string& path, std::uint32_t cap
     // here is not a no-op, it is the publication.
     write_index().store(0, std::memory_order_release);
     read_index().store(0, std::memory_order_release);
+    refresh_cached_indices();
     return std::nullopt;
 }
 
@@ -161,6 +168,12 @@ std::optional<RingError> Ring::open(const std::string& path) {
     }
     base_ = probe;
     mapped_ = hdr::kLen;
+
+    // Pairs with the release store the creator finished with. Without it the
+    // header fields below are read with no happens-before against the writes
+    // that produced them, and the comment in `create` claiming a publication
+    // would be describing something that is not there.
+    (void)write_index().load(std::memory_order_acquire);
 
     const std::uint64_t magic = load_u64(hdr::kMagic);
     if (magic != kRingMagic) {
@@ -188,6 +201,7 @@ std::optional<RingError> Ring::open(const std::string& path) {
     mapped_ = len;
     capacity_ = capacity;
     slot_size_ = slot_size;
+    refresh_cached_indices();
     return std::nullopt;
 }
 

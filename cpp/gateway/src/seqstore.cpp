@@ -61,9 +61,36 @@ SeqStore::~SeqStore() {
 }
 
 std::optional<StoreError> SeqStore::open(const std::string& path) {
-    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+    // Created explicitly rather than with a bare O_CREAT, because a file that
+    // did not exist a moment ago needs its **directory entry** made durable as
+    // well as its contents.
+    //
+    // Without that, every record can be fsync'd and the file can still vanish on
+    // a power cut, because the entry naming it was never written -- which would
+    // take this whole design down with it: a session that comes back with no
+    // sequence file at all restarts at 1, and the counterparty reads that as a
+    // reversal. It is the least intuitive line in the durability story and the
+    // one most often left out. It was left out here too, until a review of the
+    // milestone-8 code found the same omission in its sibling.
+    fd_ = ::open(path.c_str(), O_RDWR);
     if (fd_ < 0) {
-        return StoreError::CannotOpen;
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+        if (fd_ < 0) {
+            // Somebody else created it in between. Not an error.
+            fd_ = ::open(path.c_str(), O_RDWR);
+            if (fd_ < 0) {
+                return StoreError::CannotOpen;
+            }
+        } else {
+            const std::size_t slash = path.find_last_of('/');
+            const std::string dir =
+                (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+            const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd >= 0) {
+                ::fsync(dfd);
+                ::close(dfd);
+            }
+        }
     }
 
     // Read both slots and take the valid one with the higher generation.

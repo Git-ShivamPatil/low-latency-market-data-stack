@@ -336,6 +336,11 @@ impl Ring {
             capacity: 0,
             slot_size: 0,
         };
+        // Pairs with the release store the creator finished with. Without it the
+        // header fields below are read with no happens-before against the writes
+        // that produced them, and `create`'s comment claiming a publication
+        // would be describing something that is not there.
+        let _ = head.write_index().load(Ordering::Acquire);
         let magic = head.load_u64(hdr::MAGIC);
         if magic != RING_MAGIC {
             return Err(RingError::BadMagic(magic));

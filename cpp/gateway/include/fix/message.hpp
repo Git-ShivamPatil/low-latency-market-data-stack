@@ -71,6 +71,27 @@ inline constexpr int EndSeqNo = 16;
 inline constexpr int NewSeqNo = 36;
 inline constexpr int GapFillFlag = 123;
 
+// Application layer, milestone 8. Only the tags the order path actually uses;
+// an unused constant is a claim that something handles it.
+inline constexpr int ClOrdID = 11;
+inline constexpr int OrigClOrdID = 41;
+inline constexpr int OrderID = 37;
+inline constexpr int ExecID = 17;
+inline constexpr int ExecType = 150;
+inline constexpr int OrdStatus = 39;
+inline constexpr int OrdRejReason = 103;
+inline constexpr int Symbol = 55;
+inline constexpr int Side = 54;
+inline constexpr int OrderQty = 38;
+inline constexpr int OrdType = 40;
+inline constexpr int Price = 44;
+inline constexpr int LeavesQty = 151;
+inline constexpr int CumQty = 14;
+inline constexpr int AvgPx = 6;
+inline constexpr int LastPx = 31;
+inline constexpr int LastQty = 32;
+inline constexpr int TransactTime = 60;
+
 inline constexpr int Text = 58;
 inline constexpr int RefSeqNum = 45;
 inline constexpr int RefTagID = 371;
@@ -87,6 +108,8 @@ inline constexpr std::string_view SequenceReset = "4";
 inline constexpr std::string_view Logout = "5";
 inline constexpr std::string_view Logon = "A";
 inline constexpr std::string_view NewOrderSingle = "D";
+inline constexpr std::string_view OrderCancelRequest = "F";
+inline constexpr std::string_view OrderCancelReject = "9";
 inline constexpr std::string_view ExecutionReport = "8";
 }  // namespace msg_type
 

@@ -344,6 +344,39 @@ void a_consumer_joining_a_ring_in_progress_does_not_read_ahead() {
     check(got.has_value() && *got == "next", "and then sees the next real message");
 }
 
+void an_endpoint_reattached_to_a_second_ring_does_not_carry_the_first_ones_indices() {
+    // Found by review. A Producer or Consumer caches the other side's index as
+    // a hint, and a hint is only safe while it is stale *low*. Reusing one
+    // object across two rings carries the first ring's indices into the second,
+    // where they are stale *high* -- and a stale-high consumer sails past its
+    // empty check and reads a slot nobody has written.
+    TempRing a("reattach-a");
+    TempRing b("reattach-b");
+    Ring seed_a;
+    Ring seed_b;
+    seed_a.create(a.path, 8, 128);
+    seed_b.create(b.path, 8, 128);
+
+    Producer p;
+    Consumer c;
+    p.open(a.path);
+    c.open(a.path);
+    for (int i = 0; i < 5; ++i) {
+        push_str(p, "first ring");
+        pop_str(c);
+    }
+    check(c.read_index_relaxed() == 5, "the first ring advanced both indices");
+
+    // The second ring is empty and its indices are zero.
+    p.open(b.path);
+    c.open(b.path);
+    check(!pop_str(c).has_value(),
+          "a consumer reattached to an empty ring reads nothing, not slot zero");
+    check(push_str(p, "second ring"), "and the producer can still push");
+    auto got = pop_str(c);
+    check(got.has_value() && *got == "second ring", "which the consumer then sees");
+}
+
 }  // namespace
 
 int main() {
@@ -364,6 +397,7 @@ int main() {
     an_empty_message_round_trips();
     drain_stops_at_its_limit();
     a_consumer_joining_a_ring_in_progress_does_not_read_ahead();
+    an_endpoint_reattached_to_a_second_ring_does_not_carry_the_first_ones_indices();
 
     if (failures != 0) {
         std::cerr << failures << " check(s) failed\n";

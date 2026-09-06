@@ -293,6 +293,11 @@ void Session::fail(SessionError e, std::string_view text, Sink& out, Clock::time
 // --- inbound ---------------------------------------------------------------
 
 void Session::on_message(const Message& m, Sink& out, Clock::time_point now) {
+    on_message(m, out, now, nullptr);
+}
+
+void Session::on_message(const Message& m, Sink& out, Clock::time_point now,
+                         const std::function<void(const Message&)>& on_app) {
     ++stats_.received;
     last_received_ = now;
 
@@ -339,7 +344,11 @@ void Session::on_message(const Message& m, Sink& out, Clock::time_point now) {
         return;
     }
     // Application messages: the session layer's job is done once the sequence
-    // checks out. Delivery to the application is the caller's business.
+    // checks out. What the message *means* is the caller's business, and it
+    // only ever sees one that passed every check above.
+    if (on_app) {
+        on_app(m);
+    }
 }
 
 void Session::handle_logon(const Message& m, Sink& out, Clock::time_point now) {

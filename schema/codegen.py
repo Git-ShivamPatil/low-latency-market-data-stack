@@ -255,6 +255,22 @@ def validate(schema: Schema) -> None:
                 f"{what}: fields extend to {extent} bytes but blockLength says {declared}. "
                 f"Every byte of a block must be named, padding included."
             )
+        # And no holes. For a message the check above already catches a gap,
+        # because `blockLength` comes from the XML and a gap makes the extent
+        # disagree with it. For a *composite* it does not: the length is derived
+        # from these same fields, so extent == declared is tautological there and
+        # an unnamed run of bytes in the middle would sail through. The ring
+        # header is a composite with nineteen padding fields, and a missing one
+        # is exactly the mistake that produces two implementations reading a
+        # different offset for the same field.
+        missing = [b for b in range(extent) if b not in seen]
+        if missing:
+            first = missing[0]
+            raise SchemaError(
+                f"{what}: byte {first} is not named by any field "
+                f"({len(missing)} unnamed byte(s) in total). Every byte of a block "
+                f"must be named, padding included."
+            )
 
     for c in schema.composites.values():
         check_block(f"composite {c.name}", c.fields, c.length)

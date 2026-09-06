@@ -20,3 +20,9 @@ add_test(NAME risk_limits COMMAND risk_limits_test)
 add_executable(risk_allocation_test tests/allocation_test.cpp)
 target_link_libraries(risk_allocation_test PRIVATE mdstack_risk)
 add_test(NAME risk_allocation COMMAND risk_allocation_test)
+
+# The service itself. It reports its own steady-state allocation count at exit,
+# which is both the claim made visible outside a test and what pulls
+# counting_alloc.cpp into the link.
+add_executable(risk-service src/service_main.cpp)
+target_link_libraries(risk-service PRIVATE mdstack_risk mdstack_ring)

@@ -56,6 +56,22 @@ T get(const unsigned char* p, std::size_t off) {
     return v;
 }
 
+/// Makes a newly created file's *directory entry* durable.
+///
+/// Without this, every record can be `fsync`'d and the file itself can still
+/// vanish on a power cut, because the directory entry naming it was never
+/// written. It is the least intuitive line in the whole durability story and
+/// the one most often left out.
+void sync_parent_dir(const std::string& path) {
+    const std::size_t slash = path.find_last_of('/');
+    const std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+    }
+}
+
 bool write_all(int fd, const unsigned char* buf, std::size_t n) {
     std::size_t done = 0;
     while (done < n) {
@@ -90,9 +106,22 @@ OrderStore::~OrderStore() {
 std::optional<StoreError> OrderStore::open(
     const std::string& path, const std::function<void(const OrderRecord&)>& on_live) {
     path_ = path;
-    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0600);
+    // Created explicitly rather than with a bare O_CREAT, so that the one case
+    // needing a directory fsync -- the file did not exist a moment ago -- is
+    // distinguishable from the one that does not.
+    fd_ = ::open(path.c_str(), O_RDWR);
     if (fd_ < 0) {
-        return StoreError::CannotOpen;
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd_ < 0) {
+            // Somebody else created it between the two calls. Not an error:
+            // open it the ordinary way.
+            fd_ = ::open(path.c_str(), O_RDWR);
+            if (fd_ < 0) {
+                return StoreError::CannotOpen;
+            }
+        } else {
+            sync_parent_dir(path_);
+        }
     }
     if (auto e = replay()) {
         return e;
@@ -262,14 +291,7 @@ std::optional<StoreError> OrderStore::compact() {
         ::unlink(tmp.c_str());
         return StoreError::CannotWrite;
     }
-    const std::size_t slash = path_.find_last_of('/');
-    const std::string dir = (slash == std::string::npos) ? std::string(".")
-                                                         : path_.substr(0, slash);
-    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-    if (dfd >= 0) {
-        ::fsync(dfd);
-        ::close(dfd);
-    }
+    sync_parent_dir(path_);
 
     ::close(fd_);
     fd_ = ::open(path_.c_str(), O_RDWR, 0600);
@@ -305,12 +327,33 @@ std::optional<StoreError> OrderStore::record(const OrderRecord& r) {
     put<std::uint64_t>(rec, kOffSequence, replayed_ + written_ + 1);
     put<std::uint32_t>(rec, kOffChecksum, checksum(rec));
 
+    // Where the file ends now, so a failed write can be undone.
+    //
+    // Without this, a partial write or a failed fsync leaves bytes in the file
+    // that no counter knows about: the next record reuses the same sequence
+    // number, replay finds either a broken record with good ones after it or a
+    // duplicate number, and the log is refused **permanently**. A durability
+    // mechanism that turns one bad write into a store nobody can ever open
+    // again is worse than not having one.
+    const off_t before = ::lseek(fd_, 0, SEEK_CUR);
+    if (before < 0) {
+        return StoreError::CannotWrite;
+    }
+    auto rollback = [&]() {
+        if (::ftruncate(fd_, before) == 0) {
+            ::fsync(fd_);
+        }
+        ::lseek(fd_, before, SEEK_SET);
+    };
+
     if (!write_all(fd_, rec, sizeof rec)) {
+        rollback();
         return StoreError::CannotWrite;
     }
     // Before the caller sends anything. This is the expensive line and it is
     // the one the design is about.
     if (::fsync(fd_) != 0) {
+        rollback();
         return StoreError::CannotSync;
     }
     ++written_;

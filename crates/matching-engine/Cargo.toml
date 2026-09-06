@@ -23,6 +23,8 @@ book = { path = "../book" }
 transport = { path = "../transport" }
 mdconfig = { path = "../mdconfig" }
 replay-service = { path = "../replay-service" }
+# The order path: accepted orders in, execution reports out.
+ring = { path = "../ring" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"

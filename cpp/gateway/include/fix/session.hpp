@@ -134,6 +134,16 @@ class Session {
     /// Feeds one decoded inbound message.
     void on_message(const Message& m, Sink& out, Clock::time_point now);
 
+    /// `on_message`, plus delivery of application messages.
+    ///
+    /// The session layer's job ends once the sequence checks out; what an
+    /// application message *means* is the caller's business. `on_app` is called
+    /// only for messages that passed every session check, so the caller never
+    /// sees one out of sequence, one from a session that is not up, or a
+    /// duplicate the resend machinery already dealt with.
+    void on_message(const Message& m, Sink& out, Clock::time_point now,
+                    const std::function<void(const Message&)>& on_app);
+
     /// Drives heartbeats, test requests and the unresponsive-counterparty
     /// timeout. Call it regularly; it does nothing when nothing is due.
     void on_timer(Sink& out, Clock::time_point now);

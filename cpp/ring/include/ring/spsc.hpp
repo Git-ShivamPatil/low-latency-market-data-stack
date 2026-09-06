@@ -157,6 +157,26 @@ class Ring {
 
     void close() noexcept;
 
+    /// Re-reads both indices from the ring just attached.
+    ///
+    /// The caches are hints, and a hint is only safe while it is stale *low*.
+    /// A `Producer` or `Consumer` reused across two rings would otherwise carry
+    /// the first ring's indices into the second, where they are stale *high* --
+    /// and a stale-high consumer reads a slot nobody has written. Refreshing
+    /// here means no caller has to remember.
+    void refresh_cached_indices() noexcept {
+        cached_read_ = read_index().load(std::memory_order_acquire);
+        cached_write_ = write_index().load(std::memory_order_acquire);
+    }
+
+    /// The last readIndex the producer saw; re-read only when it says the ring
+    /// is full, so the common case never touches the consumer's cache line.
+    std::uint64_t cached_read_{0};
+    /// The last writeIndex the consumer saw; re-read only when it says the ring
+    /// is empty, so a burst is drained without re-reading the producer's line
+    /// per message.
+    std::uint64_t cached_write_{0};
+
   private:
     [[nodiscard]] std::atomic_ref<std::uint64_t> index_at(std::size_t offset) const noexcept {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
@@ -243,11 +263,6 @@ class Producer : public Ring {
             return len;
         });
     }
-
-  private:
-    /// The last readIndex we saw. Re-read only when this says the ring is full,
-    /// so the common case never touches the consumer's cache line.
-    std::uint64_t cached_read_{0};
 };
 
 /// The reading end. Owns `readIndex` and reads `writeIndex`.
@@ -309,12 +324,6 @@ class Consumer : public Ring {
         }
         return n;
     }
-
-  private:
-    /// The last writeIndex we saw. Re-read only when this says the ring is
-    /// empty, so a burst is drained without re-reading the producer's line per
-    /// message.
-    std::uint64_t cached_write_{0};
 };
 
 }  // namespace mdstack::ring
