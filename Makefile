@@ -53,7 +53,7 @@ $(CPP_BUILD)/CMakeCache.txt:
 # --- test ------------------------------------------------------------------
 
 .PHONY: test
-test: test-rust test-cpp test-corruption smoke ## Run every correctness suite
+test: test-rust test-cpp test-corruption test-killrestart smoke ## Run every correctness suite
 
 .PHONY: test-rust
 test-rust: ## cargo test the workspace
@@ -62,6 +62,10 @@ test-rust: ## cargo test the workspace
 .PHONY: test-cpp
 test-cpp: build-cpp ## ctest the C++ tree
 	ctest --test-dir $(CPP_BUILD) --output-on-failure
+
+.PHONY: test-killrestart
+test-killrestart: build-cpp ## SIGKILL the FIX gateway mid-session and require it to resume
+	scripts/kill-restart-test.sh
 
 .PHONY: test-corruption
 test-corruption: ## Prove a one-byte edit to a golden vector fails both suites

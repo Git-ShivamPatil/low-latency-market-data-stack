@@ -5,8 +5,13 @@ add_library(mdstack_fix STATIC
   src/message.cpp
   src/seqstore.cpp
   src/session.cpp
+  src/transport.cpp
 )
 target_include_directories(mdstack_fix PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# The binary the kill-restart test SIGKILLs.
+add_executable(fix-gateway src/gateway_main.cpp)
+target_link_libraries(fix-gateway PRIVATE mdstack_fix)
 
 add_executable(fix_message_test tests/message_test.cpp)
 target_link_libraries(fix_message_test PRIVATE mdstack_fix)

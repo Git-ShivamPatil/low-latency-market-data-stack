@@ -7,17 +7,12 @@
 namespace fix {
 namespace {
 
-/// FIX `SendingTime`: UTC, `YYYYMMDD-HH:MM:SS.sss`.
-///
-/// Wall clock, not the steady clock the session uses for timers. The two are
-/// different things and conflating them is how a session ends up with
-/// timestamps that go backwards over an NTP step.
-/// Written digit by digit rather than with `snprintf`.
+/// Fixed-width digits, written by hand rather than with `snprintf`.
 ///
 /// Not micro-optimisation: `snprintf` with `%04d` cannot be proved by the
 /// compiler to fit a fixed buffer, so `-Wformat-truncation` rejects it, and the
-/// alternatives are to size the buffer for an eleven-digit year or to disable
-/// the warning. Writing the digits is shorter than either excuse.
+/// alternatives are sizing for an eleven-digit year or switching the warning
+/// off. Writing the digits is shorter than either excuse.
 void put_digits(char*& p, int value, int width) {
     for (int i = width - 1; i >= 0; --i) {
         p[i] = static_cast<char>('0' + value % 10);
@@ -26,6 +21,11 @@ void put_digits(char*& p, int value, int width) {
     p += width;
 }
 
+/// FIX `SendingTime`: UTC, `YYYYMMDD-HH:MM:SS.sss`.
+///
+/// Wall clock, not the steady clock the session uses for timers. The two are
+/// different things, and conflating them is how a session ends up with
+/// timestamps that go backwards over an NTP step.
 std::string utc_timestamp() {
     using namespace std::chrono;
     auto now = system_clock::now();
@@ -153,14 +153,35 @@ const Session::Sent* Session::recall(std::uint64_t seq) const {
     return nullptr;
 }
 
-void Session::connect(Sink& out, Clock::time_point now) {
+void Session::reset_for_new_connection() {
+    state_ = SessionState::Disconnected;
+    error_ = SessionError::None;
+    last_sent_ = {};
+    last_received_ = {};
+    test_request_outstanding_ = false;
+    queued_.clear();
+    for (auto& slot : ring_) {
+        slot = Sent{};
+    }
+    ring_next_ = 0;
+}
+
+void Session::connect(Sink& out, Clock::time_point now, bool reset_sequences) {
     if (!cfg_.initiator) {
         return;
     }
+    if (reset_sequences && store_.reset()) {
+        error_ = SessionError::StoreFailure;
+        state_ = SessionState::LoggedOut;
+        return;
+    }
     emit(msg_type::Logon,
-         [this](Builder& b) {
+         [this, reset_sequences](Builder& b) {
              b.add(tag::EncryptMethod, std::int64_t{0});
              b.add(tag::HeartBtInt, static_cast<std::int64_t>(cfg_.heartbeat_interval_seconds));
+             if (reset_sequences) {
+                 b.add_bool(tag::ResetSeqNumFlag, true);
+             }
          },
          out, now, true);
     state_ = SessionState::AwaitingLogon;

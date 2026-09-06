@@ -108,6 +108,14 @@ jobs:
       - name: Test
         run: ctest --test-dir cpp/build --output-on-failure
 
+      # Kills the gateway with SIGKILL mid-session and requires it to resume
+      # from the sequence numbers that were durable. Runs on one compiler only:
+      # it is a behaviour test over a socket, not a codegen test, so running it
+      # twice would prove the same thing twice.
+      - name: FIX gateway survives a hard kill
+        if: matrix.compiler == 'g++'
+        run: scripts/kill-restart-test.sh
+
   smoke:
     name: Engine and handler reconcile over real sockets
     runs-on: ubuntu-24.04

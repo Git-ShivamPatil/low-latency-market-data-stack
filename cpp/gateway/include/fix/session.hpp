@@ -114,7 +114,22 @@ class Session {
     Session(SessionConfig cfg, SeqStore& store);
 
     /// Sends the logon. Initiator only.
-    void connect(Sink& out, Clock::time_point now);
+    ///
+    /// `reset_sequences` sets `ResetSeqNumFlag=Y`, which asks the counterparty
+    /// to return both directions to 1 as well. Resetting the local store
+    /// *without* it is not a reset at all — the other end keeps its numbers, and
+    /// the next message it receives reads as a sequence reversal.
+    void connect(Sink& out, Clock::time_point now, bool reset_sequences = false);
+
+    /// Clears the per-connection state so the same session object can serve a
+    /// reconnect.
+    ///
+    /// The durable store is deliberately untouched: sequence numbers survive a
+    /// dropped connection, which is the entire point of persisting them. What
+    /// does not survive is the in-memory resend ring, and that is legal --
+    /// anything no longer held is gap-filled rather than dropped. Counters stay
+    /// cumulative so a run's summary covers the whole run.
+    void reset_for_new_connection();
 
     /// Feeds one decoded inbound message.
     void on_message(const Message& m, Sink& out, Clock::time_point now);
