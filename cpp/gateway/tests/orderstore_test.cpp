@@ -218,10 +218,14 @@ void the_log_is_compacted_at_startup() {
     {
         OrderStore s;
         s.open(t.path, nullptr);
-        // A thousand orders opened and closed, and two left working. An
-        // append-only log that never compacts is a disk-space bug with a delay
-        // fuse.
-        for (std::uint64_t i = 1; i <= 1'000; ++i) {
+        // Orders opened and closed, and two left working. An append-only log
+        // that never compacts is a disk-space bug with a delay fuse.
+        //
+        // Two hundred rather than a thousand: every record is fsync'd, so this
+        // loop is 402 trips to the disk and the count buys no confidence the
+        // ratio does not. At a thousand it was the slowest test in the repo by
+        // a factor of five.
+        for (std::uint64_t i = 1; i <= 200; ++i) {
             s.record(pending(i));
             OrderRecord done = pending(i);
             done.state = OrderState::Canceled;
@@ -232,15 +236,15 @@ void the_log_is_compacted_at_startup() {
         s.record(pending(10'002));
     }
     const std::size_t before = file_size(t.path);
-    check(before == 2002 * fix::kOrderRecordSize, "the log holds every transition before restart");
+    check(before == 402 * fix::kOrderRecordSize, "the log holds every transition before restart");
 
     OrderStore s;
     std::vector<OrderRecord> seen;
     s.open(t.path, [&seen](const OrderRecord& r) { seen.push_back(r); });
     check(seen.size() == 2, "restart rebuilds exactly the two live orders");
-    check(s.compacted_away() == 2000, "and says how many records it removed");
+    check(s.compacted_away() == 400, "and says how many records it removed");
     check(file_size(t.path) == 2 * fix::kOrderRecordSize,
-          "the file is now two records, not two thousand");
+          "the file is now two records, not four hundred and two");
 
     // And the compacted file is itself replayable, which is the part a
     // rewrite-in-place gets wrong.

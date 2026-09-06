@@ -54,17 +54,37 @@ RiskConfig config() {
     return cfg;
 }
 
+/// Deliberately hard to optimise away.
+///
+/// C++14 permits an implementation to *elide* a call to a replaceable global
+/// allocation function whose result is unobserved, and clang does. So the first
+/// version of this control -- allocate a vector, read its size, free it --
+/// quietly stopped controlling anything under one of the two compilers this
+/// project builds with, and every zero below it was vacuous there. It was g++
+/// and clang++ disagreeing that surfaced it.
+///
+/// The size comes from a volatile, the pointer escapes through a volatile, and
+/// bytes are written and read back through it. There is nothing left for the
+/// optimiser to prove unobserved.
+volatile std::size_t g_alloc_size = 4096;
+void* volatile g_escaped = nullptr;
+
 /// Runs first, and everything after it depends on it.
 void the_counter_notices_when_something_does_allocate() {
     const AllocGuard guard;
-    // `volatile` so the compiler cannot decide the vector is unobserved and
-    // delete the allocation this test exists to observe.
-    auto* v = new std::vector<std::uint8_t>(4096);
-    volatile std::size_t seen = v->size();
-    delete v;
+    const std::size_t n = g_alloc_size;
+    auto* raw = new unsigned char[n];
+    g_escaped = raw;
+    raw[0] = 0x5A;
+    raw[n - 1] = 0xA5;
+    const unsigned char first = raw[0];
+    const unsigned char last = raw[n - 1];
+    delete[] static_cast<unsigned char*>(g_escaped);
+    g_escaped = nullptr;
     const auto d = guard.sample();
-    check(seen == 4096 && d.allocations >= 1 && d.deallocations >= 1,
-          "the replaced operator new is linked in, so the zeros below mean something");
+    check(first == 0x5A && last == 0xA5 && d.allocations >= 1 && d.deallocations >= 1,
+          "the replaced operator new is linked in and reached, so the zeros below "
+          "mean something");
 }
 
 void a_million_decisions_allocate_nothing() {

@@ -1,9 +1,14 @@
 # The order path — gateway to risk to engine, and back
 
-> **Status: milestone 8, in progress.** Written *before* the code, for the same
+> **Status: milestone 8, complete.** Written *before* the code, for the same
 > reason [docs/PROTOCOL.md](PROTOCOL.md) was: the decisions below are the
 > milestone. Discovering them while implementing produces a system whose shape
 > is an accident of the order things got written in.
+>
+> Two things this document did not anticipate are recorded at the bottom, under
+> [What building it changed](#what-building-it-changed). They are there rather
+> than edited into the text above, because a design document that quietly
+> rewrites itself to match the code stops being a check on it.
 
 ## What has to be true at the end
 
@@ -138,9 +143,14 @@ Five limits, in this order, cheapest first:
 | Open order count | the client already has `max_open_orders` live |
 | Position limit | the fill, if it fully filled, would take the position outside `±max_position` |
 
-**Worst case, not likely case, for the position limit.** Checking against the
-position that *would* result if the order filled completely is the only check
-that cannot be walked through by an order that fills in pieces.
+**Worst case, not likely case, for the position limit.** The check is against
+the position that would result if this order **and every other live order on the
+same side** filled completely. Checking only this order lets a caller walk past
+the limit with ten small orders, none of them individually over it; checking only
+the current position lets them walk past it with one order that has not filled
+yet. The two sides are counted separately rather than netted, because netting
+lets a caller sit at the limit on both sides and end up over it when one side
+fills and the other does not.
 
 ### The zero-allocation claim, in C++ this time
 
@@ -230,6 +240,46 @@ One order, all the way through, asserted at every place it should appear:
 The point of asserting on step 5 is that it is the only step that proves the two
 halves of this system are the same system. Everything before it could be
 satisfied by an order path that talks to a matching engine nobody is watching.
+
+---
+
+## What building it changed
+
+Two things the design above did not anticipate. They are recorded here rather
+than edited into the text, because a design document that quietly rewrites itself
+to match the code stops being a check on it.
+
+### Fills against a *resting* order had no path back
+
+The design says an `ExecReport` covers "acknowledgement, partial fill, fill,
+cancel, reject" and stops there, as though every fill belongs to the order that
+caused it. It does not. The aggressor learns about its fills from the call it
+made; the passive side made its call minutes earlier and is not in that stack
+frame at all. So a client whose order rested and was then hit heard **nothing**,
+and would have discovered it from a reconciliation days later.
+
+The engine now takes registrations for orders somebody wants to be told about.
+The list is sorted, so it is a binary search per fill and costs nothing at all
+when no order path is attached — which is the ordinary case for this engine.
+
+Found by the reconciliation scenario, which asked the engine for an order it had
+already filled and got an honest "I am not holding that" back. The report was
+working; what it was reporting was a real hole.
+
+### The flow generator was cancelling client orders
+
+A resting client order joined `symbols[].live`, which is the pool the generator
+draws its cancels and amends from. The generator stands in for other market
+participants, and other participants do not get to cancel your order. From the
+outside it looked exactly like the exchange losing an order.
+
+### And one thing the design got right but described badly
+
+Reconciliation answers with the orders that arrived over the order path, each
+carrying the client's own id back — not with the whole book. Answering with the
+whole book is what the first version did, and it was correct and useless: three
+hundred lines about orders the gateway never placed would bury the one that
+diverged. A report nobody can read is not a report.
 
 ---
 
