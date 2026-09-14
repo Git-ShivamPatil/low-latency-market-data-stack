@@ -100,8 +100,42 @@ duration_seconds = 0
 
 # 0 runs flat out. Throttling exists so a demo does not saturate a laptop; any
 # real throughput number comes from an unthrottled run measured receiver-side on
-# a quiet host, which is milestone 6 and not this machine.
-rate_per_second = 0
+# a quiet host, which is scripts/bench.sh behind the host gate and never this.
+#
+# This file is the one the case study tells a visitor to run, so it is throttled,
+# and the number is arithmetic rather than taste.
+#
+# The published steps start the engine (step 2) before the handler (step 3), so
+# the handler always joins mid-stream. It cannot trust a book it did not build
+# from the start, so it holds the live traffic arriving behind it and waits for
+# the next snapshot cycle. That hold is bounded by
+# handler.recovery_buffer_datagrams, and the wait is bounded by
+# feed.snapshot_interval_millis. The buffer has to outlast the wait:
+#
+#   datagrams/sec  = rate_per_second / messages-per-datagram   (~21.5 observed
+#                                                               at batch_size 32,
+#                                                               since a partial
+#                                                               batch goes out on
+#                                                               the linger timer)
+#   worst-case wait = snapshot_interval_millis = 2.0 s
+#   need            = datagrams/sec x 2.0  <  recovery_buffer_datagrams = 4096
+#   so rate_per_second < 4096 / 2.0 x 21.5 = ~44,000
+#
+# At 200,000 this was 6,250 datagrams/sec: the buffer filled in 0.66s and could
+# never reach a cycle two seconds away. It appeared to work, because a failed
+# join re-arms and a later attempt can happen to start just before a snapshot --
+# so step 3 passed on the third retry and step 4, which also drops 2% of its own
+# input, ended GAPPED holding an empty book.
+#
+# 20,000 gives ~930 datagrams/sec, so a full 2-second wait costs ~1,860 of the
+# 4,096 slots. Better than a 2x margin, and the retry is a backstop rather than
+# the mechanism.
+#
+# Raise it or set it to 0 to see the engine's real rate; the handler keeps up
+# either way as long as it was started first, because then it never has to bridge
+# anything. The measured throughput figures come from scripts/bench.sh behind the
+# host gate, never from this file.
+rate_per_second = 20000
 
 # Book checkpoints. Both ends must use the same interval or their checkpoints
 # will not line up.

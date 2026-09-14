@@ -62,7 +62,18 @@ symbols = [
 seed = 6811297534891234561
 messages = 0
 duration_seconds = 0
-rate_per_second = 50000
+# Throttled for the same reason, and by the same arithmetic, as the rate in
+# configs/local.toml -- which carries the working. The compose handler starts
+# after the engine and so always joins mid-stream, and its hold has to outlast
+# the wait for the next snapshot cycle:
+#
+#   4096 buffered datagrams / 2.0 s cycle x ~21.5 msg per datagram = ~44,000 msg/s
+#
+# 50,000 was over that line. It recovered anyway, because the wait for a cycle
+# averages half its interval rather than all of it -- so it worked most of the
+# time and leaned on the retry the rest, which is the wrong way round. 20,000
+# leaves better than a 2x margin and keeps the retry as a backstop.
+rate_per_second = 20000
 digest_interval = 1000
 self_check = false
 target_depth = 40

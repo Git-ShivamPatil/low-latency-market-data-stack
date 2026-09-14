@@ -49,6 +49,17 @@ echo
 
 # --------------------------------------------------------------------------
 echo "1. $STEP1"
+if [[ $WITH_DOCKER -eq 1 ]] && ! command -v docker >/dev/null 2>&1; then
+    # Said plainly rather than left to fail as "docker compose up failed". On the
+    # machine this is developed on, Docker Desktop runs Windows-side with WSL
+    # integration off, so `docker` exists in PowerShell and not in the distro the
+    # rest of this script runs in. That is a property of the host, not a defect,
+    # and the `case-study` CI job runs this mode on a runner where it works.
+    fail "--with-docker was requested but there is no docker on PATH"
+    echo "     Docker Desktop with WSL integration off puts it Windows-side only;" >&2
+    echo "     run this from PowerShell or Git Bash, or let the CI job do it." >&2
+    WITH_DOCKER=0
+fi
 if [[ $WITH_DOCKER -eq 1 ]]; then
     if $STEP1 >"$OUT/step1.log" 2>&1; then
         ok "the stack came up"
@@ -97,6 +108,22 @@ ENGINE_SECONDS=8
 HANDLER_MESSAGES=20000
 HANDLER_IDLE=5
 
+# Step 4 needs a longer run than steps 2 and 3, and the reason is specific.
+#
+# `--verify-allocations` does not start counting until the handler has applied
+# 50,000 messages, so that the count cannot include anything allocated while the
+# process was warming up. A run that ends before then reports "allocations: not
+# measured", which is honest and useless -- and the page says this command proves
+# the handler does not allocate.
+#
+# The budget has to be counted in messages that reach the BOOKS, not sequences
+# consumed. Step 4 joins mid-stream, so it spends its first seconds holding
+# traffic while it waits for a snapshot, and none of that is applied until the
+# recovery lands. At configs/local.toml's 20,000 msg/s that is a couple of
+# seconds of runway before the counter even arms.
+STEP4_ENGINE_SECONDS=16
+STEP4_MESSAGES=150000
+
 # `cargo run` may still compile, and on a Windows-mounted filesystem that is not
 # quick. Two of them racing for the build lock is what this waits out: step 3
 # does not start until step 2 has stopped building and started running.
@@ -140,13 +167,24 @@ fi
 
 # The handler has to have actually received the feed. One that starts, receives
 # nothing and exits cleanly would pass every check above.
-if grep -qE "sequence|messages" "$OUT/step3.log"; then
-    ok "and it reported on the feed it received"
+#
+# Measured on the sequence range rather than by grepping for a number. The
+# obvious greps are both wrong: "sequence|messages" matches the banner the
+# handler prints before it has received anything, and "0 messages" matches
+# "0 messages that did not apply" -- which is the run reporting that nothing
+# went wrong. Both were here, and the second failed a passing run.
+seq_range=$(grep -oE "seq [0-9]+\.\.[0-9]+" "$OUT/step3.log" | tail -1)
+if [[ -n "$seq_range" ]]; then
+    seq_from=${seq_range#seq }
+    seq_from=${seq_from%%..*}
+    seq_to=${seq_range##*..}
+    if [[ "$seq_to" -gt "$seq_from" ]]; then
+        ok "and it consumed $((seq_to - seq_from + 1)) sequences of the feed"
+    else
+        fail "the handler reported an empty sequence range ($seq_range)"
+    fi
 else
-    fail "the handler reported nothing, so steps 2 and 3 did not talk to each other"
-fi
-if grep -qE "0 messages|received 0" "$OUT/step3.log"; then
-    fail "the handler received zero messages"
+    fail "the handler never reported a sequence range, so steps 2 and 3 did not talk"
 fi
 
 # --------------------------------------------------------------------------
@@ -156,12 +194,12 @@ echo "4. $STEP4"
 # what makes the command short enough to publish. If that default ever stops
 # matching step 3's addresses, this is where it shows up.
 # shellcheck disable=SC2086
-$STEP2 --duration "$ENGINE_SECONDS" >"$OUT/step4-engine.log" 2>&1 &
+$STEP2 --duration "$STEP4_ENGINE_SECONDS" >"$OUT/step4-engine.log" 2>&1 &
 ENGINE_PID=$!
 wait_for_engine "$OUT/step4-engine.log" ||
     fail "the engine never started for step 4"
 # shellcheck disable=SC2086
-$STEP4 --messages "$HANDLER_MESSAGES" --idle-timeout "$HANDLER_IDLE"     >"$OUT/step4.log" 2>&1
+$STEP4 --messages "$STEP4_MESSAGES" --idle-timeout "$HANDLER_IDLE"     >"$OUT/step4.log" 2>&1
 STEP4_STATUS=$?
 wait "$ENGINE_PID" 2>/dev/null
 
@@ -174,24 +212,51 @@ fi
 # `--verify-allocations` is half the point of step 4. The page says this command
 # proves the handler does not allocate; if it prints no allocation report, the
 # page is describing something that did not happen.
-if grep -qE "allocation" "$OUT/step4.log"; then
-    if grep -qE "^ *0 allocations|allocations 0|allocations=0" "$OUT/step4.log" ||
-       grep -qE "0 allocations, 0 deallocations" "$OUT/step4.log"; then
-        ok "--verify-allocations reported zero"
-    else
-        echo "  note: $(grep -m1 -E 'allocation' "$OUT/step4.log")"
-        fail "--verify-allocations did not report zero allocations"
-    fi
+# Anchored on the report line the handler prints, not on the word "allocation"
+# anywhere in the file -- `cargo run` echoes the whole command line, flag
+# included, so the loose match found "--verify-allocations" and concluded a
+# report existed when none did.
+alloc_line=$(grep -E "^ *allocations[:( ]|^ *allocations over " "$OUT/step4.log" | tail -1)
+if [[ -z "$alloc_line" ]]; then
+    fail "--verify-allocations printed no allocation report at all"
+elif [[ "$alloc_line" == *"not measured"* ]]; then
+    # Distinct from a non-zero count, and fixed differently: the run was too
+    # short to clear the counter's warm-up, so raise STEP4_MESSAGES.
+    echo "  note: $alloc_line" >&2
+    fail "--verify-allocations never armed; the run ended inside the warm-up"
+elif [[ "$alloc_line" == *"0 allocations, 0 deallocations"* ]]; then
+    ok "--verify-allocations reported zero over $(echo "$alloc_line" |
+        grep -oE "[0-9]+ steady-state passes" || echo "the measured window")"
 else
-    fail "--verify-allocations printed no allocation report"
+    echo "  note: $alloc_line" >&2
+    fail "--verify-allocations did not report zero allocations"
 fi
 
 # And `--drop-rate 0.02` has to have actually dropped something, or the command
 # demonstrates recovery from a loss that never happened.
-if grep -qiE "drop|gap|recover" "$OUT/step4.log"; then
-    ok "and the injected loss is reported"
+#
+# Counted, not grepped. Matching the words "drop", "gap" or "recover" anywhere in
+# the log passes on a banner, a flag echo or the phrase "0 gaps" -- a check that
+# cannot fail is not evidence, which is rule 9 in this project's own list.
+discarded=$(grep -oE "discarded [0-9]+ datagrams on A and [0-9]+ on B" "$OUT/step4.log" | tail -1)
+if [[ -n "$discarded" ]]; then
+    d_a=$(echo "$discarded" | grep -oE "discarded [0-9]+" | grep -oE "[0-9]+")
+    d_b=$(echo "$discarded" | grep -oE "and [0-9]+ on B" | grep -oE "[0-9]+")
+    if [[ $((d_a + d_b)) -gt 0 ]]; then
+        ok "and the injected loss is real: $d_a datagrams on A, $d_b on B"
+    else
+        fail "--drop-rate 0.02 discarded nothing, so step 4 proves nothing"
+    fi
 else
-    fail "--drop-rate 0.02 produced no visible loss, so step 4 proves nothing"
+    fail "--drop-rate 0.02 reported no discard count, so step 4 proves nothing"
+fi
+# Declaring gaps is the point of the command: loss that nothing noticed is worse
+# than no loss at all.
+gaps=$(grep -cE "^  gap: sequence" "$OUT/step4.log")
+if [[ "$gaps" -gt 0 ]]; then
+    ok "and the handler declared $gaps gap(s) covering it"
+else
+    fail "loss was injected but no gap was declared"
 fi
 
 

@@ -317,6 +317,10 @@ fn run_with<B: BookSet>(
     // several datagrams and replaces every book, so joining it partway is not
     // allowed — see `handle_snapshot`.
     let mut in_snapshot_cycle = false;
+    // How many times the *initial* join has re-armed recovery after filling the
+    // buffer, and the point at which it stops trying. See the re-arm below.
+    let mut initial_join_retries = 0u32;
+    const MAX_INITIAL_JOIN_RETRIES: u32 = 8;
     let mut recovery = RecoveryBuffer::new(
         cfg.handler.recovery_buffer_datagrams,
         cfg.feed.max_datagram_bytes.max(65_536),
@@ -460,6 +464,49 @@ fn run_with<B: BookSet>(
                                 eprintln!("  recovery failed: {e}");
                                 recovery.fail();
                                 stats.recovery_failures += 1;
+                                // A failed *initial* join is not the end of it.
+                                // Going LIVE here means going LIVE with an empty
+                                // book and no gap to declare -- the handler would
+                                // sit there reporting a healthy stream and a book
+                                // it never built, which is the quietest kind of
+                                // wrong. Re-arm and wait for the next snapshot.
+                                //
+                                // Bounded, and the bound matters. Each `begin`
+                                // resets the recovery deadline, so the deadline
+                                // path that normally ends a failed recovery can
+                                // never fire if the buffer keeps filling first --
+                                // which is exactly what happens when the live
+                                // rate outruns the snapshot cycle. Unbounded,
+                                // this is a handler that neither recovers nor
+                                // stops, and `--messages` cannot end it either,
+                                // because `reached_limit` refuses to stop
+                                // mid-recovery. So: try a fixed number of times,
+                                // then give up loudly rather than either lying
+                                // about the book or spinning forever.
+                                if stats.joined_mid_stream && recovery.stats().completed == 0 {
+                                    if initial_join_retries < MAX_INITIAL_JOIN_RETRIES {
+                                        initial_join_retries += 1;
+                                        recovery.begin(1, Instant::now());
+                                    } else {
+                                        return Err(format!(
+                                            "joined mid-stream and could not build a book: \
+                                             {MAX_INITIAL_JOIN_RETRIES} snapshot attempts each \
+                                             filled the {}-datagram recovery buffer before a \
+                                             cycle completed. The feed is faster than this \
+                                             handler can bridge -- raise handler.\
+                                             recovery_buffer_datagrams, shorten \
+                                             feed.snapshot_interval_millis, or start the handler \
+                                             before the engine.",
+                                            cfg.handler.recovery_buffer_datagrams
+                                        )
+                                        .into());
+                                    }
+                                } else {
+                                    // Not the initial join, so nothing retries
+                                    // this one and the run carries on without
+                                    // the messages it was holding.
+                                    stats.recoveries_abandoned += 1;
+                                }
                             }
                         } else {
                             let gapped = arbitrator.state() == FeedState::Gapped;
@@ -541,6 +588,34 @@ fn run_with<B: BookSet>(
                         eprintln!("  recovery failed: {e}");
                         recovery.fail();
                         stats.recovery_failures += 1;
+                        // The initial join re-arms here for the same reason it
+                        // does on the hold path above, and this site matters
+                        // just as much: an initial join can fill the buffer
+                        // either while holding a datagram or while draining
+                        // one, and which of the two it happens to be is an
+                        // accident of timing. Re-arming on only one of them is
+                        // the difference between a handler that recovers and a
+                        // handler that ends GAPPED holding an empty book --
+                        // measured, on step 4 of the published commands.
+                        if stats.joined_mid_stream && recovery.stats().completed == 0 {
+                            if initial_join_retries < MAX_INITIAL_JOIN_RETRIES {
+                                initial_join_retries += 1;
+                                recovery.begin(1, Instant::now());
+                            } else {
+                                return Err(format!(
+                                    "joined mid-stream and could not build a book: \
+                                     {MAX_INITIAL_JOIN_RETRIES} snapshot attempts each filled \
+                                     the {}-datagram recovery buffer before a cycle completed. \
+                                     Raise handler.recovery_buffer_datagrams, shorten \
+                                     feed.snapshot_interval_millis, lower the publish rate, or \
+                                     start the handler before the engine.",
+                                    cfg.handler.recovery_buffer_datagrams
+                                )
+                                .into());
+                            }
+                        } else {
+                            stats.recoveries_abandoned += 1;
+                        }
                     }
                 } else {
                     drain_into_books(
@@ -676,6 +751,8 @@ fn run_with<B: BookSet>(
                 eprintln!("  recovery failed: {e}");
                 recovery.fail();
                 stats.recovery_failures += 1;
+                // A recovery that ran out of time is given up on, not retried.
+                stats.recoveries_abandoned += 1;
             }
             if let Some(limit) = idle_limit {
                 if now.duration_since(last_data) >= limit {
@@ -767,11 +844,12 @@ fn run_with<B: BookSet>(
     let clean = stats.is_clean(&arbitrator, recovery.is_recovering());
     if !clean {
         eprintln!(
-            "  NOT CLEAN: state {}, {} gaps ({} recovered, {} failed), still recovering: {}, \
-                {} bad datagrams, {} messages that did not apply",
+            "  NOT CLEAN: state {}, {} gaps ({} recovered, {} abandoned of {} failed \
+                attempts), still recovering: {}, {} bad datagrams, {} messages that did not apply",
             arbitrator.state(),
             arbitrator.gap_count(),
             stats.recoveries,
+            stats.recoveries_abandoned,
             stats.recovery_failures,
             recovery.is_recovering(),
             stats.bad_datagrams,
@@ -921,12 +999,12 @@ fn apply_replay<B: BookSet>(
             // Loud on purpose. A held datagram was discarded without evidence
             // that anything applied it, which means the book is probably short
             // of those messages — and that is the shape of the intermittent
-            // failure recorded in RESUME.md. Counting it as an apply error
+            // failure recorded in docs/RECOVERY.md. Counting it as an apply error
             // makes the run NOT CLEAN, so the smoke test fails on the spot
             // instead of hundreds of messages later.
             eprintln!(
                 "  BUG: {} held messages were discarded without evidence that the replay \
-                 of {}..={covered_through} covered them. See the open issue in RESUME.md.",
+                 of {}..={covered_through} covered them. See the open issue in docs/RECOVERY.md.",
                 outcome.unverified_messages, result.request.from
             );
             stats.unverified_drops += outcome.unverified_messages;

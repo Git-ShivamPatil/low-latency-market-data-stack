@@ -37,6 +37,20 @@ KEEP=0
 # predict exactly which datagrams die and check the reported gaps against them.
 DROP_RATE=0.02
 DROP_MODE=exclusive
+# The publish rate for the redundancy scenarios above. Stated here rather than
+# inherited from configs/local.toml, which is where it used to come from.
+#
+# That file is the one the case study tells a visitor to run, so its rate is
+# chosen for a *demo*: low enough that a handler started after the engine can
+# bridge to the next snapshot cycle. Lowering it for that reason at milestone 9
+# silently re-rated these scenarios too, and they failed on a margin they had
+# never been asked to hold -- 99 of 100 shared checkpoints instead of 100.
+#
+# A test that reads a number tuned for something else is a test that breaks when
+# that something else changes, for reasons that have nothing to do with the code
+# under test. Every other scenario in this file already sets its own rate; this
+# one now does too.
+BASE_RATE=200000
 # The recovery scenario, run after the redundancy one. It forces loss on BOTH
 # arms so redundancy cannot help, then requires the handler to rebuild from a
 # snapshot and end LIVE with a book that matches the engine's.
@@ -165,6 +179,7 @@ for MODE in "${MODES[@]}"; do
         --messages "$MESSAGES" \
         --digest-path "$ENGINE_DIGESTS" \
         --digest-interval "$DIGEST_INTERVAL" \
+        --rate "$BASE_RATE" \
         --drop-rate "$DROP_RATE" \
         --drop-mode "$DROP_MODE" \
         --self-check \

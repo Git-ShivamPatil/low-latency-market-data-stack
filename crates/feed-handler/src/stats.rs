@@ -40,7 +40,19 @@ pub struct HandlerStats {
     /// Recoveries that returned the handler to a trustworthy book.
     pub recoveries: u64,
     /// Recovery attempts that ran out of buffer or time.
+    ///
+    /// Not every one of these is a fault. An initial join re-arms and tries the
+    /// next snapshot cycle, so a run can fail three attempts, succeed on the
+    /// fourth and end holding a book that is exactly right. Diagnostics.
     pub recovery_failures: u64,
+    /// Recovery attempts the run did **not** retry — it gave up on that recovery
+    /// and carried on without the messages it was waiting for.
+    ///
+    /// This is the one that decides cleanliness. It is separate from
+    /// `recovery_failures` because re-arming turned a failed attempt from a
+    /// terminal event into a retry, and a retry that then succeeded is the
+    /// mechanism working rather than something to fail a run over.
+    pub recoveries_abandoned: u64,
     /// Snapshot fragments ignored because they predated the gap.
     pub snapshots_discarded: u64,
     /// Which recovery attempt a replay has already been requested for, so one
@@ -69,9 +81,13 @@ impl HandlerStats {
             arb.window_capacity(),
         );
         if self.recoveries > 0 || self.recovery_failures > 0 {
+            // "retried" and "abandoned" are reported separately because they
+            // mean opposite things: the first is an attempt that was tried
+            // again, the second is one the run gave up on.
+            let retried = self.recovery_failures - self.recoveries_abandoned;
             eprintln!(
-                "  recovered {} times, {} failed",
-                self.recoveries, self.recovery_failures
+                "  recovered {} times, {} attempts failed ({} retried, {} abandoned)",
+                self.recoveries, self.recovery_failures, retried, self.recoveries_abandoned
             );
         }
 
@@ -176,6 +192,10 @@ impl HandlerStats {
         let mut f = OpenOptions::new().append(true).open(path)?;
         writeln!(f, "recoveries={}", self.recoveries)?;
         writeln!(f, "recovery_failures={}", self.recovery_failures)?;
+        // The half of `recovery_failures` that was not retried. A scenario that
+        // starts the handler first should see zero of both; one that joins
+        // mid-stream can legitimately see failures and no abandonments.
+        writeln!(f, "recoveries_abandoned={}", self.recoveries_abandoned)?;
         writeln!(f, "recovery_attempts={}", r.attempts)?;
         writeln!(f, "recovery_datagrams_buffered={}", r.datagrams_buffered)?;
         writeln!(f, "recovery_messages_replayed={}", r.messages_replayed)?;
@@ -216,7 +236,11 @@ impl HandlerStats {
     pub fn is_clean(&self, arb: &Arbitrator, recovering: bool) -> bool {
         arb.state() != FeedState::Gapped
             && !recovering
-            && self.recovery_failures == 0
+            // Abandoned, not merely failed. A run that filled its recovery
+            // buffer three times, re-armed, caught the next snapshot cycle and
+            // ended LIVE with a correct book did its job -- failing it here
+            // would be failing the retry for having been needed.
+            && self.recoveries_abandoned == 0
             && self.bad_datagrams == 0
             && self.apply_errors == 0
             // A datagram dropped because the reorder window was full is message

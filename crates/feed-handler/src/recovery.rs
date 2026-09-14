@@ -96,7 +96,7 @@ pub struct DrainOutcome {
     ///
     /// Should always be zero. Non-zero means a held datagram was discarded on an
     /// assumption rather than on a fact, which is the shape of the intermittent
-    /// replay failure recorded in RESUME.md. The caller reports it rather than
+    /// replay failure recorded in docs/RECOVERY.md. The caller reports it rather than
     /// guessing whether to apply or drop: applying might double-apply, dropping
     /// might lose it, and picking one silently is how this became hard to find.
     pub unverified_messages: u64,
@@ -460,7 +460,7 @@ impl RecoveryBuffer {
                 // Dropping it on the assumption that something must have
                 // covered it is the assumption this whole path used to make,
                 // and it is the one remaining candidate for the intermittent
-                // failure recorded in RESUME.md. It is counted and reported
+                // failure recorded in docs/RECOVERY.md. It is counted and reported
                 // rather than guessed at: applying it might double-apply, and
                 // dropping it might lose it, and picking one silently is how
                 // this became hard to find in the first place.
@@ -601,7 +601,7 @@ mod tests {
         //
         // Applying it might double-apply and dropping it might lose it, and
         // picking one quietly is how the intermittent replay failure recorded in
-        // RESUME.md stayed hidden across two sessions. Reporting it makes a run
+        // docs/RECOVERY.md stayed hidden across two sessions. Reporting it makes a run
         // fail where the cause is rather than several hundred messages later.
         let mut b = buffer();
         b.begin(100, Instant::now());
