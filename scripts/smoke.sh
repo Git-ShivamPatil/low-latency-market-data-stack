@@ -61,8 +61,25 @@ RECOVERY_SNAPSHOT_MS=200
 # snapshot cycle is due, and the run would test nothing.
 RECOVERY_RATE=20000
 RECOVERY_MESSAGES=20000
-# The replay scenario runs the snapshot cycle far enough apart that it cannot
-# fire during the run.
+# The engine publishes MORE than the handler consumes, and the margin is
+# load-bearing.
+#
+# A gap in the last few datagrams of the stream has no snapshot cycle left to
+# recover from: the publisher has stopped, so the cycle that would have closed it
+# is never sent. The handler then correctly reports GAPPED and exits non-zero --
+# it is right, and the scenario fails for a reason that is about where the run
+# happened to end rather than about recovery.
+#
+# Measured: one round in twelve, the last gap opened at 17769 when the handler
+# had seen 1..17768, and the run sat in recovery until its idle timeout.
+#
+# Giving the engine a margin means the handler always stops first, on its own
+# message limit, while the publisher is still cycling -- so every gap it sees has
+# a cycle behind it. This is the same class of mistake as the replay scenario's
+# snapshot interval: a test whose outcome depends on the run ending at a
+# convenient moment.
+RECOVERY_ENGINE_MESSAGES=$((RECOVERY_MESSAGES + 6000))
+# The replay scenario turns the snapshot cycle OFF. 0 disables it entirely.
 #
 # It used to share the recovery scenario's 200ms, which meant both recovery
 # mechanisms were live and racing while the test asserted that replay won. Under
@@ -70,11 +87,25 @@ RECOVERY_MESSAGES=20000
 # fall back -- and the scenario failed with a correct book and matching digests.
 # Racing two mechanisms and asserting which one gets there first is not a test.
 #
+# The first fix moved it to 3000ms, "far enough apart that it cannot fire during
+# the run". That reasoning was wrong, and it is worth saying why rather than just
+# correcting the number: the run is about a second of traffic, but a *recovery*
+# is not bounded by the run. One measured here took 3,224ms across two reopen
+# cycles, and a snapshot fired inside it and closed the gap. The scenario failed
+# again, the same way, for the same reason -- an interval chosen to outlast the
+# traffic does not outlast an arbitrarily slow recovery.
+#
+# So the cycle is off, and the assertion that replay closed the gap is now a
+# statement about the only mechanism in the room. If replay cannot close it,
+# nothing can, and the recovery times out and says so -- which is a real failure
+# and exactly what this scenario should report. A test whose outcome depends on
+# which of two mechanisms won is not testing either of them.
+#
 # Now each scenario exercises exactly one path: `recovery` has no replay service
 # and must use snapshots; `replay` has no usable snapshot and must use replay. If
 # replay does not work, recovery times out and the run fails loudly, which is the
 # assertion this scenario was always trying to make.
-REPLAY_SNAPSHOT_MS=3000
+REPLAY_SNAPSHOT_MS=0
 # Which book the redundancy, recovery and replay scenarios rebuild into. The
 # books scenario below sets its own and ignores this. Overridable so a failure
 # in one of those can be attributed: if it reproduces with `--books reference`

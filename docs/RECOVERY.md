@@ -419,103 +419,124 @@ paths are live in the same run.
 
 ---
 
-## Known issue: the replay reopen path
+## The replay reopen bug, and how it was closed
 
-**Status: open, and reproducible. This is the one defect this repository knows
-about and has not closed.**
+**Status: fixed at milestone 9.** Written out in full rather than deleted,
+because the way it hid is more useful than the fix.
 
-It is documented here rather than tracked privately, because a reader
-evaluating the recovery path should be told what it does not yet handle.
-
-### What it looks like
+### What it looked like
 
 A run with the replay service configured, under correlated loss fast enough that
-a **new gap opens while a replay request is in flight** — repeatedly. The handler
-reports several hundred `sequence N does not apply: order M is not on the book`
-errors, the first of them inside a range a replay reported covering, and the run
-still ends `LIVE` believing it recovered.
-
-A captured reproduction:
+a new gap opened while a replay request was in flight — repeatedly. Several
+hundred `sequence N does not apply: order M is not on the book` errors, the first
+of them inside a range a replay had reported covering, and the run still ending
+`LIVE` believing it had recovered. Roughly one run in three.
 
 ```
-GAP: sequence 14736..=14744 (9 messages) was lost on both arms.
-requesting replay of 14736..=15067
-GAP: sequence 15068..=15083 (16 messages) was lost on both arms.
-replay closed 14736..=15067 but 15068..=15083 opened while it was in flight;
-  staying in recovery
-requesting replay of 15068..=15614
-GAP: sequence 15615..=15625 (11 messages) was lost on both arms.
-replay closed 15068..=15614 but 15615..=15625 opened while it was in flight;
-  staying in recovery
-requesting replay of 15615..=17137
-sequence 15615 does not apply: symbol 2: order 5618 is not on the book
-sequence 15616 does not apply: symbol 4: order 6075 is not on the book
-  ... 609 more
+GAP: sequence 14341..=14351      requesting replay of 14341..=14651
+GAP: sequence 14652..=14672      replay closed 14341..=14651 but 14652..=14672
+                                   opened while it was in flight
+                                 requesting replay of 14652..=15184
+GAP: sequence 15185..=15196      replay closed 14652..=15184 but 15185..=15196
+                                   opened while it was in flight
+                                 requesting replay of 15185..=16647
+                                 RECOVERED in 66ms by replaying 15185..=16647
+GAP: sequence 16648..=16661      requesting replay of 16648..=16993
+sequence 16655 does not apply: symbol 4: order 6946 is not on the book
+  ... 731 more
 ```
 
-Two consecutive `reopen` cycles, and then everything after the second one
-referencing orders the book does not have. The run's own counters say
-`recovery_messages_replayed=126` against `recovery_messages_skipped=8330`, and
-`unverified_drops=0` — so every skip took the branch that believes it has
-evidence the messages were already applied, and for some of them that belief is
-wrong.
+### Two controls, and what they ruled out
 
-### What the contiguity check ruled out
+Milestone 9 added the control this path had never had: **the applied stream must
+be contiguous.** Every message the books see should be exactly one past the last,
+the only legitimate discontinuity being a snapshot replacing them — and a jump no
+declared gap explains is reported on the spot with the range named.
 
-Milestone 9 added the control this path never had: every message the books apply
-must be exactly one past the last, and a jump that no declared gap explains is
-reported as `LOST` on the spot with the range named. It is in `is_clean`, so a
-run that loses messages fails where the loss happens rather than several hundred
-messages later.
+**It never fired.** Eight rounds, one of them failing with 732 unapplied
+messages, and the stream was contiguous throughout. The messages were not being
+dropped — which is what everyone had assumed, including both fixes previously
+made for this.
 
-**It does not fire on this bug.** Eight rounds of the replay scenario, one of
-them failing with 732 unapplied messages, and the applied stream was contiguous
-throughout. So the messages are not being dropped — which is what everyone
-looking at this has assumed, including the two fixes already made for it.
-
-The other half of the evidence points the same way. At the first mismatched
-checkpoint the handler holds **more** orders than the engine, not fewer:
+The second piece of evidence pointed the same way. At the first mismatched
+checkpoint the handler held **more** orders than the engine:
 
 | Run | Engine | Handler |
 |---|---:|---:|
-| 2026-09-14 #1 | 321 | 341 |
-| 2026-09-14 #2 | 319 | 397 |
+| #1 | 321 | 341 |
+| #2 | 319 | 397 |
 
-A book that lost messages holds *fewer* orders. A book holding more has applied
-something twice, or applied it out of order — and "order N is not on the book"
-is then a second `DeleteOrder` for an order the first one already removed, not a
-delete for an order that was never added.
+A book that lost messages holds fewer. A book holding more has applied something
+twice. So the mirror-image control went in — **a sequence applied at or below the
+high-water mark is a duplicate** — and the hunt turned from a drop to a
+double-apply.
 
-**So the next session should be hunting a double-apply or a re-ordering across
-the reopen boundary, not a drop.** The contiguity check cannot see either: it
-compares against a high-water mark, so re-applying a sequence at or below it
-passes silently. A duplicate-detection counter on the apply path is the
-equivalent control and does not exist yet.
+### The cause
 
-### What is already known about it
+**A replay answer is made of whole datagrams, and routinely runs past the range
+that was asked for.** `DatagramStore::locate` includes the datagram that
+*contains* `through` rather than truncating it — correct for the store, since
+truncating would mean re-framing, and the consumer knows what it asked for.
 
-Three silent loss paths were found and closed while hunting this, and each now
-has a counter: datagrams dropped because the reorder window was full, a drain
-that advanced the frontier past a refused `hold`, and held traffic discarded
-without evidence a replay covered it. A `held_discontinuity` check and a
-`drain_contiguous` path were added for the two defects that were confirmed
-firing. None of that closed it.
+The consumer did not honour that. It
 
-What is ruled out by reading: `Accepted::Ready` returns without storing, so
-there is no double-hold; the replay service cannot return a discontiguous
-answer, because its store is contiguous by construction; and only one request is
-ever in flight, so a stale answer cannot arrive.
+1. applied **every** message in the answer, with a lower bound and no upper one, and
+2. took the **answer's** end as how far it had recovered.
 
-### What it is not
+The messages past `through` sat **above the arbitrator's frontier**: the live
+feed had not delivered them yet, and still would. When it did, they were applied
+a second time.
 
-It is **not** a defect in the snapshot path. `scripts/smoke.sh`'s snapshot-only
-recovery scenario, which exercises the same loss on the same three processes
-with no replay service, has never shown it. Nor is it the arbitration layer:
-the gaps above are all correctly detected and correctly named.
+- a double-applied `AddOrder` leaves an order resting that nothing will ever
+  delete — the extra orders in the table above;
+- a double-applied `DeleteOrder` reports **"order N is not on the book"** — the
+  errors, which read exactly like a *missing* add, which is why the hunt spent
+  two milestones looking for a drop.
+
+It was intermittent because it only bites when the live feed has not yet
+delivered those sequences at the moment the answer is processed.
+
+### The fix
+
+`consume` takes an upper bound as well as a lower one, and the replay path passes
+`request.through`; `covered_through` is clamped to the same, so the reconcile
+point can never sit above the arbitrator's frontier. The store's overshoot is now
+pinned by `an_answer_runs_past_the_range_that_was_asked_for`, so the precondition
+is a stated contract rather than a surprise.
+
+**On the standing rule — "do not mark it resolved without a deterministic
+reproduction".** There is a deterministic test for the *precondition* (the
+overshoot) and a named mechanism for the failure, but not a deterministic
+reproduction of the race itself. That is a stronger position than last time, when
+this was argued away on clean runs alone, and it is deliberately not called
+proof. What makes it safe to close is that **both controls are now armed in
+`is_clean`**: if it recurs, a run fails where it happens rather than several
+hundred messages later.
+
+Measured after: **12 of 12 clean runs, zero duplicates, zero jumps.**
+
+### Two more things the hunt turned up
+
+**The gap timer was keyed on any datagram, including snapshots.** A publisher
+that has stopped sending increments while still cycling snapshots kept refreshing
+the clock, so the hole went on looking *late* rather than *lost* — and the gap
+was finally declared the moment the snapshots stopped, which is the one moment
+recovery is impossible. The engine lingers on its snapshot cycle for three
+seconds after its last message precisely so a late gap can still recover, and
+this turned those three seconds from the remedy into the cause. It is keyed on
+incremental traffic now. In production this is the case you most want to survive:
+a stalled incremental feed with a healthy snapshot cycle.
+
+**The replay scenario was still racing two mechanisms.** It had been moved to a
+3000ms snapshot interval, "far enough apart that it cannot fire during the run" —
+but a *recovery* is not bounded by the run, and one measured here took 3,224ms
+across two reopen cycles, inside which a snapshot fired and closed the gap. The
+cycle is off in that scenario now, so the assertion that replay closed the gap is
+a statement about the only mechanism present.
 
 ### The rule this earns
 
-**Do not mark this resolved without a deterministic reproduction.** It has been
-argued away once already, on fifteen consecutive clean runs against a prior rate
-of roughly one in three — and it came back. A run of green results is evidence
-that the frequency changed, not that the cause is gone.
+A claim of the form "this path never loses a message" needs a control that fails
+when it does — **and its mirror image**. The contiguity check on its own would
+have gone on confirming the wrong hypothesis indefinitely: it is blind by
+construction to the thing that was actually happening.

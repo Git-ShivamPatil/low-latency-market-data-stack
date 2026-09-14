@@ -304,6 +304,50 @@ mod tests {
         s
     }
 
+    /// The answer to a range request is made of WHOLE datagrams, and the last
+    /// one runs past `through` whenever `through` falls mid-datagram -- which,
+    /// at 32 messages to a datagram, is almost always.
+    ///
+    /// This is the right behaviour for the store: truncating a datagram would
+    /// mean re-framing it, and the consumer is told the range it asked for and
+    /// can skip the rest. But it is a contract the consumer has to actually
+    /// honour, and for five milestones it did not.
+    ///
+    /// The handler asked for `gap_from..=frontier`, applied every message in
+    /// the answer, and took the answer's own end as how far it had recovered.
+    /// The messages past `frontier` were above the arbitrator's frontier, so
+    /// the live feed had not delivered them yet and still would -- and did,
+    /// whereupon they were applied a second time. A double-applied `AddOrder`
+    /// leaves an order resting that nothing will ever delete; a double-applied
+    /// `DeleteOrder` reports "order N is not on the book". Both showed up, one
+    /// run in three, several hundred messages after the cause.
+    ///
+    /// So this test pins the overshoot as deliberate, and
+    /// `crates/feed-handler`'s `consume` takes an upper bound because of it.
+    #[test]
+    fn an_answer_runs_past_the_range_that_was_asked_for() {
+        // Datagrams of 10: 1..=10, 11..=20, 21..=30, 31..=40.
+        let s = filled(16, 4, 10);
+
+        // Ask for 12..=23, which starts and ends mid-datagram.
+        let located = s.locate(12, 23);
+        assert_eq!(located.status, Status::Ok);
+
+        let first = wire::PacketHeaderDecoder::wrap(s.datagram_at(located.start).unwrap())
+            .unwrap()
+            .first_sequence();
+        let last_hdr =
+            wire::PacketHeaderDecoder::wrap(s.datagram_at(located.end - 1).unwrap()).unwrap();
+        let last_end = last_hdr.first_sequence() + u64::from(last_hdr.message_count()) - 1;
+
+        assert_eq!(first, 11, "the answer starts before the range: 11, not 12");
+        assert_eq!(last_end, 30, "and ends after it: 30, not 23");
+        assert!(
+            last_end > 23,
+            "a consumer that trusts the answer's end over its own request will              claim to have recovered {last_end} when it asked for 23"
+        );
+    }
+
     #[test]
     fn an_empty_store_can_serve_nothing() {
         let s = DatagramStore::new(8, 4096);

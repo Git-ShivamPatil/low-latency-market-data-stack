@@ -4,8 +4,8 @@
 
 **Price-time-priority matching engine publishing a binary feed over redundant A/B UDP multicast, with a Rust feed handler that arbitrates the two and rebuilds MBP/MBO books without allocating.**
 
-![status](https://img.shields.io/badge/status-in_development-111111?style=flat-square)
-![progress](https://img.shields.io/badge/milestones-8_of_9-4a4a4a?style=flat-square)
+![status](https://img.shields.io/badge/status-v1.0.0-111111?style=flat-square)
+![progress](https://img.shields.io/badge/milestones-9_of_9-4a4a4a?style=flat-square)
 ![licence](https://img.shields.io/badge/licence-MIT-767676?style=flat-square)
 
 ![Rust](https://img.shields.io/badge/Rust-1.98-000000?style=flat-square&logo=rust&logoColor=white)
@@ -19,7 +19,7 @@
 ---
 
 > [!IMPORTANT]
-> **This is a build in progress — 8 of 9 milestones complete.**
+> **Complete — 9 of 9 milestones, tagged `v1.0.0`.**
 >
 > The figures below (`1M+ msg/s · ~100ns decode`) have now been **measured**: 2.78M msg/s sustained receiver-side with zero gaps, three runs within 0.7%, and 8.2ns per message to decode.
 > They are single-host, over loopback, and **batched 32 messages to a datagram** — which is not a footnote, because at one message per datagram the kernel caps out an order of magnitude lower.
@@ -54,20 +54,20 @@ flowchart LR
 
 <sub>Conceptual architecture. Shape carries meaning, and it means the same thing across every project in this series: a **rounded** node is a boundary — what comes in or goes out, a **rectangle** is where the work happens, a **cylinder** is state that outlives a request.</sub>
 
-## What is being built
+## What it does
 
 **Matching engine and binary feed.** Price-time-priority matching publishing a binary market-data feed over redundant A/B UDP multicast channels, with configurable packet-loss injection, a 2-second snapshot cycle, and a TCP replay service for recovery.
 
-**Allocation-free feed handler.** A/B feed arbitration, sequence-gap detection and snapshot-based recovery into MBP/MBO order books — sustaining 1M+ messages/sec at ~100ns decode and ~200ns book update, with zero heap allocations per message verified by a counting allocator.
+**Allocation-free feed handler.** A/B feed arbitration, sequence-gap detection and snapshot-based recovery into MBP/MBO order books — sustaining 1M+ messages/sec at ~100ns decode and ~200ns book update, with zero heap allocations per message verified by a counting allocator. Measured single-host over loopback, batched 32 messages to a datagram.
 
-**FIX 4.4 order gateway.** A full session layer — logon, heartbeats, resend/gap-fill, durable sequence persistence — reconciling order state across a hard process restart, plus a risk service enforcing pre-trade limits on an allocation-free path.
+**FIX 4.4 order gateway.** A FIX 4.4 session layer — logon, heartbeats, resend/gap-fill, durable sequence persistence — cross-checked against QuickFIX as an independent counterparty, reconciling order state across a hard process restart, plus a risk service enforcing pre-trade limits on an allocation-free path.
 
 ## Roadmap
 
 Each milestone is independently demoable and ends in a commit. A box is ticked only when its verification step actually passed — not when the code was written.
 
 ```
-[█████████████████████░░░] 8/9 milestones · 89%
+[████████████████████████] 9/9 milestones · 100%
 ```
 
 - [x] **M1 · Workspace, wire schema, and cross-language codegen**  
@@ -94,8 +94,9 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - [x] **M8 · Risk service, order path into the engine, and restart reconciliation**  
   An order crosses the whole stack — gateway to risk to engine to fill to execution report — and open order state is reconstructed correctly after a hard crash.  
   <sub>Five processes and four shared-memory SPSC rings. `scripts/order-path-test.sh` sends **one order** over FIX and follows it: risk passes it, the engine fills it against resting liquidity, the fill returns as a FIX `ExecutionReport`, and the `feed-handler` — a fourth process that has never heard of the order path and only reads multicast — rebuilds a book **identical to the engine's at all 795 shared checkpoints**. That last one is the only assertion that proves the market-data half and the order-entry half are the same system. In the same run a quantity breach is rejected with a reason and **never reaches the engine**, witnessed by the engine's own counter rather than by risk reporting its own rejection. Then the gateway is **`SIGKILL`ed with an order working**, restarts from its write-ahead log, asks the engine what it is holding, and the two agree — and nothing is repaired, because the divergence report is the deliverable. Pre-trade limits run on a path that does not touch the heap: **0 allocations across 1,000,000 risk decisions**, under both g++ and clang++, with a control that allocates on purpose and requires the counter to notice. The two ring implementations are generated from one schema and checked against each other by a Rust process and a C++ process on opposite ends of the same ring, 200,000 messages each way, zero mismatches. See [docs/ORDER-PATH.md](docs/ORDER-PATH.md).</sub>
-- [ ] **M9 · Hardening, documentation, and a tagged release**  
-  A stranger clones the repo on a clean machine and the four commands on the portfolio page work in order.
+- [x] **M9 · Hardening, documentation, and a tagged release**  
+  A stranger clones the repo on a clean machine and the four commands on the portfolio page work in order.  
+  <sub>Verified: `docker compose up -d` brings up **all five processes** with the feed crossing a user-defined bridge as real multicast — five containers, risk healthy, four rings created, the engine publishing, the handler `LIVE` on **both arms with zero gaps**, and the FIX port accepting a connection from the host. It had **never been run** since the benchmark crate joined the workspace at M6, and three defects were waiting in it, each fatal alone: a workspace member missing from the image, `--flag=value` — every argument the compose file passes — rejected by both C++ parsers, and the acceptor bound to `127.0.0.1` inside a container. Every other suite was green throughout, because they call these binaries the way the *tests* need rather than the way the *deployment* does. `scripts/cli-args-test.sh` pins the spelling in a second and a CI job now runs `docker compose up -d` for real on every push. **`docs/CLAIMS-MAP.md` maps every claim on the case study to a named test**, and checking it — rather than only writing it — found four more: `docs/WIRE.md` had documented an aggregated-`levels` snapshot since M1 that M4 replaced with `orders` in queue order, and argued from it that the snapshot cycle *cannot* recover an MBO book, contradicting this project's own recovery claim for five milestones. **The two claims that did not survive were corrected on the page itself**, not annotated away. And the one bug this repository had never closed — a replay answer applied past the range it asked for, so the live feed delivered those sequences again and the book double-applied them — was found, fixed, and armed against with two controls in `is_clean`: **12 of 12 clean smoke runs against a prior rate of roughly one in three**. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/RECOVERY.md](docs/RECOVERY.md).</sub>
 
 ## On the performance target
 

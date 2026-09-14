@@ -236,6 +236,16 @@ matters.
 
 ---
 
+**The one bug this repository had not closed is now closed, and said so
+honestly.** A replay answer applied past the range it asked for, so the live feed
+delivered those sequences again and the book double-applied them — found at
+milestone 9, fixed, and guarded by two controls that are now part of `is_clean`:
+the applied stream must be contiguous, and no sequence may be applied twice.
+Twelve of twelve clean runs against a prior rate of roughly one in three.
+[RECOVERY.md](RECOVERY.md) has the full account, including the honest limit:
+there is a deterministic test for the precondition and a named mechanism, but not
+a deterministic reproduction of the race.
+
 ## What this file does not claim
 
 It does not claim the numbers were measured on production-grade hardware, on a

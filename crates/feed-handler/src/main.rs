@@ -367,6 +367,23 @@ fn run_with<B: BookSet>(
     let mut last_replay_from: Option<u64> = None;
 
     let mut last_data = Instant::now();
+    // When an *incremental* datagram last arrived, which is a different question
+    // from when any datagram did.
+    //
+    // A hole is declared lost when the feed goes quiet, because a datagram that
+    // has not arrived on a live feed is merely late. But snapshot datagrams live
+    // in their own sequence space and can never fill a hole in the incremental
+    // one -- so a publisher that has stopped sending increments while still
+    // cycling snapshots leaves the consumer believing its hole is still late,
+    // and it waits. The moment it finally declares the gap is the moment the
+    // snapshots stop too, which is the one moment recovery is impossible.
+    //
+    // Measured: the engine lingers on its snapshot cycle for three seconds after
+    // its last message, exactly so a late gap can still recover. Timing the gap
+    // off `last_data` meant those three seconds suppressed the declaration
+    // instead of serving it, and the run ended GAPPED holding a book it knew was
+    // wrong. See `docs/RECOVERY.md`.
+    let mut last_incremental = Instant::now();
     let mut last_report = Instant::now();
 
     // Which arm is polled first alternates each pass. Draining A to empty before
@@ -392,6 +409,7 @@ fn run_with<B: BookSet>(
     'outer: loop {
         let alloc_scope = allocs.begin(arbitrator.messages_delivered());
         let mut got_any = false;
+        let mut got_incremental = false;
         poll_b_first = !poll_b_first;
         let arms: [(u8, &Receiver); 2] = if poll_b_first {
             [(1u8, &b), (0u8, &a)]
@@ -436,6 +454,9 @@ fn run_with<B: BookSet>(
 
                 // Arbitration decides what, if anything, this datagram
                 // contributes. Everything downstream sees one ordered stream.
+                // Past the snapshot routing above, so this counts only traffic
+                // that could actually close a hole.
+                got_incremental = true;
                 let outcome = arbitrator.accept(channel, &buf[..n]);
                 match outcome {
                     Accepted::Ready {
@@ -526,6 +547,7 @@ fn run_with<B: BookSet>(
                                 digest_interval,
                                 gapped,
                                 0,
+                                u64::MAX,
                             );
                             if let (Some(probe), Some(t0)) = (latency.as_mut(), started) {
                                 probe.record(tsc::stop().saturating_sub(t0), count);
@@ -710,6 +732,9 @@ fn run_with<B: BookSet>(
         }
 
         let now = Instant::now();
+        if got_incremental {
+            last_incremental = now;
+        }
         if got_any {
             last_data = now;
         } else {
@@ -730,7 +755,7 @@ fn run_with<B: BookSet>(
 
             // A hole that has stayed open through a quiet period is not late
             // any more.
-            if now.duration_since(last_data) >= gap_timeout {
+            if now.duration_since(last_incremental) >= gap_timeout {
                 if let Some(gap) = arbitrator.declare_gap_if_stalled() {
                     eprintln!(
                         "  GAP: sequence {gap} did not arrive within {}ms of the feed going \
@@ -941,13 +966,23 @@ fn apply_replay<B: BookSet>(
             digest_interval,
             false,
             result.request.from,
+            result.request.through,
         )?;
         if let Ok(h) = wire::PacketHeaderDecoder::wrap(datagram) {
             messages += u64::from(h.message_count());
             let first = h.first_sequence();
             let end = first + u64::from(h.message_count());
             if contiguous && first <= covered_through + 1 {
-                covered_through = covered_through.max(end.saturating_sub(1));
+                // Clamped to what was asked for. The store serves whole
+                // datagrams and includes the one that *contains* `through`
+                // rather than truncating it, so `end - 1` routinely runs past
+                // the request. Claiming coverage that far would set the
+                // reconcile point above the arbitrator's frontier, and the
+                // messages in between would be applied here and again when the
+                // live feed delivered them.
+                covered_through = covered_through
+                    .max(end.saturating_sub(1))
+                    .min(result.request.through);
             } else if contiguous {
                 eprintln!(
                     "  the replay answer for {}..={} jumps from {covered_through} to \
@@ -1000,6 +1035,7 @@ fn apply_replay<B: BookSet>(
                     digest_interval,
                     false,
                     skip_below,
+                    u64::MAX,
                 ) {
                     failure = Some(e);
                 }
@@ -1043,6 +1079,7 @@ fn apply_replay<B: BookSet>(
             digest_interval,
             false,
             skip_below,
+            u64::MAX,
         ) {
             failure = Some(e);
         }
@@ -1179,6 +1216,7 @@ fn handle_snapshot<B: BookSet>(
                     digest_interval,
                     false,
                     skip_below,
+                    u64::MAX,
                 ) {
                     failure = Some(e);
                 }
@@ -1218,6 +1256,7 @@ fn handle_snapshot<B: BookSet>(
                 digest_interval,
                 false,
                 skip_below,
+                u64::MAX,
             ) {
                 failure = Some(e);
             }
@@ -1255,6 +1294,19 @@ fn consume<B: BookSet>(
     // boundary; applying those twice is what puts a book quietly and permanently
     // wrong.
     skip_below: u64,
+    // Messages above this sequence are not ours to apply yet, and must be
+    // skipped for the mirror-image reason.
+    //
+    // Only ever finite on the replay path. A replay answer is made of whole
+    // datagrams, so the last one routinely runs past the range that was asked
+    // for — the store includes the datagram that *contains* `through` rather
+    // than truncating it. Those extra messages sit above the arbitrator's
+    // frontier, which means the live feed has not delivered them yet and still
+    // will. Applying them here and again when they arrive is a double-apply, and
+    // a double-applied `AddOrder` leaves an order resting that nothing will ever
+    // delete while a double-applied `DeleteOrder` reports "order N is not on the
+    // book". See `docs/RECOVERY.md`.
+    skip_above: u64,
 ) -> io::Result<bool> {
     let reader = match PacketReader::new(datagram) {
         Ok(r) => r,
@@ -1274,7 +1326,7 @@ fn consume<B: BookSet>(
                 break;
             }
         };
-        if seq < skip_below {
+        if seq < skip_below || seq > skip_above {
             continue;
         }
         // The contiguity check. Every message the books see should be exactly
@@ -1301,6 +1353,20 @@ fn consume<B: BookSet>(
                  applied and no gap covers them",
                 stats.applied_high,
                 seq - stats.applied_high - 1
+            );
+        }
+        // The other direction: a sequence the books have already applied. There
+        // is no legitimate path to this -- a snapshot moves `applied_high`
+        // without coming through here, and every replay and drain is told where
+        // to start within its datagram.
+        if stats.applied_high != 0 && seq <= stats.applied_high {
+            stats.duplicate_applies += 1;
+            if stats.first_duplicate.is_none() {
+                stats.first_duplicate = Some((seq, stats.applied_high));
+            }
+            eprintln!(
+                "  DOUBLE: sequence {seq} applied again; the books are already through {}",
+                stats.applied_high
             );
         }
         if seq > stats.applied_high {
@@ -1355,7 +1421,16 @@ fn drain_into_books<B: BookSet>(
         // The branch is predictable and the whole probe is absent when the flag
         // is off, so an untimed run pays nothing for this being here.
         let started = latency.as_ref().map(|_| tsc::start());
-        let outcome = consume(bytes, books, stats, digest_log, digest_interval, gapped, 0);
+        let outcome = consume(
+            bytes,
+            books,
+            stats,
+            digest_log,
+            digest_interval,
+            gapped,
+            0,
+            u64::MAX,
+        );
         if let (Some(probe), Some(t0)) = (latency.as_mut(), started) {
             probe.record(tsc::stop().saturating_sub(t0), count);
         }

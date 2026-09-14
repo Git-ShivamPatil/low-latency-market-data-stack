@@ -76,6 +76,22 @@ pub struct HandlerStats {
     /// The first such jump, as `(from, to)`, so the report names a range rather
     /// than a count.
     pub first_jump: Option<(u64, u64)>,
+    /// Messages applied at a sequence the books have already seen.
+    ///
+    /// The other half of the contiguity control, and the half that matters for
+    /// the open replay bug. `sequence_jumps` compares against a high-water mark,
+    /// so it catches a message that arrives too late to be next and is blind to
+    /// one that arrives twice. Re-applying an `AddOrder` or a `DeleteOrder` puts
+    /// the book quietly and permanently wrong in the other direction: the second
+    /// delete reports "order N is not on the book", and an order whose delete was
+    /// spent early stays resting forever.
+    ///
+    /// Nothing should ever re-apply. A snapshot moves `applied_high` without
+    /// passing through the apply path, and every replay and drain is told where
+    /// to start within the datagram.
+    pub duplicate_applies: u64,
+    /// The first duplicate, as `(sequence, applied_high_at_the_time)`.
+    pub first_duplicate: Option<(u64, u64)>,
     /// Which recovery attempt a replay has already been requested for, so one
     /// gap does not produce a stream of duplicate requests.
     pub replay_requested: u64,
@@ -218,6 +234,11 @@ impl HandlerStats {
         // mid-stream can legitimately see failures and no abandonments.
         writeln!(f, "recoveries_abandoned={}", self.recoveries_abandoned)?;
         writeln!(f, "sequence_jumps={}", self.sequence_jumps)?;
+        writeln!(f, "duplicate_applies={}", self.duplicate_applies)?;
+        if let Some((seq, high)) = self.first_duplicate {
+            writeln!(f, "first_duplicate_sequence={seq}")?;
+            writeln!(f, "first_duplicate_applied_high={high}")?;
+        }
         if let Some((from, to)) = self.first_jump {
             writeln!(f, "first_jump_from={from}")?;
             writeln!(f, "first_jump_to={to}")?;
@@ -280,5 +301,10 @@ impl HandlerStats {
             // The applied stream skipped forward with no gap to account for it.
             // Messages this handler was given and never applied.
             && self.sequence_jumps == 0
+            // And the mirror image: a sequence applied to the books twice. This
+            // is the one that catches the milestone-9 replay bug, and it is
+            // armed rather than merely reported, because "we looked and saw
+            // none" is a weaker statement than "a run that does it fails".
+            && self.duplicate_applies == 0
     }
 }

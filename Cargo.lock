@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "alloc-guard"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "anes"
@@ -79,7 +79,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bench"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bench-support",
  "book",
@@ -89,14 +89,14 @@ dependencies = [
 
 [[package]]
 name = "bench-support"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "alloc-guard",
 ]
 
 [[package]]
 name = "book"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "wire",
 ]
@@ -240,7 +240,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "feed-handler"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "alloc-guard",
  "bench-support",
@@ -333,7 +333,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "matching-engine"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "book",
  "clap",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "mdconfig"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "toml",
@@ -437,7 +437,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "replay-service"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "mdconfig",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "ring"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "alloc-guard",
  "libc",
@@ -603,7 +603,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "transport"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "socket2",
 ]
@@ -662,7 +662,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "wire"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "zerocopy"
