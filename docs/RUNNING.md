@@ -92,31 +92,89 @@ docker compose logs -f handler
 docker compose down
 ```
 
-This puts the engine, the replay service and the handler on a user-defined
-bridge with a fixed subnet, and sends the feed across it as real multicast. If it
-does not work:
+This brings up **all five processes** — the gateway, the risk service, the
+engine, the replay service and the handler — on a user-defined bridge with a
+fixed subnet, and sends the feed across it as real multicast. If the handler
+joins its groups and then receives nothing:
 
 ```bash
 MDSTACK_TRANSPORT=unicast-fanout docker compose up -d
 ```
 
-> **A note on the case study's step ordering.** The published steps read
-> `docker compose up -d`, then run the engine, then run the handler. Taken
-> literally that starts *two* engines — one in the container and one on the host
-> — both publishing to the same groups with independent sequence numbers, and the
-> handler would report a torrent of gaps.
->
-> The replay service is genuinely infrastructure a host binary attaches to, so
-> the intent of step 1 now has something real behind it. To follow the published
-> steps as written:
->
-> ```bash
-> docker compose up -d replay
-> ```
->
-> then run the engine and handler on the host with `--replay-uplink` and
-> `--replay`. Bringing up the *whole* compose stack is the alternative, all-in-one
-> path. The published copy still needs a word changed before v1.0 to say which.
+which uses the same binaries and the same framing over plain UDP.
+
+A FIX client on the host connects to the gateway on port 5001.
+
+### What the compose stack is, and is not
+
+It is a **self-contained copy of the whole system**, not infrastructure that the
+host binaries attach to. That distinction is easy to get wrong, and it was
+written down wrong here until milestone 9 — this section used to warn that
+running `docker compose up -d` and then the host engine would start two
+publishers on the same groups and drown the handler in gaps.
+
+**It does not.** The measurement, with the compose stack publishing at 50,000
+msg/s: a host `feed-handler` pointed at `239.1.1.1:30001` and `239.1.1.2:30001`
+for twelve seconds received **zero messages** and stayed `SYNCING`, both arms at
+0/0. The bridge has its own network namespace and its multicast does not reach
+WSL.
+
+So the four commands the case study publishes do run in order, and nothing
+conflicts. But it is worth being plain about what step 1 is doing: it brings up a
+containerised stack that steps 2, 3 and 4 then **ignore**, because those run
+host-local binaries on the host's own loopback. Step 1 is harmless rather than
+load-bearing.
+
+If you want a host binary that genuinely attaches to something in a container,
+the replay service is the one that qualifies:
+
+```bash
+docker compose up -d replay
+```
+
+then run the engine and handler on the host with `--replay-uplink` and
+`--replay`. That is a real dependency across the boundary, over TCP, which
+multicast isolation does not affect.
+
+### The order things start in, and why
+
+`risk-service` creates all four shared-memory rings and therefore starts first.
+The gateway and the engine only ever open them, and `depends_on` waits on its
+**healthcheck** rather than on "the process is up", because those are different
+moments and the dependents need the second one.
+
+The healthcheck is `test -f /app/state/reports.ring`, which is the last of the
+four to be created. That is only a real readiness signal because `risk-service`
+**unlinks all four before creating any of them**: the files live on a named
+volume and outlive `docker compose down`, so without the unlink the check would
+pass the instant the volume was mounted and the other two would attach to the
+previous run's rings.
+
+`risk` is also the one service with `restart: "no"`. Everything else uses
+`unless-stopped`. Restarting the creator alone, while the gateway and the engine
+hold the old rings, leaves two halves of a stack that both look healthy and
+cannot talk to each other. If it dies, take the whole thing down:
+
+```bash
+docker compose down && docker compose up -d
+```
+
+### Two things that had never been run
+
+`docker compose up -d` is step 1 of the four commands the case study publishes,
+and until milestone 9 nobody had executed it since the benchmark crate joined the
+workspace. Three defects were sitting in it, each fatal on its own:
+
+| What | Why it failed |
+|---|---|
+| `bench` was never copied into the image | It is a workspace member outside `crates/`, so cargo refused to load the workspace at all — before it reached the three binaries the stage wanted |
+| Every argument was `--flag=value` | Both C++ parsers compared the whole argument against a literal, so all of them fell through to the usage branch and the service exited 2 |
+| The gateway bound `127.0.0.1` | Inside a container the published port forwards to the container's own address, so port 5001 could never be reached however it was mapped |
+
+All three are fixed, and all three now have a test: `scripts/cli-args-test.sh`
+pins the argument spelling in about a second, and the `case-study` CI job runs
+`docker compose up -d` for real on every push. An image nobody builds is an image
+nobody knows is broken.
 
 ---
 

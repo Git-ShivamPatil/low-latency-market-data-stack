@@ -66,12 +66,21 @@ class Connection {
 /// Connects to `host:port`. Returns a closed Connection on failure.
 Connection connect_to(const std::string& host, std::uint16_t port);
 
-/// Listens on `port` and accepts one connection.
+/// Listens on `bind_addr:port` and accepts one connection.
 ///
 /// One at a time, deliberately: a FIX session is a long-lived relationship
 /// between two named parties, not a request/response service, and the multiple
 /// concurrent sessions a real deployment needs are out of scope. See
 /// `docs/PROTOCOL.md`.
-Connection accept_one(std::uint16_t port, int timeout_ms);
+///
+/// `bind_addr` defaults to loopback, which is right for every test in this
+/// repository and wrong in exactly one place: inside a container, where a
+/// published port forwards to the container's own address and a listener on
+/// 127.0.0.1 is unreachable from outside no matter what the port mapping says.
+/// `docker-compose.yml` passes 0.0.0.0 for that reason. The default stays
+/// loopback so that nothing else starts listening on every interface by
+/// accident.
+Connection accept_one(std::uint16_t port, int timeout_ms,
+                      const std::string& bind_addr = "127.0.0.1");
 
 }  // namespace fix

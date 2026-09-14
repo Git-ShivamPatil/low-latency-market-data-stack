@@ -33,9 +33,18 @@ services:
     networks:
       feed:
         ipv4_address: 172.28.0.10
+    volumes:
+      - state:/app/state
     command:
       - --config=/app/configs/docker.toml
       - --transport=${MDSTACK_TRANSPORT:-multicast}
+      # The other end of the order path. Without these the engine is exactly
+      # what milestones 2 through 6 built and a client order has nowhere to go.
+      - --order-ring=/app/state/accepted.ring
+      - --exec-ring=/app/state/execs.ring
+    depends_on:
+      risk:
+        condition: service_healthy
     restart: unless-stopped
 
   replay:
@@ -64,6 +73,105 @@ services:
       - engine
       - replay
     restart: unless-stopped
+
+  # --- the order path -------------------------------------------------------
+  #
+  # The risk service creates all four rings and therefore starts first. The
+  # gateway and the engine only ever open them; a second creator would zero the
+  # indices under whoever was already attached, silently, because a fresh ring
+  # looks exactly like an empty one. See docs/ORDER-PATH.md.
+  #
+  # `depends_on: service_healthy` rather than `service_started`, because
+  # "the process is up" and "the rings exist" are different moments and the
+  # gateway needs the second one.
+  risk:
+    <<: *build
+    container_name: mdstack-risk
+    entrypoint: ["risk-service"]
+    networks:
+      feed:
+        ipv4_address: 172.28.0.13
+    volumes:
+      - state:/app/state
+    command:
+      - --orders=/app/state/orders.ring
+      - --accepted=/app/state/accepted.ring
+      - --execs=/app/state/execs.ring
+      - --reports=/app/state/reports.ring
+      # ACME, from configs/docker.toml.
+      - --symbol=1
+      - --max-order-qty=10000
+      - --max-notional=100000000000
+      - --max-position=1000000
+      - --collar-bps=2000
+      - --reference-price=1000000
+      # 0 means run until signalled, which is what a service wants.
+      - --run-seconds=0
+    # reports.ring is created last of the four, and risk-service unlinks all four
+    # before creating any of them -- so its existence means "this run built the
+    # rings", not "this volume has been used before". That unlink is what makes
+    # the check meaningful on a named volume; without it the file survives
+    # `docker compose down` and the check passes before risk has started.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /app/state/reports.ring"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+      start_period: 2s
+    # Deliberately NOT `unless-stopped`, which every other service here uses.
+    #
+    # risk-service is the only process that creates the rings, and it recreates
+    # them on every start. Restarting it alone, while the gateway and the engine
+    # are still attached to the old ones, gives them a mapping nothing reads and
+    # a fresh ring nothing writes -- two halves of a stack that both look healthy
+    # and cannot talk. A crash here has to be loud.
+    #
+    # If it does die: `docker compose down && docker compose up -d`. The lifetime
+    # of the rings is the lifetime of the stack, and compose cannot express
+    # "restart these three together".
+    restart: "no"
+
+  gateway:
+    <<: *build
+    container_name: mdstack-gateway
+    entrypoint: ["fix-gateway"]
+    networks:
+      feed:
+        ipv4_address: 172.28.0.14
+    ports:
+      # A FIX client on the host connects here.
+      - "5001:5001"
+    volumes:
+      - state:/app/state
+    command:
+      - --listen=5001
+      # Without this the acceptor binds 127.0.0.1 *inside the container*, where
+      # the published port above forwards to the container's own address and can
+      # never reach it. The port mapping looks correct and the connection is
+      # refused, which is a confusing half-hour. The default stays loopback so
+      # nothing outside a container starts listening on every interface.
+      - --bind=0.0.0.0
+      - --store=/app/state/gateway.seq
+      - --sender=EXCHANGE
+      - --target=CLIENT
+      - --heartbeat=30
+      - --run-seconds=0
+      - --orders-ring=/app/state/orders.ring
+      - --reports-ring=/app/state/reports.ring
+      - --order-store=/app/state/orders.log
+      - --symbol=ACME=1
+      # After a restart, ask the engine what it is still holding. It reports;
+      # it does not repair.
+      - --reconcile
+    depends_on:
+      risk:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  # Named, so the sequence store and the order log survive `docker compose
+  # down`. A durable store on an anonymous volume is not durable.
+  state:
 
 networks:
   # A user-defined bridge rather than the default one, so the subnet is fixed

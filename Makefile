@@ -53,7 +53,7 @@ $(CPP_BUILD)/CMakeCache.txt:
 # --- test ------------------------------------------------------------------
 
 .PHONY: test
-test: test-rust test-cpp test-corruption test-killrestart test-quickfix test-ring-interop test-orderpath smoke ## Run every correctness suite
+test: test-rust test-cpp test-cliargs test-corruption test-killrestart test-quickfix test-ring-interop test-orderpath smoke test-casestudy ## Run every correctness suite
 
 .PHONY: test-rust
 test-rust: ## cargo test the workspace
@@ -62,6 +62,13 @@ test-rust: ## cargo test the workspace
 .PHONY: test-cpp
 test-cpp: build-cpp ## ctest the C++ tree
 	ctest --test-dir $(CPP_BUILD) --output-on-failure
+
+# Cheap and early: the two C++ binaries have to accept the `--flag=value`
+# spelling docker-compose.yml uses. They did not, for as long as that file has
+# existed, and every other suite was green because it calls them differently.
+.PHONY: test-cliargs
+test-cliargs: build-cpp ## Pin the command-line contract both binaries are deployed with
+	MDSTACK_BUILD_DIR=$(CPP_BUILD) scripts/cli-args-test.sh
 
 .PHONY: test-killrestart
 test-killrestart: build-cpp ## SIGKILL the FIX gateway mid-session and require it to resume
@@ -87,6 +94,19 @@ test-corruption: ## Prove a one-byte edit to a golden vector fails both suites
 smoke: ## End-to-end: engine and handler as separate processes, books reconciled
 	scripts/smoke.sh
 
+# Last in `test` deliberately. Everything above proves the system is correct;
+# this proves the four commands a stranger copies off the case study page still
+# run. They are the public surface, so a renamed binary or a dropped flag is a
+# regression like any other -- and nothing else here would catch it, because
+# every other suite runs the binaries with the arguments the TESTS need.
+.PHONY: test-casestudy
+test-casestudy: ## Run the four commands the case study publishes, exactly as published
+	scripts/case-study-commands-test.sh
+
+.PHONY: test-casestudy-docker
+test-casestudy-docker: ## The same, including `docker compose up -d` for real
+	scripts/case-study-commands-test.sh --with-docker
+
 .PHONY: run-engine
 run-engine: ## The engine, exactly as the case study runs it
 	cargo run --release --bin matching-engine -- --config configs/local.toml
@@ -102,9 +122,14 @@ fmt: ## Format the Rust tree
 	$(CARGO) fmt --all
 
 .PHONY: lint
-lint: ## Formatting and clippy, both as errors
+lint: ## Formatting, clippy and documentation links, all as errors
 	$(CARGO) fmt --all -- --check
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	scripts/check-doc-links.py
+
+.PHONY: check-doc-links
+check-doc-links: ## Every relative link and heading anchor in the docs resolves
+	scripts/check-doc-links.py
 
 .PHONY: ci
 ci: check-generated lint test ## Everything CI runs, in CI's order

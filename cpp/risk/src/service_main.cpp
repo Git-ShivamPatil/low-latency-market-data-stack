@@ -31,6 +31,9 @@
 // that vanishes between the gateway and the engine is the worst outcome on this
 // path, because nothing will ever notice on its own.
 
+#include <unistd.h>
+
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
@@ -260,8 +263,35 @@ void handle_report_side(Consumer& execs, Producer& reports, risk::RiskEngine& en
 int main(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string{}; };
+        // Both `--flag value` and `--flag=value` are accepted.
+        //
+        // The second form is not a nicety: it is what docker-compose.yml, a
+        // systemd unit and every other declarative runner writes, because one
+        // list entry per argument is the shape those files have. Accepting only
+        // the first is how this repository shipped a compose file whose risk
+        // service exited 2 before creating a single ring -- and it failed
+        // quietly, because the usage text goes to stderr and everything
+        // downstream only ever saw "dependency failed to start: unhealthy".
+        std::string a = argv[i];
+        std::string inlined;
+        bool have_inlined = false;
+        if (a.rfind("--", 0) == 0) {
+            const auto eq = a.find('=');
+            if (eq != std::string::npos) {
+                inlined = a.substr(eq + 1);
+                a.resize(eq);
+                have_inlined = true;
+            }
+        }
+        // `--symbol=7` splits on the FIRST '=', so a value that itself contains
+        // one survives intact. The gateway relies on that for `--symbol=ACME=1`.
+        auto next = [&]() -> std::string {
+            if (have_inlined) {
+                have_inlined = false;
+                return inlined;
+            }
+            return (i + 1 < argc) ? argv[++i] : std::string{};
+        };
         if (a == "--orders") {
             o.orders = next();
         } else if (a == "--accepted") {
@@ -293,6 +323,14 @@ int main(int argc, char** argv) {
         } else if (a == "--no-create") {
             o.no_create = true;
         } else {
+            return usage();
+        }
+        // The flag matched but never called next(), so it takes no value and one
+        // was given anyway -- `--no-create=yes`. Refusing beats ignoring it: a
+        // silently dropped value is how somebody ends up believing they disabled
+        // something they did not.
+        if (have_inlined) {
+            std::cerr << "risk-service: " << a << " takes no value\n";
             return usage();
         }
     }
@@ -331,6 +369,26 @@ int main(int argc, char** argv) {
         // All four, here, before anybody else attaches.
         Ring seed;
         for (const auto* path : {&o.orders, &o.accepted, &o.execs, &o.reports}) {
+            // Unlink first. A ring is inter-process plumbing, not durable state:
+            // nothing in it is meaningful to a process that was not attached when
+            // it was written, and `create` opens O_CREAT without O_TRUNC, so a
+            // file left behind by a previous run would be adopted rather than
+            // replaced.
+            //
+            // It also makes existence mean something. On a named volume the four
+            // files outlive the container, so a healthcheck asking "does
+            // reports.ring exist?" answered yes the instant the volume was
+            // mounted -- before this run had created anything -- and the gateway
+            // and the engine attached to last run's rings. Unlinking here is what
+            // makes `test -f` a real readiness signal rather than a test of
+            // whether the stack has ever been up before.
+            //
+            // ENOENT is the normal case and is not an error.
+            if (::unlink(path->c_str()) != 0 && errno != ENOENT) {
+                std::cerr << "risk-service: removing stale " << *path << ": " << std::strerror(errno)
+                          << "\n";
+                return 1;
+            }
             if (auto e = seed.create(*path, o.capacity, o.slot_size)) {
                 std::cerr << "risk-service: creating " << *path << ": "
                           << mdstack::ring::describe(*e) << "\n";
@@ -367,10 +425,13 @@ int main(int argc, char** argv) {
     // count printed at exit is what says so.
     const risk::AllocCounts at_steady_state = risk::alloc_counts();
 
+    // 0 means run until signalled, which is what a container wants. A default
+    // of 30 seconds is right for a test and wrong for a service.
+    const bool forever = o.run_seconds <= 0;
     const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(o.run_seconds);
+        std::chrono::steady_clock::now() + std::chrono::seconds(forever ? 0 : o.run_seconds);
     std::uint64_t idle_passes = 0;
-    while (!stop_requested && std::chrono::steady_clock::now() < deadline) {
+    while (!stop_requested && (forever || std::chrono::steady_clock::now() < deadline)) {
         const std::uint64_t before = counters.orders_in + counters.cancels_in +
                                      counters.reports_in + counters.reconciles_in;
         handle_order_side(orders, accepted, reports, engine);

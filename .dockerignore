@@ -1,0 +1,31 @@
+# Everything here is build output or machine-specific state, and every byte of it
+# was being sent to the Docker daemon as build context on each
+# `docker compose build`. Without this file the context is ~155MB, of which
+# ~151MB is target/ and cpp/build/ -- artefacts compiled for the host, which the
+# image must not use and cannot use.
+#
+# The cost is not only the transfer. A context that changes whenever a local
+# `cargo build` runs invalidates the COPY layers on every rebuild, so the image
+# recompiles from scratch for reasons that have nothing to do with the source
+# having changed.
+#
+# Note what is NOT here: bench/. It is a workspace member, and cargo refuses to
+# load the workspace without its manifest even though nothing in the image builds
+# it.
+
+# Build output, both toolchains.
+target/
+cpp/build/
+
+# Regenerable and machine-specific, and never committed either.
+results/
+
+# History and CI config. Neither is read by a build.
+.git/
+.github/
+
+# The host build config sets -C target-cpu=native, which is exactly wrong for an
+# image that may be built and run on different CPUs. The Dockerfile already
+# clears RUSTFLAGS; keeping the file out of the context means the setting cannot
+# come back by accident.
+.cargo/

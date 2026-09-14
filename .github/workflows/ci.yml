@@ -41,6 +41,13 @@ jobs:
           make generate
           git --no-pager diff --stat
 
+      # Same category of defect: something in the repository promising a reader
+      # a file or a section that is not there. CLAIMS-MAP.md linked to
+      # docs/ARCHITECTURE.md for a while before that file existed, and nothing
+      # failed -- it just quietly did not resolve.
+      - name: Every link in the documentation resolves
+        run: scripts/check-doc-links.py
+
   rust:
     name: Rust
     runs-on: ubuntu-24.04
@@ -114,6 +121,10 @@ jobs:
       # from the sequence numbers that were durable. Runs on one compiler only:
       # it is a behaviour test over a socket, not a codegen test, so running it
       # twice would prove the same thing twice.
+      # Fast, and it guards the deployment path: docker-compose.yml passes every
+      # argument as --flag=value, which both parsers rejected until milestone 9.
+      - name: Both binaries accept the arguments they are deployed with
+        run: scripts/cli-args-test.sh
       - name: FIX gateway survives a hard kill
         if: matrix.compiler == 'g++'
         run: scripts/kill-restart-test.sh
@@ -196,3 +207,39 @@ jobs:
       # and a price read from the wrong offset is a plausible price.
       - name: A Rust process and a C++ process on one shared-memory ring
         run: scripts/ring-interop-test.sh
+
+  # The four commands the case study publishes, run exactly as published.
+  #
+  # This job exists because those commands are the public surface: a stranger
+  # copies them off the page in order, and a renamed binary, a moved config or a
+  # dropped flag turns the page into four commands that do not run, in front of
+  # precisely the reader who tries them. No other job here would catch that --
+  # every other one runs the binaries with the arguments the TESTS need.
+  #
+  # It runs `--with-docker`, which is the half this project cannot verify on the
+  # machine it is developed on: `docker compose up -d` builds the Rust workspace
+  # and the C++ tree into an image, and a 2-core laptop takes the better part of
+  # an hour to find out whether that works. A free runner has four cores and
+  # Docker already installed, so the containerised step is checked here on every
+  # push rather than by hand, once, before a release.
+  case-study:
+    name: The four published commands still run
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Docker is present on this runner
+        run: docker --version && docker compose version
+      - name: Run them in order, exactly as the page prints them
+        run: scripts/case-study-commands-test.sh --with-docker
+      - name: Keep the artifacts when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: case-study-artifacts
+          path: results/case-study/
+          retention-days: 7
+      - name: Leave nothing running
+        if: always()
+        run: docker compose down --volumes --remove-orphans || true

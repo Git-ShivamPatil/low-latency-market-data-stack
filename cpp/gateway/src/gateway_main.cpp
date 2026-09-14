@@ -7,6 +7,8 @@
 // socket; this wires the two together and runs a loop. Everything worth testing
 // lives in the pieces, which is why they are tested without this.
 
+#include <arpa/inet.h>
+
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +31,11 @@ void on_signal(int) { stop_requested = 1; }
 struct Options {
     bool listen{false};
     std::string host{"127.0.0.1"};
+    /// Which address to listen on with --listen. Loopback is right everywhere
+    /// except inside a container, where a published port forwards to the
+    /// container's own address and a loopback listener is unreachable however
+    /// the port is mapped.
+    std::string bind_addr{"127.0.0.1"};
     std::uint16_t port{5001};
     std::string store_path{"/tmp/mdstack-gateway.seq"};
     std::string sender{"GATEWAY"};
@@ -64,6 +71,7 @@ bool parse_host_port(const std::string& s, std::string& host, std::uint16_t& por
 
 int usage() {
     std::cerr << "usage: fix-gateway [--connect host:port | --listen port] --store PATH\n"
+              << "                   [--bind ADDR] (with --listen; default 127.0.0.1)\n"
               << "                   [--sender ID] [--target ID] [--heartbeat N]\n"
               << "                   [--send-orders N] [--run-seconds N] [--reset-seq]\n"
               << "  order path:      [--orders-ring PATH --reports-ring PATH\n"
@@ -101,11 +109,44 @@ std::optional<ClientOrder> parse_client_order(const std::string& spec) {
 int main(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
+        // Both `--flag value` and `--flag=value` are accepted; see the same
+        // comment in cpp/risk/src/service_main.cpp for why the second form is
+        // load-bearing rather than decorative. Splitting on the FIRST '=' is what
+        // keeps `--symbol=ACME=1` working, since that value contains one too.
         std::string a = argv[i];
-        auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string{}; };
+        std::string inlined;
+        bool have_inlined = false;
+        if (a.rfind("--", 0) == 0) {
+            const auto eq = a.find('=');
+            if (eq != std::string::npos) {
+                inlined = a.substr(eq + 1);
+                a.resize(eq);
+                have_inlined = true;
+            }
+        }
+        auto next = [&]() -> std::string {
+            if (have_inlined) {
+                have_inlined = false;
+                return inlined;
+            }
+            return (i + 1 < argc) ? argv[++i] : std::string{};
+        };
         if (a == "--connect") {
             if (!parse_host_port(next(), o.host, o.port)) return usage();
             o.listen = false;
+        } else if (a == "--bind") {
+            o.bind_addr = next();
+            // Checked here rather than at bind time. `accept_one` can only
+            // report failure by returning a closed connection, which the session
+            // loop reports as "state disconnected" -- true, useless, and
+            // identical to nobody having called. A typo in an address should say
+            // so.
+            in_addr probe{};
+            if (::inet_pton(AF_INET, o.bind_addr.c_str(), &probe) != 1) {
+                std::cerr << "gateway: --bind " << o.bind_addr
+                          << " is not an IPv4 address (0.0.0.0 listens on all interfaces)\n";
+                return usage();
+            }
         } else if (a == "--listen") {
             o.port = static_cast<std::uint16_t>(std::stoi(next()));
             o.listen = true;
@@ -150,6 +191,13 @@ int main(int argc, char** argv) {
         } else {
             return usage();
         }
+        // Matched, but never consumed a value, so this flag takes none and one
+        // was supplied anyway -- `--reconcile=yes`. Refuse rather than drop it
+        // silently.
+        if (have_inlined) {
+            std::cerr << "gateway: " << a << " takes no value\n";
+            return usage();
+        }
     }
 
     std::signal(SIGINT, on_signal);
@@ -176,7 +224,10 @@ int main(int argc, char** argv) {
     // local store without telling the other end is not a reset, it is a
     // unilateral sequence reversal waiting to be reported.
     auto now = fix::Clock::now();
-    const auto deadline = now + std::chrono::seconds(o.run_seconds);
+    // 0 means run until signalled, which is what a container wants. A default of
+    // 30 seconds is right for a test and wrong for a service.
+    const auto deadline = now + std::chrono::seconds(o.run_seconds <= 0 ? 3600 * 24 * 365
+                                                                       : o.run_seconds);
 
     fix::SessionConfig cfg;
     cfg.sender_comp_id = o.sender;
@@ -234,7 +285,7 @@ int main(int argc, char** argv) {
     std::map<std::string, int> exec_reports_in;
 
     while (!stop_requested && fix::Clock::now() < deadline) {
-        fix::Connection conn = o.listen ? fix::accept_one(o.port, 3000)
+        fix::Connection conn = o.listen ? fix::accept_one(o.port, 3000, o.bind_addr)
                                         : fix::connect_to(o.host, o.port);
         if (!conn.open()) {
             if (o.listen) {

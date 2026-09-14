@@ -138,7 +138,7 @@ Connection connect_to(const std::string& host, std::uint16_t port) {
     return Connection(fd);
 }
 
-Connection accept_one(std::uint16_t port, int timeout_ms) {
+Connection accept_one(std::uint16_t port, int timeout_ms, const std::string& bind_addr) {
     int listener = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
         return {};
@@ -150,7 +150,13 @@ Connection accept_one(std::uint16_t port, int timeout_ms) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // A bad address is refused rather than quietly falling back to loopback:
+    // silently listening somewhere other than where you were told to is the
+    // failure mode this whole parameter exists to fix.
+    if (::inet_pton(AF_INET, bind_addr.c_str(), &addr.sin_addr) != 1) {
+        ::close(listener);
+        return {};
+    }
     addr.sin_port = htons(port);
     if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
         ::listen(listener, 1) != 0) {
