@@ -81,7 +81,7 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
   <sub>Verified: 10M messages at 2% single-arm loss produce **zero gaps**, with both arms contributing first arrivals. Under *independent* 2% loss, 124 datagrams died on both arms — 0.040%, matching the p² prediction — and the handler named gaps covering exactly those 3,968 sequences, no more and no less. Correlated loss transitions to `GAPPED` with the range named. `scripts/smoke.sh` now injects loss over real sockets too. See [docs/RECOVERY.md](docs/RECOVERY.md).</sub>
 - [x] **M4 · Snapshot cycle and TCP replay recovery**  
   A handler that has fallen behind rejoins the live stream with a correct book instead of being restarted.  
-  <sub>Verified: a range lost on both arms, and a 1,600-message blackout, both recover to a book **identical to the publisher's** — including queue position, not just quantity. `scripts/smoke.sh` runs both recovery paths across three processes: snapshot-only (4 gaps, 2 recoveries, worst 48ms) and with the replay service (5 gaps, 4 filled by replay, 1 by snapshot, 2,783 messages recovered), each ending `LIVE` with every shared checkpoint matching. `Snapshot` carries **orders in queue order** rather than aggregated levels, because an aggregate cannot restore price-time priority. See [docs/RECOVERY.md](docs/RECOVERY.md).</sub>
+  <sub>Verified by two tests, because they establish two different things. `scripts/smoke.sh` proves recovery **across a real process boundary**: both recovery paths across three processes — snapshot-only (4 gaps, 2 recoveries, worst 48ms) and with the replay service (5 gaps, 4 filled by replay, 1 by snapshot, 2,783 messages recovered) — each ending `LIVE` with every shared checkpoint matching. What it cannot see is **queue position**, because its digest hashes price levels and a book rebuilt in a different order digests identically; that is carried by `crates/feed-handler/tests/recovery.rs::recovery_restores_queue_position_not_just_quantity`, which walks the recovered book order by order after a range lost on both arms and a 1,600-message blackout. `Snapshot` carries **orders in queue order** rather than aggregated levels, because an aggregate cannot restore price-time priority. See [docs/RECOVERY.md](docs/RECOVERY.md).</sub>
 - [x] **M5 · MBP and MBO books on an allocation-free path**  
   Both book views are maintained with zero heap allocations per message, and that is proved by a test rather than asserted in a README.  
   <sub>Verified: `--verify-allocations` reports **0 allocations, 0 deallocations, 0 reallocations** over 32,601 steady-state receive passes across two processes — while the same run with `--books reference` reports 10,814, so the counter is measuring something. A `#[test]` asserts exactly zero across **1,000,000 messages including a forced both-arm blackout and the snapshot recovery that follows**, over 125,021 measured scopes. The fast book is differentially tested against the reference book over **5,000,000 random operations** — every return value, every aggregated level, and the exact queue order within each level — and both reconcile with the engine across a process boundary. See [docs/BOOKS.md](docs/BOOKS.md).</sub>
@@ -119,42 +119,55 @@ Each milestone is independently demoable and ends in a commit. A box is ticked o
 - WSL2 Ubuntu 24.04 as the actual dev/run target (Windows host)
 - GitHub Actions (Linux runners, both toolchains)
 
-## How it will be run
+## How to run it
 
-### What runs today
-
-The engine matches orders and publishes a batched binary feed on two redundant
-channels; the handler consumes both, discards duplicates and rebuilds the books.
-Steps 2 and 3 below work now. Steps 1 and 4 arrive in milestones 4 and 5.
-
-Run inside WSL2 or any Linux — multicast socket options, `SO_REUSEADDR` and the
-core pinning later milestones need only behave correctly there, and the C++ tree
-is not wired for Windows.
+Run inside WSL2 or any Linux. The multicast socket options, `SO_REUSEADDR` and
+the core pinning behave correctly only there, and the C++ tree is not wired for
+Windows.
 
 ```bash
 make smoke       # engine and handler as separate processes, books reconciled
 make test        # every correctness suite, both toolchains
 make lint        # rustfmt and clippy, both as errors
+make ci          # everything CI runs, in CI's order
 ```
 
-**Start the handler before the engine.** A handler that joins mid-stream cannot
-rebuild the orders that rested before it arrived, and it says so rather than
-pretending otherwise — recovering from a late join is what the snapshot cycle in
-milestone 4 is for. [docs/RUNNING.md](docs/RUNNING.md) has the detail, including
-what to try when a multicast group join succeeds but nothing arrives.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the map — what each of the five
+processes owns and what crosses each boundary. [docs/RUNNING.md](docs/RUNNING.md)
+is the operational detail, including what to try when a multicast group join
+succeeds but nothing arrives.
 
-### What it will run
+### The four commands the case study publishes
 
-Steps 2 and 3 work today. Step 1 brings up the containerised stack rather than
-infrastructure the host binaries attach to — see the note in
-[docs/RUNNING.md](docs/RUNNING.md#containerised) — and step 4 needs the recovery
-path from milestones 4 and 5. These are the commands the [case study](https://www.shivamsfolio.com/projects/low-latency-market-data-order-entry) publishes:
+**All four work.** They are printed verbatim on the
+[case study](https://www.shivamsfolio.com/projects/low-latency-market-data-order-entry),
+which makes them public surface rather than illustration: a stranger copies them
+in order, so a renamed binary, a moved config or a dropped flag turns the page
+into four commands that do not run, in front of precisely the reader who tries
+them.
+
+So they are a test. `scripts/case-study-commands-test.sh` runs them with every
+flag exactly as printed, adding only a stop condition to the three that would
+otherwise run until interrupted, and it is in `make test` and in CI on every
+push. Nothing else here would catch that regression, because every other suite
+runs the binaries with the arguments the *tests* need, which is not the same
+thing as the arguments the page promises.
+
+That distinction was not academic. Step 1 had **never been run** since the
+benchmark crate joined the workspace at milestone 6, and it was broken three
+separate ways — a workspace member missing from the image, an argument spelling
+neither C++ parser accepted, and a FIX acceptor bound to loopback inside a
+container. Every other suite was green throughout.
+[docs/CLAIMS-MAP.md](docs/CLAIMS-MAP.md#what-running-step-1-found) has the three
+and what now stops each of them coming back.
 
 **1. Bring up the transport.** Start the containerised multicast network and the replay service before either side of the stack connects to it.
 
 ```bash
 docker compose up -d
 ```
+
+<sub>This brings up **all five processes** in containers — gateway, risk, engine, replay, handler — with the feed crossing a user-defined bridge as real multicast, and the gateway's FIX port published on 5001. It is a self-contained copy of the system rather than infrastructure the next three commands attach to: the bridge has its own network namespace, and a host handler pointed at the same two groups receives nothing from it. The four commands do run in order and nothing conflicts, but step 1 is harmless rather than load-bearing for steps 2–4. [docs/RUNNING.md](docs/RUNNING.md#what-the-compose-stack-is-and-is-not) has the measurement and names the one service that *does* work as infrastructure across the boundary.</sub>
 
 **2. Run the matching engine.** Start the engine and let it publish the binary feed on both the A and B multicast channels.
 
@@ -175,7 +188,7 @@ cargo run --release --bin feed-handler -- --drop-rate 0.02 --verify-allocations
 ```
 
 <details>
-<summary><b>Planned repository layout</b></summary>
+<summary><b>Repository layout</b></summary>
 
 ```
 README.md — leads with the four commands from the case study, verbatim, and the benchmark caveats above the fold
@@ -189,7 +202,7 @@ crates/book/ — reference book, digest, and the shared apply path              
              — MBP: a dense tick-indexed level array maintained over the same store          [M5]
 crates/alloc-guard/ — counting #[global_allocator] and the zero-allocation assertions        [M5]
 crates/bench-support/ — latency histogram, calibrated rdtsc, and the host gate               [M6]
-bench/ — Criterion microbenches, the hostcheck binary, and the report template               [M6]
+bench/ — Criterion microbenches, the hostcheck binary, and the report they fill in            [M6]
 crates/transport/ — multicast and unicast-fanout backends, one send path                     [M2]
 crates/mdconfig/ — the configuration file both binaries read                                 [M2]
 crates/matching-engine/ — bin `matching-engine`; price-time priority, A/B publisher, loss injection, snapshot cycle
@@ -207,13 +220,17 @@ cpp/gateway/tests/ — 51 session checks driving the state machine directly     
 schema/market-data.xml — the single source of truth for wire layout
 schema/golden/ — hand-checked byte vectors consumed by both language test suites
 configs/local.toml — the config the advertised command names; channels, symbols, tick size, rates, batch factor
-docker-compose.yml
-docker/ — Dockerfiles and the user-defined bridge network definition
-bench/ — Criterion benches, load profiles, REPORT.md
-docs/ — WIRE.md, RUNNING.md, RECOVERY.md, BOOKS.md and PROTOCOL.md (FIX scope, written first)
-bench/REPORT.md — the benchmark methodology; a template until a rented host fills it in
-scripts/ — smoke.sh, verify-golden-corruption.sh, bench.sh, kill-restart-test.sh, quickfix-interop-test.sh
-tests/ — cross-process integration and FIX session conformance suites
+docker-compose.yml — all five processes and the user-defined bridge, in one command    [M9]
+docker/Dockerfile — a Rust stage, a C++ stage, and a runtime image carrying six binaries
+.dockerignore — keeps 151MB of host build output out of the build context              [M9]
+docs/ARCHITECTURE.md — the map: five processes, four rings, and what crosses each       [M9]
+docs/ — WIRE.md, RECOVERY.md, BOOKS.md, PROTOCOL.md, ORDER-PATH.md, RUNNING.md
+docs/CLAIMS-MAP.md — every advertised claim mapped to a named test, and the two that   [M9]
+                     did not survive that mapping
+bench/REPORT.md — the benchmark methodology and the measured figures, with the caveats
+scripts/ — smoke.sh, verify-golden-corruption.sh, bench.sh, kill-restart-test.sh,
+           quickfix-interop-test.sh, ring-interop-test.sh, order-path-test.sh,
+           case-study-commands-test.sh
 .github/workflows/ci.yml — both toolchains, correctness and allocation suites only, never latency
 ```
 

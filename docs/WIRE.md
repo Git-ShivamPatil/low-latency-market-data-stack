@@ -126,7 +126,7 @@ in the case where a replace happens to reduce.
 | 2 | `ModifyOrder` | 24 | — |
 | 3 | `DeleteOrder` | 12 | — |
 | 4 | `Trade` | 40 | — |
-| 5 | `Snapshot` | 12 | `levels` |
+| 5 | `Snapshot` | 12 | `orders` |
 | 6 | `Heartbeat` | 8 | — |
 | 7 | `SequenceReset` | 8 | — |
 
@@ -183,7 +183,7 @@ feed and buy nothing.
 | 38 | 1 | Side   | `aggressorSide` |
 | 39 | 1 | uint8  | `reserved` (always 0) |
 
-### Snapshot — templateId 5, blockLength 12, group `levels`
+### Snapshot — templateId 5, blockLength 12, group `orders`
 
 Root block:
 
@@ -191,20 +191,47 @@ Root block:
 |-------:|-----:|------|-------|
 | 0  | 8 | uint64 | `lastSequence` — the snapshot reflects every message up to and including this |
 | 8  | 2 | uint16 | `symbolId` |
-| 10 | 1 | uint8  | `flags` — bit0 = last fragment for this symbol in this cycle |
+| 10 | 1 | uint8  | `flags` — bit0 (`SNAPSHOT_FLAG_LAST_FRAGMENT`) = last fragment for this symbol in this cycle |
 | 11 | 1 | uint8  | `reserved` (always 0) |
 
-Then a `groupSizeEncoding` with `blockLength` 16, then `numInGroup` entries of:
+Then a `groupSizeEncoding` with `blockLength` 24, then `numInGroup` entries of:
 
 | Offset | Size | Type | Field |
 |-------:|-----:|------|-------|
-| 0  | 8 | int64  | `price` |
-| 8  | 4 | uint32 | `quantity` |
-| 12 | 2 | uint16 | `orderCount` |
-| 14 | 1 | Side   | `side` |
-| 15 | 1 | uint8  | `reserved` (always 0) |
+| 0  | 8 | uint64 | `orderId` |
+| 8  | 8 | int64  | `price` |
+| 16 | 4 | uint32 | `quantity` |
+| 20 | 1 | Side   | `side` |
+| 21 | 1 | uint8  | `reserved` (always 0) |
+| 22 | 2 | uint16 | `reserved2` (always 0) |
 
-Total size is `8 + 12 + 4 + 16 × numInGroup`.
+Total size is `8 + 12 + 4 + 24 × numInGroup` — message header, root block, group
+header, entries. That is the **message**, not the datagram: a snapshot travels
+inside a packet like any other message, so add the 24-byte `packetHeader` to
+compare against a captured datagram or one of the golden files.
+`schema/golden/snapshot_two_orders.bin` is 96 bytes, which is 24 + 8 + 12 + 4 +
+2 × 24.
+
+**The group carries individual resting orders, in queue order** — best price
+first within each side, and within a price, the order that has been resting
+longest first. It does not carry aggregated levels. Section
+[Why the snapshot carries orders](#why-the-snapshot-carries-orders-and-not-levels)
+is why, and it is the single most consequential decision on this wire.
+
+#### Fragmentation
+
+A snapshot of a busy book does not fit in a datagram, so a cycle is a sequence of
+`Snapshot` messages per symbol. Every fragment of a cycle carries the same
+`lastSequence`; the first one for a symbol clears that symbol's book and the rest
+append to it. `flags` bit0 marks the last fragment for that symbol, which is how a
+handler knows the symbol is complete rather than merely quiet.
+
+Two failures this shape makes detectable rather than silent. A fragment naming an
+order the book already holds is a **broken cycle** and is reported, not merged —
+`crates/book/src/apply.rs` has the case. And a handler that starts adopting a
+cycle from the middle, having missed the opening fragment, would leave the
+symbols it already cleared correct and the rest stale, so it refuses instead and
+waits for the next cycle.
 
 ### Heartbeat — templateId 6, blockLength 8
 
@@ -223,32 +250,84 @@ a silent arm and a healthy-but-empty arm look identical.
 
 ---
 
-## A consequence of aggregating the snapshot
+## Why the snapshot carries orders, and not levels
 
-`Snapshot` carries **aggregated price levels** — price, total quantity, order
-count — not individual orders. That is enough to rebuild a market-by-price view
-and not enough to rebuild a market-by-order one: the aggregate says three orders
-total 250 at this price, but not which orders, in what queue order, or with what
-ids. Queue position is unrecoverable from it, and queue position is the whole
-point of price-time priority.
+> **This section said the opposite until milestone 9.** It is rewritten rather
+> than deleted, and what it used to say is at the bottom, because the reasoning
+> that produced the wrong shape is the useful part.
 
-This is deliberate and it is what real feeds do — but it means **the snapshot
-cycle alone cannot recover an MBO book.** So milestone 4 needs both mechanisms
-it is scheduled to build, for different reasons:
+`Snapshot` carries **individual resting orders, in queue order**. The group is
+`orders`, each entry is an `orderId`, a `price`, a `quantity` and a `side`, and
+the order they arrive in *is* the queue order.
 
-| Mechanism | Recovers | Cost |
+The alternative — aggregated price levels, carrying price, total quantity and an
+order count — is smaller, and it is what a real MBP feed publishes. It was the
+original design on this wire.
+
+**It cannot recover this system's book.** An aggregate says three orders total
+250 at this price. It does not say which orders, with what ids, or in what queue
+order. A handler that rebuilt from it would hold a book with the right depth at
+every price and the wrong order inside every price — and since matching here is
+price-**time** priority, the next trade it predicted would go to the wrong
+resting order. A book that is silently wrong about queue position is worse than
+one that is honestly absent, and it is much harder to notice.
+
+There is a second reason, specific to this feed. `DeleteOrder` carries **no
+price** (see its block above: `orderId`, `symbolId`, `side`). An MBP view cannot
+be driven from this feed alone — to decrement the right level, a handler must
+first look the order up by id, which means it needs the order-by-order map
+whether it wanted one or not. Once the MBO map has to exist, a snapshot that
+cannot populate it is a snapshot that cannot do its job.
+
+So the group is orders, and the cost is paid in size: a snapshot is O(resting
+orders) rather than O(price levels), which is why it fragments and why `flags`
+bit0 exists.
+
+### Then why keep the replay service?
+
+Both mechanisms exist, but not for the reason the original design gave. It is not
+that one recovers MBP and the other MBO — the snapshot now recovers everything.
+They differ in cost and in what they destroy:
+
+| Mechanism | How it recovers | Cost |
 |---|---|---|
-| 2-second snapshot cycle | MBP, immediately, from the next cycle | Bounded wait, no request |
-| TCP replay service | MBO exactly, by replaying the missed range | A round trip and the publisher's history |
+| 2-second snapshot cycle | Clears the symbol and rebuilds it from the cycle | A bounded wait, no request, and **the existing book is discarded** |
+| TCP replay service | Asks for exactly the missed range and applies it | A round trip and the publisher's history, but **the book is never discarded** |
 
-A handler that has lost messages and needs its order book back must replay. One
-that only trades off aggregated depth can wait for the next snapshot. The
-recovery state machine in milestone 4 has to choose between them rather than
-assume one is always available.
+That is the choice the recovery state machine makes: a small hole is cheaper to
+patch than to rebuild around, and a handler with no replay service configured, or
+one whose gap is older than the history the publisher kept, waits for the cycle.
+`scripts/smoke.sh` runs each path in its own scenario and never both at once —
+under load the snapshot legitimately wins a race, and a test that asserted replay
+won would be passing by accident. [RECOVERY.md](RECOVERY.md) is the state machine.
 
-`book::apply_message` refuses a `Snapshot` outright today rather than half-applying
-one, because a book that is silently missing its queue order is worse than one
-that is honestly absent.
+<details>
+<summary><b>What this section used to say, and why it was wrong</b></summary>
+
+Written at milestone 1, it read:
+
+> `Snapshot` carries **aggregated price levels** — price, total quantity, order
+> count — not individual orders. […] This is deliberate and it is what real feeds
+> do — but it means **the snapshot cycle alone cannot recover an MBO book.**
+
+and concluded that the snapshot would recover MBP, the replay service would
+recover MBO, and `book::apply_message` would refuse a `Snapshot` outright rather
+than half-apply one.
+
+The reasoning was sound and the premise was borrowed. Real MBP feeds do aggregate,
+so aggregating looked like the realistic choice — but this feed publishes
+order-by-order messages and a priceless `DeleteOrder`, which makes it an MBO feed
+with an MBP view derived from it, not the other way round. Milestone 4 changed the
+schema; this document was not changed with it, and said the opposite of the code
+for five milestones. It was caught at milestone 9 by
+[CLAIMS-MAP.md](CLAIMS-MAP.md), checking the claims on the case study page against
+the repository one at a time.
+
+Worth stating plainly: nothing was wrong with the code. A design document that
+stops tracking the design is its own defect, and the only thing that catches it is
+reading it against the source rather than trusting that it was updated.
+
+</details>
 
 ---
 

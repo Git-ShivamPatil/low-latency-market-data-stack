@@ -268,6 +268,43 @@ that waits forever looks healthy while holding a book it knows is wrong.
 config refuses to load otherwise: the cycle already in flight when the gap opened
 may be too old to help, so the *second* one is the first that can close it.
 
+### A failed *initial join* is retried; a failed gap recovery is not
+
+The two are different situations and milestone 9 stopped treating them the same.
+
+A handler that joins mid-stream has **no book at all**. When its first recovery
+attempt fails, the old behaviour was to give up and go `LIVE` — which meant going
+live with an empty book and no gap to declare, reporting a healthy stream and a
+book it never built. That is the quietest kind of wrong, and it is what step 3 of
+the published commands does every time, because the page starts the engine before
+the handler.
+
+So an initial join now re-arms and waits for the next cycle. Three things make
+that safe rather than a spin:
+
+- **It is bounded.** Eight attempts, then the handler exits with an error naming
+  the buffer size and what to change. Unbounded, it could never stop: each
+  `begin` resets the deadline, so the deadline that normally ends a failed
+  recovery never fires if the buffer keeps filling first — and `--messages`
+  cannot end it either, because the message limit deliberately refuses to stop
+  mid-recovery.
+- **Both failure sites re-arm.** An initial join can fill the buffer while
+  *holding* a datagram or while *draining* one, and which it happens to be is an
+  accident of timing. Only the first re-armed at first, which is exactly why step
+  4 ended `GAPPED` holding an empty book while step 3 recovered.
+- **A retry is not a fault.** `recovery_failures` counts every failed attempt;
+  `recoveries_abandoned` counts only the ones nothing retried, and that is what
+  decides whether a run is clean. A run that filled its buffer twice, re-armed,
+  caught the next cycle and ended `LIVE` with a correct book did its job — failing
+  it would be failing the retry for having been needed.
+
+A gap recovery **mid-run** is not retried, because the handler already holds a
+book and the honest report is that a range is missing.
+
+**The retry is a backstop, not the mechanism.** If a demo needs it every time,
+the rate and the buffer are mismatched — `configs/local.toml` carries the
+arithmetic for choosing a rate the buffer can actually bridge.
+
 ### What is measured
 
 `scripts/smoke.sh` runs a recovery scenario: correlated loss on both arms, a
@@ -379,3 +416,74 @@ same injected loss, with all three processes:
 The mix is the interesting part: replay handles most gaps, and the snapshot cycle
 catches the one whose range had aged past what the run's small history held. Both
 paths are live in the same run.
+
+---
+
+## Known issue: the replay reopen path
+
+**Status: open, and reproducible. This is the one defect this repository knows
+about and has not closed.**
+
+It is documented here rather than tracked privately, because a reader
+evaluating the recovery path should be told what it does not yet handle.
+
+### What it looks like
+
+A run with the replay service configured, under correlated loss fast enough that
+a **new gap opens while a replay request is in flight** — repeatedly. The handler
+reports several hundred `sequence N does not apply: order M is not on the book`
+errors, the first of them inside a range a replay reported covering, and the run
+still ends `LIVE` believing it recovered.
+
+A captured reproduction:
+
+```
+GAP: sequence 14736..=14744 (9 messages) was lost on both arms.
+requesting replay of 14736..=15067
+GAP: sequence 15068..=15083 (16 messages) was lost on both arms.
+replay closed 14736..=15067 but 15068..=15083 opened while it was in flight;
+  staying in recovery
+requesting replay of 15068..=15614
+GAP: sequence 15615..=15625 (11 messages) was lost on both arms.
+replay closed 15068..=15614 but 15615..=15625 opened while it was in flight;
+  staying in recovery
+requesting replay of 15615..=17137
+sequence 15615 does not apply: symbol 2: order 5618 is not on the book
+sequence 15616 does not apply: symbol 4: order 6075 is not on the book
+  ... 609 more
+```
+
+Two consecutive `reopen` cycles, and then everything after the second one
+referencing orders the book does not have. The run's own counters say
+`recovery_messages_replayed=126` against `recovery_messages_skipped=8330`, and
+`unverified_drops=0` — so every skip took the branch that believes it has
+evidence the messages were already applied, and for some of them that belief is
+wrong.
+
+### What is already known about it
+
+Three silent loss paths were found and closed while hunting this, and each now
+has a counter: datagrams dropped because the reorder window was full, a drain
+that advanced the frontier past a refused `hold`, and held traffic discarded
+without evidence a replay covered it. A `held_discontinuity` check and a
+`drain_contiguous` path were added for the two defects that were confirmed
+firing. None of that closed it.
+
+What is ruled out by reading: `Accepted::Ready` returns without storing, so
+there is no double-hold; the replay service cannot return a discontiguous
+answer, because its store is contiguous by construction; and only one request is
+ever in flight, so a stale answer cannot arrive.
+
+### What it is not
+
+It is **not** a defect in the snapshot path. `scripts/smoke.sh`'s snapshot-only
+recovery scenario, which exercises the same loss on the same three processes
+with no replay service, has never shown it. Nor is it the arbitration layer:
+the gaps above are all correctly detected and correctly named.
+
+### The rule this earns
+
+**Do not mark this resolved without a deterministic reproduction.** It has been
+argued away once already, on fifteen consecutive clean runs against a prior rate
+of roughly one in three — and it came back. A run of green results is evidence
+that the frequency changed, not that the cause is gone.
