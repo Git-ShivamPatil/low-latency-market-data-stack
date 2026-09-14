@@ -460,6 +460,38 @@ referencing orders the book does not have. The run's own counters say
 evidence the messages were already applied, and for some of them that belief is
 wrong.
 
+### What the contiguity check ruled out
+
+Milestone 9 added the control this path never had: every message the books apply
+must be exactly one past the last, and a jump that no declared gap explains is
+reported as `LOST` on the spot with the range named. It is in `is_clean`, so a
+run that loses messages fails where the loss happens rather than several hundred
+messages later.
+
+**It does not fire on this bug.** Eight rounds of the replay scenario, one of
+them failing with 732 unapplied messages, and the applied stream was contiguous
+throughout. So the messages are not being dropped — which is what everyone
+looking at this has assumed, including the two fixes already made for it.
+
+The other half of the evidence points the same way. At the first mismatched
+checkpoint the handler holds **more** orders than the engine, not fewer:
+
+| Run | Engine | Handler |
+|---|---:|---:|
+| 2026-09-14 #1 | 321 | 341 |
+| 2026-09-14 #2 | 319 | 397 |
+
+A book that lost messages holds *fewer* orders. A book holding more has applied
+something twice, or applied it out of order — and "order N is not on the book"
+is then a second `DeleteOrder` for an order the first one already removed, not a
+delete for an order that was never added.
+
+**So the next session should be hunting a double-apply or a re-ordering across
+the reopen boundary, not a drop.** The contiguity check cannot see either: it
+compares against a high-water mark, so re-applying a sequence at or below it
+passes silently. A duplicate-detection counter on the apply path is the
+equivalent control and does not exist yet.
+
 ### What is already known about it
 
 Three silent loss paths were found and closed while hunting this, and each now

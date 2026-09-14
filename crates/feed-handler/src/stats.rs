@@ -55,6 +55,27 @@ pub struct HandlerStats {
     pub recoveries_abandoned: u64,
     /// Snapshot fragments ignored because they predated the gap.
     pub snapshots_discarded: u64,
+    /// The highest sequence actually applied to the books.
+    ///
+    /// Distinct from `last_sequence`, which is the most recent one seen. This is
+    /// the high-water mark the contiguity check below is measured against, and
+    /// it is reset — not advanced — when a snapshot replaces the books, because
+    /// a snapshot legitimately moves the stream forward without applying the
+    /// messages in between.
+    pub applied_high: u64,
+    /// Times the applied stream skipped forward with no gap to account for it.
+    ///
+    /// **This is the control on the recovery path.** Every message the books
+    /// ever see should be exactly one past the last, except across a snapshot
+    /// adoption. A jump that no declared gap explains is messages lost
+    /// silently — and until milestone 9 nothing looked, so the first anyone knew
+    /// was several hundred messages later, when something referenced an order
+    /// the book had never been told about. See
+    /// `docs/RECOVERY.md` → "Known issue: the replay reopen path".
+    pub sequence_jumps: u64,
+    /// The first such jump, as `(from, to)`, so the report names a range rather
+    /// than a count.
+    pub first_jump: Option<(u64, u64)>,
     /// Which recovery attempt a replay has already been requested for, so one
     /// gap does not produce a stream of duplicate requests.
     pub replay_requested: u64,
@@ -196,6 +217,11 @@ impl HandlerStats {
         // starts the handler first should see zero of both; one that joins
         // mid-stream can legitimately see failures and no abandonments.
         writeln!(f, "recoveries_abandoned={}", self.recoveries_abandoned)?;
+        writeln!(f, "sequence_jumps={}", self.sequence_jumps)?;
+        if let Some((from, to)) = self.first_jump {
+            writeln!(f, "first_jump_from={from}")?;
+            writeln!(f, "first_jump_to={to}")?;
+        }
         writeln!(f, "recovery_attempts={}", r.attempts)?;
         writeln!(f, "recovery_datagrams_buffered={}", r.datagrams_buffered)?;
         writeln!(f, "recovery_messages_replayed={}", r.messages_replayed)?;
@@ -251,5 +277,8 @@ impl HandlerStats {
             && arb.arm(1).dropped_window_full == 0
             // Held traffic discarded without evidence anything applied it.
             && self.unverified_drops == 0
+            // The applied stream skipped forward with no gap to account for it.
+            // Messages this handler was given and never applied.
+            && self.sequence_jumps == 0
     }
 }

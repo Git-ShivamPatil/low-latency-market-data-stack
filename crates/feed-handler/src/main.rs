@@ -845,12 +845,25 @@ fn run_with<B: BookSet>(
     if !clean {
         eprintln!(
             "  NOT CLEAN: state {}, {} gaps ({} recovered, {} abandoned of {} failed \
-                attempts), still recovering: {}, {} bad datagrams, {} messages that did not apply",
+                attempts), {} silent sequence jumps{}, {} dropped with the window full, \
+                {} unverified drops, still recovering: {}, {} bad datagrams, \
+                {} messages that did not apply",
             arbitrator.state(),
             arbitrator.gap_count(),
             stats.recoveries,
             stats.recoveries_abandoned,
             stats.recovery_failures,
+            stats.sequence_jumps,
+            match stats.first_jump {
+                Some((from, to)) => format!(" (first {from} -> {to})"),
+                None => String::new(),
+            },
+            // Both of these are checked by `is_clean` and neither used to be
+            // printed, so a run could fail for a reason the failure message did
+            // not mention. A report that omits the cause is most of the way to
+            // not having a report.
+            arbitrator.arm(0).dropped_window_full + arbitrator.arm(1).dropped_window_full,
+            stats.unverified_drops,
             recovery.is_recovering(),
             stats.bad_datagrams,
             stats.apply_errors
@@ -1184,6 +1197,11 @@ fn handle_snapshot<B: BookSet>(
 
         recovery.adopt_snapshot(last_sequence);
         arbitrator.resync_to(last_sequence + 1);
+        // The books now hold everything up to `last_sequence` without having
+        // applied the messages that got them there, which is the whole point of
+        // a snapshot. Move the contiguity high-water mark with them, or the
+        // first held datagram replayed on top would look like a jump.
+        stats.applied_high = stats.applied_high.max(last_sequence);
 
         // Replay whatever arrived while we were waiting, minus what the
         // snapshot already covers.
@@ -1258,6 +1276,35 @@ fn consume<B: BookSet>(
         };
         if seq < skip_below {
             continue;
+        }
+        // The contiguity check. Every message the books see should be exactly
+        // one past the last one they saw -- live traffic is contiguous by
+        // arbitration, a replay fills its hole where it is, and held traffic is
+        // drained in order. The one legitimate discontinuity is a snapshot
+        // replacing the books, and that resets `applied_high` rather than
+        // passing through here.
+        //
+        // So a jump at this point means messages were dropped by this handler
+        // with nothing recording it. Reporting it here names the exact range;
+        // without it the first symptom is an "order N is not on the book"
+        // several hundred messages later, for an order added long before, which
+        // is what made the replay reopen bug so hard to find.
+        // `gapped` is the exemption: while a declared gap is outstanding the
+        // jump is the gap, and it has already been named.
+        if !gapped && stats.applied_high != 0 && seq > stats.applied_high + 1 {
+            stats.sequence_jumps += 1;
+            if stats.first_jump.is_none() {
+                stats.first_jump = Some((stats.applied_high, seq));
+            }
+            eprintln!(
+                "  LOST: the applied stream jumped {} -> {seq}; {} messages were never \
+                 applied and no gap covers them",
+                stats.applied_high,
+                seq - stats.applied_high - 1
+            );
+        }
+        if seq > stats.applied_high {
+            stats.applied_high = seq;
         }
         any = true;
         stats.messages += 1;
